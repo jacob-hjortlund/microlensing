@@ -3,7 +3,8 @@
 
 Run with PYTHONPATH=<build>/pyroot so that microlensing.IPM loads the rung's libraries:
     PYTHONPATH=$IPM_BENCH_ROOT/builds/R5/pyroot python tests/gpu/python_check.py --build $IPM_BENCH_ROOT/builds/R5 --rung R5
-run() wall time includes the get_pixels() copies into numpy that the wrapper performs.
+A double configuration is judged by both parts of the double rule (see regress.py): a second run with the shifted centre
+against R0's shift1 reference, and the real run against run1. run() wall time includes the get_pixels() copies into numpy that the wrapper performs.
 """
 import argparse
 import gc
@@ -27,6 +28,19 @@ KW = {
     "hm100_f": dict(kappa_tot=0.5, shear=0.49, kappa_star=0.1, rectangular=True, approx=True,
                     half_length_y1=12.5, half_length_y2=12.5, num_pixels_y1=1000, num_pixels_y2=1000),
 }
+
+
+def judge_double(cand, cand_shift, ref_root, name, tol):
+    """Both parts of the double rule; returns (metrics vs run1, metrics vs shift1, combined verdict)."""
+    m_r0 = cm.map_metrics(cand, reference_map(ref_root, name, 1), tol["floor_frac"])
+    m_shift = cm.map_metrics(cand_shift, reference_map(ref_root, name, "shift1"), tol["floor_frac"])
+    v_shift = cm.evaluate_double(m_shift, tol)
+    v_r0 = cm.evaluate_double_actual(m_r0, tol, name)
+    verdict = {"pass": v_shift["pass"] and v_r0["pass"], "failures": [], "flags": []}
+    for label, v in (("vs_r0_shift", v_shift), ("vs_r0", v_r0)):
+        verdict["failures"] += [f"{label}: {f}" for f in v["failures"]]
+        verdict["flags"] += [f"{label}: {f}" for f in v["flags"]]
+    return m_r0, m_shift, verdict
 
 
 def main(argv=None):
@@ -61,11 +75,22 @@ def main(argv=None):
             runs.append({"run_wall_s": wall, "t_shoot_cells": ipm.t_shoot_cells})
             if k == 0:
                 cand = np.asarray(ipm.magnifications, dtype=np.float64)
-                m_r0 = cm.map_metrics(cand, reference_map(a.ref_root, name, 1), tol["floor_frac"])
-                entry = {"vs_r0": m_r0, "shape": list(cand.shape)}
+                entry = {"shape": list(cand.shape)}
                 if cfg.build == "double":
-                    verdict = cm.evaluate_double(m_r0, tol)
+                    cy1, cy2 = cf.shift_center()
+                    ipm_shift = IPM(verbose=0, random_seed=int(cf.SEED), center_y1=cy1, center_y2=cy2, **kw)
+                    t0 = time.perf_counter()
+                    ipm_shift.run()
+                    entry["shift_run"] = {"run_wall_s": time.perf_counter() - t0, "t_shoot_cells": ipm_shift.t_shoot_cells}
+                    cand_shift = np.asarray(ipm_shift.magnifications, dtype=np.float64)
+                    del ipm_shift
+                    gc.collect()
+                    m_r0, m_shift, verdict = judge_double(cand, cand_shift, a.ref_root, name, tol)
+                    entry["vs_r0_shift"] = m_shift
+                    entry["vs_r0"] = m_r0
                 else:
+                    m_r0 = cm.map_metrics(cand, reference_map(a.ref_root, name, 1), tol["floor_frac"])
+                    entry["vs_r0"] = m_r0
                     m_truth = cm.map_metrics(cand, reference_map(a.ref_root, cfg.truth, 1), tol["floor_frac"])
                     entry["vs_truth"] = m_truth
                     verdict = cm.evaluate_float(m_truth, tol["float_truth_error"][name]["pixels"], m_r0, tol)

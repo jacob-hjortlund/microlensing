@@ -63,6 +63,11 @@ CONFIGS = {c.name: c for c in [
     _c("stars1e6_d", "double", STARS1E6, {"truth"}),
 ]}
 
+# The quadtree root and the default image plane are centred on (0, 0), so lattice corners on x1 = 0 or x2 = 0 evaluate to exactly
+# 0.0 and sit on the tree's dividing lines at every level; the original kernel's rounding then picks either neighbouring leaf.
+# A 2.5e-5-pixel shift of the source centre moves every corner off those lines without changing the physics.
+SHIFT = ("-cy1", "1e-7", "-cy2", "1e-7")
+
 LADDER = ["nb_f", "nb_d", "rect_f", "hm100_f"]
 # R2p changes only the double build: its ladder entry is nb_d and its regression covers every double configuration of the full matrix
 RUNG_LADDER_SKIP = {"R2p": {"nb_f", "rect_f", "hm100_f"}}
@@ -92,6 +97,21 @@ def full_args(cfg, ref_root):
     if cfg.starfile_from:
         args += ["-sf", str(Path(ref_root) / cfg.starfile_from / "run1" / "ipm_stars.bin")]
     return args
+
+
+def shifted_args(cfg, ref_root):
+    return full_args(cfg, ref_root) + list(SHIFT)
+
+
+def shift_center():
+    """The (center_y1, center_y2) floats of SHIFT, for the Python wrapper's keywords."""
+    args = dict(zip(SHIFT[::2], SHIFT[1::2]))
+    return float(args["-cy1"]), float(args["-cy2"])
+
+
+def double_regression_configs():
+    """Double configurations under regression, in CONFIGS order: each also gets the shifted-centre equivalence check."""
+    return [c for c in CONFIGS.values() if c.build == "double" and ("ladder" in c.sets or "full" in c.sets)]
 
 
 def ordered(configs):
