@@ -55,6 +55,14 @@ public:
     Complex<T> multipole_coeffs[treenode::MAX_EXPANSION_ORDER + 1];
     Complex<T> local_coeffs[treenode::MAX_EXPANSION_ORDER + 1];
 
+    /******************************************************************************
+    filled by ipm_leaf::build_leaf_records: index of this node in the compact leaf
+    arrays used by the shooting kernel (-1 if the node is not a leaf), and the
+    start of its contiguous list of direct (node + neighbour) stars
+    ******************************************************************************/
+    int leaf_index;
+    int direct_begin;
+
 
     /******************************************************************************
 	default constructor
@@ -96,6 +104,9 @@ public:
             multipole_coeffs[i] = Complex<T>();
             local_coeffs[i] = Complex<T>();
         }
+
+        leaf_index = -1;
+        direct_begin = 0;
 	}
     
     /******************************************************************************
@@ -137,6 +148,9 @@ public:
             multipole_coeffs[i] = n.multipole_coeffs[i];
             local_coeffs[i] = n.local_coeffs[i];
         }
+
+        leaf_index = n.leaf_index;
+        direct_begin = n.direct_begin;
 
 		return *this;
 	}
