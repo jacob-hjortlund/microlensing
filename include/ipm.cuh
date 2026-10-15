@@ -3,6 +3,7 @@
 #include "array_functions.cuh"
 #include "complex.cuh"
 #include "ipm_functions.cuh"
+#include "ipm_functions_fast.cuh"
 #include "microlensing.cuh"
 #include "star.cuh"
 #include "stopwatch.hpp"
@@ -413,33 +414,27 @@ private:
 
 	bool shoot_cells(int verbose)
 	{
-		threads = dim3(16, 16);
 		/******************************************************************************
-		launch as many 16x16 blocks as the device keeps resident (occupancy API) instead
-		of one block per SM as get_blocks() does; the grid-stride loops of the kernel
-		accept any grid. both grid dimensions are scaled down by the same factor
+		one block per TILE x TILE tile of cells; launch as many blocks as the device
+		can keep resident (occupancy API), not one per SM as get_blocks() does, so
+		the latency of the tree walk, star loads and atomics can be hidden
 		******************************************************************************/
+		const int tiles_x = (num_ray_threads.re + ipm_fast::TILE - 1) / ipm_fast::TILE;
+		const int tiles_y = (num_ray_threads.im + ipm_fast::TILE - 1) / ipm_fast::TILE;
+		const long long num_tiles = 1LL * tiles_x * tiles_y;
+
 		int blocks_per_sm = 0;
-		cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, shoot_cells_kernel<T>, threads.x * threads.y, 0);
+		cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, ipm_fast::shoot_cells_tiled_kernel<T>, ipm_fast::TILE * ipm_fast::TILE, 0);
 		if (cuda_error("cudaOccupancyMaxActiveBlocksPerMultiprocessor", false, __FILE__, __LINE__)) return false;
 		if (blocks_per_sm < 1) blocks_per_sm = 1;
-		const long long max_blocks = 1LL * blocks_per_sm * cuda_device_prop.multiProcessorCount;
-		long long bx = (num_ray_threads.re - 1) / threads.x + 1;
-		long long by = (num_ray_threads.im - 1) / threads.y + 1;
-		if (bx * by > max_blocks)
-		{
-			double factor = std::sqrt(1.0 * max_blocks / (bx * by));
-			bx = std::max(1LL, static_cast<long long>(bx * factor));
-			by = std::max(1LL, static_cast<long long>(by * factor));
-		}
-		blocks = dim3(static_cast<unsigned int>(bx), static_cast<unsigned int>(by));
-		print_verbose("Shooting with " << bx << " x " << by << " blocks of " << threads.x << " x " << threads.y
-			<< " threads (" << blocks_per_sm << " resident blocks per SM)\n", verbose, 2);
+		long long grid = 1LL * blocks_per_sm * cuda_device_prop.multiProcessorCount;
+		if (grid > num_tiles) grid = num_tiles;
+		print_verbose("Shooting " << num_tiles << " tiles of " << ipm_fast::TILE << "x" << ipm_fast::TILE << " cells with " << grid
+			<< " blocks (" << blocks_per_sm << " resident blocks per SM)\n", verbose, 2);
 
 		unsigned long long int* percentage = nullptr;
 		cudaMallocManaged(&percentage, sizeof(unsigned long long int));
 		if (cuda_error("cudaMallocManaged(*percentage)", false, __FILE__, __LINE__)) return false;
-
 		*percentage = 1;
 
 		/******************************************************************************
@@ -447,18 +442,18 @@ private:
 		******************************************************************************/
 		print_verbose("Shooting cells...\n", verbose, 1);
 		stopwatch.start();
-		shoot_cells_kernel<T> <<<blocks, threads>>> (kappa_tot, shear, theta_star, stars, kappa_star, tree[0],
-			rectangular, corner, approx, taylor_smooth, ray_half_sep, num_ray_threads, center_x, half_length_x,
+		ipm_fast::shoot_cells_tiled_kernel<T> <<<static_cast<unsigned int>(grid), dim3(ipm_fast::TILE, ipm_fast::TILE)>>> (
+			kappa_tot, shear, theta_star, stars, kappa_star, tree[0],
+			rectangular, corner, approx, taylor_smooth,
+			ray_half_sep, num_ray_threads, center_x, half_length_x,
 			center_y, half_length_y, pixels_minima, pixels_saddles, pixels, num_pixels_y, percentage, verbose);
-		if (cuda_error("shoot_rays_kernel", true, __FILE__, __LINE__)) return false;
+		if (cuda_error("shoot_cells_tiled_kernel", true, __FILE__, __LINE__)) return false;
 		t_shoot_cells = stopwatch.stop();
 		print_verbose("\nDone shooting cells. Elapsed time: " << t_shoot_cells << " seconds.\n", verbose, 1);
-
 
 		cudaFree(percentage);
 		if (cuda_error("cudaFree(*percentage)", false, __FILE__, __LINE__)) return false;
 		percentage = nullptr;
-
 
 		if (write_parities)
 		{
