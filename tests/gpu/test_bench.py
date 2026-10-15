@@ -748,7 +748,7 @@ class RegressTests(unittest.TestCase):
             self.assertEqual(len(out["configs"]), 4)
             for c in out["configs"]:
                 self.assertFalse(c["pass"])
-                self.assertTrue(any(f.startswith("check failed: ") and "shape mismatch" in f for f in c["failures"]),
+                self.assertTrue(any(f.startswith("check failed: ValueError: shape mismatch") for f in c["failures"]),
                                 c["failures"])
 
     def test_empty_selection_is_an_error(self):
@@ -779,6 +779,99 @@ class RegressTests(unittest.TestCase):
             out = bench_lib.read_json(result)
             self.assertTrue(out["complete"])
             self.assertEqual(out["n_configs"], 4)
+
+    def test_runs_have_a_timeout_and_failed_runs_are_recorded(self):
+        with tempfile.TemporaryDirectory() as d:
+            build = self.write_fake_regression(d)
+            with mock.patch.object(bench_lib, "run_ipm", wraps=bench_lib.run_ipm) as runs:
+                rc = self.run_fake_regression(d, build, {"FAKE_IPM_FAIL": "1"})
+            self.assertEqual(rc, 1)
+            self.assertEqual(runs.call_count, 4)
+            for call in runs.call_args_list:
+                self.assertEqual(call.kwargs.get("timeout"), 3600)
+            out = bench_lib.read_json(Path(d) / "results" / "regression_ladder.json")
+            self.assertTrue(out["complete"])
+            self.assertEqual(len(out["configs"]), 4)
+            for c in out["configs"]:
+                self.assertFalse(c["pass"])
+                self.assertTrue(any("run failed: exit code 3" in f for f in c["failures"]), c["failures"])
+            self.assertEqual(list((Path(d) / "scratch").glob("*")), [])
+
+    def test_float_rule_is_judged_against_the_truth(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = synthetic_reference(f"{d}/ref", "nb_d", 5.0)
+            # R0-float sits 2e-6 from the truth. The candidate is R0-float itself, so only the truth comparison can fail it.
+            ref_f = Path(d) / "ref" / "nb_f" / "run1"
+            ref_f.mkdir(parents=True)
+            write_map(ref_f / "ipm_magnifications.bin", base * (1 + 2e-6))
+            out = Path(d) / "out"
+            out.mkdir()
+            write_map(out / "ipm_magnifications.bin", base * (1 + 2e-6))
+            res = regress.check_config(configs.CONFIGS["nb_f"], out, f"{d}/ref", self.tolerances(), "R2")
+            self.assertFalse(res["pass"])
+            self.assertTrue(res["failures"] and all("vs truth" in f for f in res["failures"]), res["failures"])
+
+    def test_sum_ratio_is_judged_against_r0_float(self):
+        with tempfile.TemporaryDirectory() as d:
+            truth = synthetic_reference(f"{d}/ref", "nb_d", 5.0)
+            ref_f = Path(d) / "ref" / "nb_f" / "run1"
+            ref_f.mkdir(parents=True)
+            write_map(ref_f / "ipm_magnifications.bin", truth * (1 + 2e-5))
+            out = Path(d) / "out"
+            out.mkdir()
+            write_map(out / "ipm_magnifications.bin", truth)   # equal to the truth, so only the R0-float sum can fail
+            res = regress.check_config(configs.CONFIGS["nb_f"], out, f"{d}/ref", self.tolerances(), "R2")
+            self.assertFalse(res["pass"])
+            self.assertTrue(res["failures"] and all("sum_ratio" in f for f in res["failures"]), res["failures"])
+
+    def test_parity_consistency_fails_alone(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = 5.0 + np.random.default_rng(3).random((30, 20))
+            # self-inconsistent maps: minima + saddles = 0.9 x total, so only the parity check can fail
+            maps = {"ipm_magnifications.bin": base,
+                    "ipm_magnifications_minima.bin": 0.4 * base,
+                    "ipm_magnifications_saddles.bin": 0.5 * base}
+            for name in ("par_d", "par_f"):
+                ref = Path(d) / "ref" / name / "run1"
+                ref.mkdir(parents=True)
+                for fname, arr in maps.items():
+                    write_map(ref / fname, arr)
+            out = Path(d) / "out"
+            out.mkdir()
+            for fname, arr in maps.items():
+                write_map(out / fname, arr)
+            res = regress.check_config(configs.CONFIGS["par_f"], out, f"{d}/ref", self.tolerances(), "R4")
+            self.assertFalse(res["pass"])
+            self.assertTrue(res["failures"] and all(f.startswith("pixels != minima + saddles") for f in res["failures"]),
+                            res["failures"])
+            self.assertTrue(all(entry["verdict"]["pass"] for entry in res["maps"].values()))
+
+    def test_star_file_source_is_information_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = synthetic_reference(f"{d}/ref", "sf_d", 5.0)
+            synthetic_reference(f"{d}/ref", "sf_f", 5.0)
+            ref_nb = Path(d) / "ref" / "nb_f" / "run1"
+            ref_nb.mkdir(parents=True)
+            write_map(ref_nb / "ipm_magnifications.bin", 1.5 * base)   # the source field is 1.5x the candidate
+            out = Path(d) / "out"
+            out.mkdir()
+            write_map(out / "ipm_magnifications.bin", base)
+            tol = self.tolerances()
+            tol["float_truth_error"]["sf_f"] = {"pixels": {"mean": 1e-6, "p999": 1e-5, "p9999": 2e-5, "max": 5e-5}}
+            res = regress.check_config(configs.CONFIGS["sf_f"], out, f"{d}/ref", tol, "R2")
+            self.assertTrue(res["pass"], res["failures"])
+            self.assertAlmostEqual(res["vs_source_field"]["mean"], 1 / 3, places=6)
+
+    def test_unknown_configuration_name_is_an_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                rc = regress.main(["--build", f"{d}/build", "--rung", "R1a", "--only", "nb_f", "nb_ff",
+                                   "--ref-root", f"{d}/ref", "--tolerances", f"{d}/tolerances.json",
+                                   "--results", f"{d}/results", "--scratch", f"{d}/scratch"])
+            self.assertEqual(rc, 2)
+            self.assertIn("unknown configuration(s): nb_ff", err.getvalue())
+            self.assertFalse((Path(d) / "results").exists())
 
 
 if __name__ == "__main__":
