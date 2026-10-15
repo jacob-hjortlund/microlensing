@@ -874,5 +874,41 @@ class RegressTests(unittest.TestCase):
             self.assertFalse((Path(d) / "results").exists())
 
 
+import calibrate  # noqa: E402
+
+
+class CalibrateTests(unittest.TestCase):
+    def test_floors_and_truth_errors(self):
+        with tempfile.TemporaryDirectory() as d:
+            ref = f"{d}/ref"
+            for name in ("nb_f", "nb_d", "rect_f", "rect_d", "hm100_f", "hm100_d", "circ_a0_f", "circ_a0_d",
+                         "rect_a0_f", "rect_a0_d", "par_f", "par_d", "nry10_f", "nry10_d", "big_f", "big_d",
+                         "hm1000_f", "hm1000_d", "sf_f", "sf_d", "stars1e6_f", "stars1e6_d"):
+                parities = name.startswith("par_")
+                base = synthetic_reference(ref, name, 5.0, parities=parities, k=1)
+                if "full" in configs.CONFIGS[name].sets:
+                    for k in (2, 3):
+                        dd = Path(ref) / name / f"run{k}"
+                        dd.mkdir(parents=True)
+                        noisy = base * (1 + 1e-9 * k)
+                        write_map(dd / "ipm_magnifications.bin", noisy)
+                        if parities:
+                            write_map(dd / "ipm_magnifications_minima.bin", 0.4 * noisy)
+                            write_map(dd / "ipm_magnifications_saddles.bin", 0.6 * noisy)
+            with contextlib.redirect_stdout(io.StringIO()):   # calibrate() prints one progress line per map
+                tol, lines, warnings = calibrate.calibrate(ref, compare_maps.default_tolerances())
+            self.assertAlmostEqual(tol["floors"]["nb_d"]["pixels"][1]["max"], 3e-9, places=12)
+            self.assertIn("nb_f", tol["float_truth_error"])
+            self.assertEqual(set(tol["float_truth_error"]["par_f"]), {"pixels", "minima", "saddles"})
+            self.assertEqual(warnings, [])
+            self.assertTrue(any(line.startswith("nb_f") for line in lines))
+
+    def test_warns_when_double_floor_is_close_to_threshold(self):
+        tol = compare_maps.default_tolerances()
+        tol["floors"] = {"nb_d": {"pixels": [{"mean": 0, "p999": 2e-6, "p9999": 0, "offmask_max": 0}]}}
+        self.assertEqual(len(calibrate.sanity_warnings(tol)), 1)
+        self.assertIn("nb_d", calibrate.sanity_warnings(tol)[0])
+
+
 if __name__ == "__main__":
     unittest.main()
