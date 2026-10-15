@@ -277,5 +277,48 @@ class EvaluateRuleTests(unittest.TestCase):
         self.assertAlmostEqual(scaled, value, places=12)
 
 
+import configs  # noqa: E402
+
+
+class ConfigTests(unittest.TestCase):
+    def test_every_float_config_has_a_double_truth_with_identical_args(self):
+        for cfg in configs.CONFIGS.values():
+            self.assertIn(cfg.build, ("float", "double"), cfg.name)
+            if cfg.build == "float":
+                truth = configs.CONFIGS[cfg.truth]
+                self.assertEqual(truth.build, "double", cfg.name)
+                self.assertEqual(truth.args, cfg.args, cfg.name)
+                self.assertEqual(truth.starfile_from, cfg.starfile_from, cfg.name)
+
+    def test_ladder_and_sets(self):
+        self.assertEqual(configs.LADDER, ["nb_f", "nb_d", "rect_f", "hm100_f"])
+        names = [c.name for c in configs.ladder_configs()]
+        self.assertEqual(names, configs.LADDER)
+        self.assertEqual([c.name for c in configs.ladder_configs("R2p")], ["nb_d"])
+        full = {c.name for c in configs.configs_in("full")}
+        self.assertEqual(len(full), 15)
+        self.assertTrue(all(c.build == "double" for c in configs.regression_configs("R2p", "ladder")))
+        self.assertEqual({c.name for c in configs.regression_configs("R3", "full")}, full)
+        self.assertEqual({c.name for c in configs.configs_in("memory")}, {"big_f", "hm1000_f", "stars1e6_f"})
+
+    def test_full_args_and_starfile(self):
+        cfg = configs.CONFIGS["sf_f"]
+        args = configs.full_args(cfg, "/ref")
+        self.assertIn("-sf", args)
+        self.assertEqual(args[args.index("-sf") + 1], "/ref/nb_f/run1/ipm_stars.bin")
+        self.assertEqual(args[:2], ["-rs", configs.SEED])
+        self.assertNotIn("-v", args)
+        self.assertNotIn("-o", args)
+        self.assertEqual(len(args) % 2, 0)
+
+    def test_ordered_puts_starfile_users_last(self):
+        order = [c.name for c in configs.ordered(configs.configs_in("full"))]
+        self.assertGreater(order.index("sf_f"), order.index("nb_f"))
+
+    def test_exe_for(self):
+        self.assertEqual(configs.exe_for("/b", "float").name, "ipm_gpu")
+        self.assertEqual(configs.exe_for("/b", "double").name, "ipm_gpu_double")
+
+
 if __name__ == "__main__":
     unittest.main()
