@@ -194,6 +194,48 @@ class ToleranceTests(unittest.TestCase):
 
 
 class EvaluateRuleTests(unittest.TestCase):
+    def test_double_actual_pass_fail_and_flag(self):
+        tol = compare_maps.default_tolerances()
+        tol["double_actual"]["default"].update(mean=2e-6, p999=3e-5, p9999=4e-4, offmask_max=1e-5, sum_ratio=1e-6, flag_max=1e-2)
+        m = {"mean": 1e-6, "p999": 1e-5, "p9999": 1e-4, "max": 5e-3, "offmask_max": 0.0, "sum_ratio": -1e-7,
+             "finite": True, "nonneg": True}
+        v = compare_maps.evaluate_double_actual(m, tol, "nb_d")   # no entry of its own: the default applies
+        self.assertEqual((v["pass"], v["failures"], v["flags"]), (True, [], []))
+        for key, bad in (("mean", 3e-6), ("p999", 4e-5), ("p9999", 5e-4), ("offmask_max", 2e-5), ("sum_ratio", -2e-6)):
+            v = compare_maps.evaluate_double_actual({**m, key: bad}, tol, "nb_d")
+            self.assertFalse(v["pass"], key)
+            self.assertEqual(len(v["failures"]), 1, key)
+            self.assertTrue(v["failures"][0].endswith("[default]"), v["failures"])
+        v = compare_maps.evaluate_double_actual({**m, "max": 2e-2}, tol, "nb_d")   # a large max alone is a flag, not a failure
+        self.assertTrue(v["pass"])
+        self.assertEqual(len(v["flags"]), 1)
+        self.assertFalse(compare_maps.evaluate_double_actual({**m, "nonneg": False}, tol, "nb_d")["pass"])
+
+    def test_double_actual_uses_the_configurations_own_entry_and_names_it(self):
+        tol = compare_maps.default_tolerances()
+        tol["double_actual"]["nb_d"] = {**tol["double_actual"]["default"], "mean": 1e-6, "flag_max": 1e-2}
+        m = {"mean": 5e-7, "p999": 0.0, "p9999": 0.0, "max": 5e-3, "offmask_max": 0.0, "sum_ratio": 0.0,
+             "finite": True, "nonneg": True}
+        self.assertTrue(compare_maps.evaluate_double_actual(m, tol, "nb_d")["pass"])      # own entry: mean limit 1e-6
+        v = compare_maps.evaluate_double_actual(m, tol, "rect_d")                         # default: mean limit 1e-7
+        self.assertFalse(v["pass"])
+        self.assertIn("[default]", v["failures"][0])
+        self.assertEqual(len(v["flags"]), 1)                                              # max 5e-3 > default flag_max 1e-3
+        v = compare_maps.evaluate_double_actual({**m, "mean": 2e-6}, tol, "nb_d")
+        self.assertIn("[nb_d]", v["failures"][0])
+
+    def test_default_double_actual_matches_double_and_load_merges(self):
+        d = compare_maps.default_tolerances()
+        self.assertEqual(list(d["double_actual"]), ["default"])
+        self.assertEqual({k: v for k, v in d["double_actual"]["default"].items() if k != "flag_max"}, d["double"])
+        self.assertEqual(d["double_actual"]["default"]["flag_max"], 1e-3)
+        self.assertEqual(d["double_shift_sensitivity"], {})
+        with tempfile.TemporaryDirectory() as t:
+            Path(t, "tol.json").write_text(json.dumps({"double_actual": {"nb_d": {"mean": 5e-6}}}))
+            tol = compare_maps.load_tolerances(Path(t, "tol.json"))
+        self.assertEqual(tol["double_actual"]["nb_d"], {"mean": 5e-6})   # an entry replaces nothing but itself
+        self.assertEqual(tol["double_actual"]["default"], d["double_actual"]["default"])
+
     def metrics(self, **over):
         m = {"mean": 1e-9, "p999": 1e-7, "p9999": 1e-7, "max": 1e-6, "offmask_max": 1e-8,
              "sum_ratio": 1e-8, "n_mask": 10, "n_total": 10, "finite": True, "nonneg": True}
@@ -360,6 +402,13 @@ class ConfigTests(unittest.TestCase):
         expected[y] = "0.2729"
         self.assertEqual(hm1000, expected)
         self.assertEqual(hm1000[a], "1")
+
+    def test_shifted_args_and_double_regression_configs(self):
+        cfg = configs.CONFIGS["nb_d"]
+        self.assertEqual(configs.shifted_args(cfg, "/ref"), configs.full_args(cfg, "/ref") + ["-cy1", "1e-7", "-cy2", "1e-7"])
+        self.assertEqual([c.name for c in configs.double_regression_configs()], ["nb_d", "rect_d", "rect_a0_d", "hm100_d"])
+        for c in configs.CONFIGS.values():   # the shift must not collide with a centre already in a configuration
+            self.assertFalse({"-cy1", "-cy2"} & set(c.args), c.name)
 
     def test_exe_for(self):
         self.assertEqual(configs.exe_for("/b", "float").name, "ipm_gpu")
@@ -578,6 +627,37 @@ class MakeReferenceTests(unittest.TestCase):
             self.assertFalse((Path(d) / "scratch" / "nb_f" / "run2").exists())
             self.assertEqual(len(bench_lib.read_json(Path(d) / "results" / "timing_full.json")["records"]), 3)
 
+    def test_shift_creates_shift1_and_records_and_honours_force_and_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            build = fake_build_dir(Path(d) / "build")
+            argv = ["--shift", "--build", str(build), "--ref-root", f"{d}/ref",
+                    "--scratch", f"{d}/scratch", "--results", f"{d}/results"]
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(make_reference.main(argv + ["--only", "nb_d", "hm100_d"]), 0)
+            ref = Path(d) / "ref"
+            self.assertTrue(make_reference.is_complete(ref / "nb_d" / "shift1"))
+            self.assertTrue(make_reference.is_complete(ref / "hm100_d" / "shift1"))
+            self.assertFalse((ref / "rect_d").exists())
+            self.assertFalse((ref / "nb_d" / "run1").exists())      # --shift does not make the matrix
+            self.assertFalse((Path(d) / "results" / "timing_full.json").exists())
+            runs = bench_lib.read_json(Path(d) / "results" / "shift_runs.json")
+            self.assertEqual([r["config"] for r in runs["records"]], ["nb_d", "hm100_d"])
+            self.assertEqual(runs["shift"], list(configs.SHIFT))
+            stamp = (ref / "nb_d" / "shift1" / "ipm_parameter_info.txt").stat().st_mtime_ns
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(make_reference.main(argv), 0)      # all four; two exist and are skipped
+            self.assertEqual(out.getvalue().count("skip "), 2)
+            self.assertEqual((ref / "nb_d" / "shift1" / "ipm_parameter_info.txt").stat().st_mtime_ns, stamp)
+            runs = bench_lib.read_json(Path(d) / "results" / "shift_runs.json")
+            self.assertEqual(sorted(r["config"] for r in runs["records"]), ["hm100_d", "nb_d", "rect_a0_d", "rect_d"])
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(make_reference.main(argv + ["--only", "nb_d", "--force"]), 0)
+            self.assertGreater((ref / "nb_d" / "shift1" / "ipm_parameter_info.txt").stat().st_mtime_ns, stamp)
+            self.assertEqual(len(bench_lib.read_json(Path(d) / "results" / "shift_runs.json")["records"]), 4)   # replaced
+            self.assertFalse((Path(d) / "scratch" / "nb_d" / "shift1").exists())
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(make_reference.main(argv + ["--only", "nb_f"]), 2)   # float configurations have no shift run
+
     def test_failed_run_returns_nonzero(self):
         with tempfile.TemporaryDirectory() as d:
             build = fake_build_dir(Path(d) / "build")
@@ -633,7 +713,8 @@ import regress  # noqa: E402
 
 
 def synthetic_reference(ref_root, name, value, shape=(30, 20), parities=False, k=1):
-    d = Path(ref_root) / name / f"run{k}"
+    """k is a run number or a directory name such as "shift1"."""
+    d = Path(ref_root) / name / (f"run{k}" if isinstance(k, int) else k)
     d.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(7)
     base = value + rng.random(shape)
@@ -655,15 +736,60 @@ class RegressTests(unittest.TestCase):
     def test_double_config_pass_and_fail(self):
         with tempfile.TemporaryDirectory() as d:
             base = synthetic_reference(f"{d}/ref", "nb_d", 5.0)
+            synthetic_reference(f"{d}/ref", "nb_d", 5.0, k="shift1")
+            out, out_shift = Path(d) / "out", Path(d) / "out_shift"
+            out.mkdir()
+            out_shift.mkdir()
+            write_map(out / "ipm_magnifications.bin", base * (1 + 1e-9))
+            write_map(out_shift / "ipm_magnifications.bin", base * (1 + 1e-9))
+            check = lambda: regress.check_config(configs.CONFIGS["nb_d"], out, f"{d}/ref", self.tolerances(), "R3", out_shift)
+            res = check()
+            self.assertTrue(res["pass"], res["failures"])
+            entry = res["maps"]["pixels"]
+            self.assertIn("vs_r0_shift", entry)
+            self.assertTrue(entry["verdict"]["pass"] and entry["verdict_shift"]["pass"])
+            # either comparison alone fails the configuration, and the failure names the comparison
+            write_map(out / "ipm_magnifications.bin", base * (1 + 1e-4))
+            res = check()
+            self.assertFalse(res["pass"])
+            self.assertTrue(all(f.startswith("pixels vs_r0: ") for f in res["failures"]), res["failures"])
+            self.assertTrue(res["maps"]["pixels"]["verdict_shift"]["pass"])
+            write_map(out / "ipm_magnifications.bin", base * (1 + 1e-9))
+            write_map(out_shift / "ipm_magnifications.bin", base * (1 + 1e-4))
+            res = check()
+            self.assertFalse(res["pass"])
+            self.assertTrue(all(f.startswith("pixels vs_r0_shift: ") for f in res["failures"]), res["failures"])
+            self.assertTrue(res["maps"]["pixels"]["verdict"]["pass"])
+
+    def test_double_config_uses_the_calibrated_actual_limits_and_flags_a_large_max(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = synthetic_reference(f"{d}/ref", "nb_d", 5.0)
+            synthetic_reference(f"{d}/ref", "nb_d", 5.0, k="shift1")
+            out, out_shift = Path(d) / "out", Path(d) / "out_shift"
+            out.mkdir()
+            out_shift.mkdir()
+            write_map(out_shift / "ipm_magnifications.bin", base)
+            bumped = base.copy()
+            bumped[0, 0] *= 1.002      # one pixel: mean ~3e-6, max 2e-3
+            write_map(out / "ipm_magnifications.bin", bumped)
+            tol = self.tolerances()
+            tol["double_actual"]["nb_d"] = {**tol["double_actual"]["default"],
+                                            "mean": 1e-5, "p999": 1e-3, "p9999": 1e-2, "sum_ratio": 1e-5}
+            res = regress.check_config(configs.CONFIGS["nb_d"], out, f"{d}/ref", tol, "R3", out_shift)
+            self.assertTrue(res["pass"], res["failures"])
+            self.assertTrue(any(f.startswith("pixels vs_r0: max=") for f in res["flags"]), res["flags"])
+
+    def test_double_config_requires_the_shifted_output_and_reference(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = synthetic_reference(f"{d}/ref", "nb_d", 5.0)
             out = Path(d) / "out"
             out.mkdir()
-            write_map(out / "ipm_magnifications.bin", base * (1 + 1e-9))
-            res = regress.check_config(configs.CONFIGS["nb_d"], out, f"{d}/ref", self.tolerances(), "R3")
-            self.assertTrue(res["pass"], res["failures"])
-            write_map(out / "ipm_magnifications.bin", base * (1 + 1e-4))
-            res = regress.check_config(configs.CONFIGS["nb_d"], out, f"{d}/ref", self.tolerances(), "R3")
-            self.assertFalse(res["pass"])
-            self.assertTrue(any("pixels" in f for f in res["failures"]))
+            write_map(out / "ipm_magnifications.bin", base)
+            with self.assertRaises(ValueError):
+                regress.check_config(configs.CONFIGS["nb_d"], out, f"{d}/ref", self.tolerances(), "R3")
+            with self.assertRaises(FileNotFoundError) as ctx:
+                regress.check_config(configs.CONFIGS["nb_d"], out, f"{d}/ref", self.tolerances(), "R3", out)
+            self.assertIn("nb_d/shift1", str(ctx.exception))
 
     def test_float_config_uses_truth(self):
         with tempfile.TemporaryDirectory() as d:
@@ -701,7 +827,7 @@ class RegressTests(unittest.TestCase):
             out.mkdir()
             write_map(out / "ipm_magnifications.bin", np.ones((3, 3)))
             with self.assertRaises(FileNotFoundError) as ctx:
-                regress.check_config(configs.CONFIGS["nb_d"], out, f"{d}/ref", self.tolerances(), "R1a")
+                regress.check_config(configs.CONFIGS["nb_d"], out, f"{d}/ref", self.tolerances(), "R1a", out)
             self.assertIn("nb_d/run1", str(ctx.exception))
 
     def write_fake_regression(self, d):
@@ -713,6 +839,8 @@ class RegressTests(unittest.TestCase):
             ref.mkdir(parents=True)
             write_map(ref / "ipm_magnifications.bin", np.full((3, 4), 2.0, dtype=np.float32))
             (ref / "ipm_parameter_info.txt").write_text("t_shoot_cells 1.0\n")
+            if name.endswith("_d"):
+                shutil.copytree(ref, ref.with_name("shift1"))
         tol = self.tolerances()
         for name in ("nb_f", "rect_f", "hm100_f"):
             tol["float_truth_error"][name] = {"pixels": {"mean": 1e-6, "p999": 1e-5, "p9999": 2e-5, "max": 5e-5}}
@@ -735,7 +863,32 @@ class RegressTests(unittest.TestCase):
             self.assertTrue(out["complete"])
             self.assertEqual(out["n_configs"], 4)
             self.assertEqual([c["config"] for c in out["configs"]], ["nb_f", "nb_d", "rect_f", "hm100_f"])
+            self.assertEqual([("run_shift" in c) for c in out["configs"]], [False, True, False, False])
+            nb_d = out["configs"][1]
+            self.assertEqual(set(nb_d["run_shift"]), set(nb_d["run"]))
+            self.assertIn("vs_r0_shift", nb_d["maps"]["pixels"])
+            self.assertIn("double_actual", out["tolerances"])
+            self.assertFalse((Path(d) / "scratch" / "nb_d_shift").exists())
             self.assertFalse((Path(d) / "scratch" / "nb_f").exists())
+
+    def test_failed_shift_run_fails_the_double_configuration(self):
+        with tempfile.TemporaryDirectory() as d:
+            build = self.write_fake_regression(d)
+            real = bench_lib.run_ipm
+
+            def fail_shift(exe, args, outdir, **kw):
+                if "-cy1" in args:
+                    exe = "/nonexistent/ipm"
+                return real(exe, args, outdir, **kw)
+            with mock.patch.object(bench_lib, "run_ipm", side_effect=fail_shift):
+                rc = self.run_fake_regression(d, build, {"FAKE_IPM_VALUE": "2.0"})
+            self.assertEqual(rc, 1)
+            out = bench_lib.read_json(Path(d) / "results" / "regression_ladder.json")
+            by_name = {c["config"]: c for c in out["configs"]}
+            self.assertTrue(by_name["nb_f"]["pass"])
+            self.assertFalse(by_name["nb_d"]["pass"])
+            self.assertTrue(any(f.startswith("shift run failed") for f in by_name["nb_d"]["failures"]), by_name["nb_d"]["failures"])
+            self.assertEqual(list((Path(d) / "scratch").glob("*")), [])
 
     def test_check_failure_is_recorded_not_fatal(self):
         with tempfile.TemporaryDirectory() as d:
@@ -787,7 +940,7 @@ class RegressTests(unittest.TestCase):
             with mock.patch.object(bench_lib, "run_ipm", wraps=bench_lib.run_ipm) as runs:
                 rc = self.run_fake_regression(d, build, {"FAKE_IPM_FAIL": "1"})
             self.assertEqual(rc, 1)
-            self.assertEqual(runs.call_count, 4)
+            self.assertEqual(runs.call_count, 5)   # the double configuration runs twice
             for call in runs.call_args_list:
                 self.assertEqual(call.kwargs.get("timeout"), 3600)
             out = bench_lib.read_json(Path(d) / "results" / "regression_ladder.json")
@@ -892,16 +1045,20 @@ def spread_stats(amplitude):
 
 
 def map_path(ref, name, k, which):
-    return Path(ref) / name / f"run{k}" / regress.MAP_FILES[which]
+    return Path(ref) / name / (f"run{k}" if isinstance(k, int) else k) / regress.MAP_FILES[which]
 
 
-def calibration_tree(ref):
+SHIFT_AMPLITUDE = 4e-10   # shift1 = run1 times (1 + SHIFT_AMPLITUDE * SPREAD) for the double regression configurations
+
+
+def calibration_tree(ref, shift=True):
     """Write synthetic references for all 22 configurations; returns {(float configuration, map): amplitude}.
 
     A double configuration has a map level of its own. A float configuration is its double twin times
     (1 + amplitude * SPREAD), with a different amplitude for every configuration and map, and the pixels of a parity
     configuration are minima + saddles. The configurations with three runs get run2 and run3 as run1 times
-    (1 + 2e-9 * SPREAD) and (1 + 3e-9 * SPREAD).
+    (1 + 2e-9 * SPREAD) and (1 + 3e-9 * SPREAD). With shift, the four double regression configurations also get a
+    shift1 directory (see SHIFT_AMPLITUDE).
     """
     texture = np.random.default_rng(7).random(SPREAD.shape)
     maps = {}
@@ -931,6 +1088,11 @@ def calibration_tree(ref):
             for which, arr in run.items():
                 map_path(ref, name, k, which).parent.mkdir(parents=True, exist_ok=True)
                 write_map(map_path(ref, name, k, which), arr)
+    if shift:
+        for cfg in configs.double_regression_configs():
+            path = map_path(ref, cfg.name, "shift1", "pixels")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_map(path, maps[cfg.name]["pixels"] * (1 + SHIFT_AMPLITUDE * SPREAD))
     return amplitude
 
 
@@ -974,8 +1136,63 @@ class CalibrateTests(unittest.TestCase):
             self.assertAlmostEqual(tol["floors"]["nb_d"]["pixels"][1]["max"], 3e-9, places=12)
             self.assertIn("nb_f", tol["float_truth_error"])
             self.assertEqual(set(tol["float_truth_error"]["par_f"]), {"pixels", "minima", "saddles"})
-            self.assertEqual(warnings, [])
+            self.assertEqual(len(warnings), 1)   # no shift1 references in this tree
+            self.assertIn("no shift1 references", warnings[0])
             self.assertTrue(any(line.startswith("nb_f") for line in lines))
+
+    def test_shift_sensitivity_and_derived_double_actual(self):
+        with tempfile.TemporaryDirectory() as d:
+            calibration_tree(f"{d}/ref")
+            # a different shift effect per configuration; the largest drives double_actual
+            perturb(f"{d}/ref", "hm100_d", "shift1", "pixels", 1 + 3e-5)
+            (tol, lines, warnings), printed = run_quietly(calibrate.calibrate, f"{d}/ref", compare_maps.default_tolerances())
+        self.assertEqual(list(tol["double_shift_sensitivity"]), [c.name for c in configs.double_regression_configs()])
+        sens = tol["double_shift_sensitivity"]
+        self.assertAlmostEqual(sens["nb_d"]["max"], SHIFT_AMPLITUDE * 20.0, places=12)
+        self.assertAlmostEqual(sens["hm100_d"]["mean"], 3e-5, delta=1e-7)
+        act, dbl = tol["double_actual"], tol["double"]
+        self.assertEqual(list(act), [c.name for c in configs.double_regression_configs()] + ["default"])
+        # nb_d's sensitivity is far below the signed-off thresholds: they are the floor; only flag_max has its own floor
+        self.assertEqual(act["nb_d"], {**dbl, "flag_max": 1e-3})
+        # hm100_d: 2 x ~3.0e-5 rounded up to one significant figure
+        self.assertEqual(act["hm100_d"]["mean"], 7e-5)
+        for key in ("mean", "p999", "p9999"):
+            self.assertEqual(act["hm100_d"][key], calibrate.round_up_1sf(max(2 * sens["hm100_d"][key], dbl[key])), key)
+        self.assertEqual(act["hm100_d"]["flag_max"], calibrate.round_up_1sf(max(3 * sens["hm100_d"]["max"], 1e-3)))
+        self.assertEqual((act["hm100_d"]["offmask_max"], act["hm100_d"]["sum_ratio"]), (dbl["offmask_max"], dbl["sum_ratio"]))
+        self.assertEqual(act["default"], act["hm100_d"])      # hm100_d has the largest sensitivity everywhere
+        self.assertLess(act["nb_d"]["mean"], act["default"]["mean"])
+        self.assertEqual(tol["double_actual_note"], "calibrated from R0 shift sensitivity; pending user sign-off")
+        self.assertEqual(tol["double"], compare_maps.default_tolerances()["double"])   # the signed-off thresholds are untouched
+        self.assertEqual(sum("shift sensitivity" in line for line in lines), 4)
+        self.assertEqual(sum(line.startswith("double_actual") for line in lines), 5)   # four configurations and the default
+        # the signed-off mean (1e-7) is below the sensitivity of hm100_d (3e-5): a warning for each of the three keys
+        self.assertEqual(sum("is below R0's own shift sensitivity" in w for w in warnings), 3, warnings)
+        self.assertTrue(all(("WARNING " + w) in printed.splitlines() for w in warnings))
+
+    def test_warns_per_missing_shift_reference_when_only_some_exist(self):
+        with tempfile.TemporaryDirectory() as d:
+            calibration_tree(f"{d}/ref")
+            shutil.rmtree(Path(d) / "ref" / "rect_d" / "shift1")
+            (tol, _, warnings), _ = run_quietly(calibrate.calibrate, f"{d}/ref", compare_maps.default_tolerances())
+        self.assertEqual(sorted(tol["double_shift_sensitivity"]), ["hm100_d", "nb_d", "rect_a0_d"])
+        missing = [w for w in warnings if "no shift1 reference" in w]
+        self.assertEqual(len(missing), 1)
+        self.assertTrue(missing[0].startswith("rect_d:"))
+
+    def test_round_up_to_one_significant_figure(self):
+        for x, want in ((1.76e-6, 2e-6), (2e-6, 2e-6), (2.0000001e-6, 3e-6), (0.91, 1.0), (1.1e-3, 2e-3), (0.0, 0.0)):
+            self.assertEqual(calibrate.round_up_1sf(x), want, x)
+
+    def test_without_shift_references_double_actual_keeps_its_defaults_and_warns(self):
+        with tempfile.TemporaryDirectory() as d:
+            calibration_tree(f"{d}/ref", shift=False)
+            (tol, lines, warnings), printed = run_quietly(calibrate.calibrate, f"{d}/ref", compare_maps.default_tolerances())
+        self.assertEqual(tol["double_actual"], compare_maps.default_tolerances()["double_actual"])
+        self.assertEqual(tol["double_shift_sensitivity"], {})
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("WARNING " + warnings[0], printed.splitlines())
+        self.assertFalse(any("shift sensitivity" in line for line in lines))
 
     def test_warns_when_double_floor_is_close_to_threshold(self):
         tol = compare_maps.default_tolerances()
@@ -1011,6 +1228,16 @@ class CalibrateTests(unittest.TestCase):
             calibration_tree(f"{d}/ref")
             (tol, lines, _), printed = run_quietly(calibrate.calibrate, f"{d}/ref", compare_maps.default_tolerances())
         self.assertEqual(printed.splitlines(), lines)
+        extra = [line for line in lines if "shift sensitivity" in line or line.startswith("double_actual")]
+        for line in extra[:4]:   # one line per double regression configuration, then one per double_actual entry
+            name = line.split()[0]
+            sens = tol["double_shift_sensitivity"][name]
+            self.assertEqual(numbers_in(line), [float(f"{sens[k]:.2e}") for k in ("mean", "p999", "p9999", "max")], line)
+        self.assertEqual(len(extra), 9)
+        for line, (name, actual) in zip(extra[4:], tol["double_actual"].items()):
+            self.assertEqual(line.split()[:2], ["double_actual", name])
+            self.assertEqual(numbers_in(line), [float(f"{v:.2e}") for v in actual.values()], line)
+        lines = [line for line in lines if line not in extra]
         shown = [tuple(line.split()[:2]) for line in lines]
         stored = [(name, which) for name, per_map in tol["floors"].items() for which in per_map] + [("par_f", "parity")]
         self.assertEqual(sorted(shown), sorted(stored))   # every map once, plus one parity line
@@ -1345,6 +1572,33 @@ class PythonCheckTests(unittest.TestCase):
             self.assertEqual(kw["half_length_y2"], float(args["-hly2"]), name)
             self.assertEqual(kw.get("is_double", False), cfg.build == "double", name)
             self.assertEqual(kw.get("rectangular", False), args.get("-r", "0") == "1", name)
+
+
+class PythonCheckDoubleTests(unittest.TestCase):
+    def test_shift_center_comes_from_shift(self):
+        self.assertEqual(configs.shift_center(), (1e-7, 1e-7))
+
+    def test_double_verdict_combines_both_parts(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = synthetic_reference(f"{d}/ref", "nb_d", 5.0)
+            synthetic_reference(f"{d}/ref", "nb_d", 5.0, k="shift1")
+            tol = compare_maps.default_tolerances()
+            good, bad = base * (1 + 1e-9), base * (1 + 1e-4)
+            m_r0, m_shift, v = python_check.judge_double(good, good, f"{d}/ref", "nb_d", tol)
+            self.assertTrue(v["pass"], v["failures"])
+            self.assertLess(m_r0["mean"], 1e-8)
+            v = python_check.judge_double(bad, good, f"{d}/ref", "nb_d", tol)[2]
+            self.assertFalse(v["pass"])
+            self.assertTrue(v["failures"] and all(f.startswith("vs_r0: ") for f in v["failures"]), v["failures"])
+            v = python_check.judge_double(good, bad, f"{d}/ref", "nb_d", tol)[2]
+            self.assertFalse(v["pass"])
+            self.assertTrue(v["failures"] and all(f.startswith("vs_r0_shift: ") for f in v["failures"]), v["failures"])
+            tol["double_actual"]["nb_d"] = {**tol["double_actual"]["default"], "flag_max": 1e-9}   # only a flag
+            v = python_check.judge_double(base * (1 + 1e-8), base, f"{d}/ref", "nb_d", tol)[2]
+            self.assertTrue(v["pass"], v["failures"])
+            self.assertTrue(any(f.startswith("vs_r0: max=") for f in v["flags"]), v["flags"])
+            with self.assertRaises(FileNotFoundError):
+                python_check.judge_double(good, good, f"{d}/ref", "rect_d", tol)
 
 
 import report  # noqa: E402

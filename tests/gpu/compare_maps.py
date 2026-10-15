@@ -19,6 +19,9 @@ def default_tolerances():
         "floor_frac": 1e-3,
         "parity_consistency": 1e-5,
         "double": {"mean": 1e-7, "p999": 1e-5, "p9999": 3e-5, "offmask_max": 1e-5, "sum_ratio": 1e-6},
+        "double_actual": {"default": {"mean": 1e-7, "p999": 1e-5, "p9999": 3e-5, "offmask_max": 1e-5, "sum_ratio": 1e-6,
+                                      "flag_max": 1e-3}},
+        "double_shift_sensitivity": {},
         "float": {"ratio": 1.5, "flag_ratio_max": 3.0, "sum_ratio": 1e-5},
         "floors": {},
         "float_truth_error": {},
@@ -91,6 +94,22 @@ def evaluate_double(m, tol):
     if abs(m["sum_ratio"]) > d["sum_ratio"]:
         fails.append(f"|sum_ratio|={abs(m['sum_ratio']):.3e} > {d['sum_ratio']:.1e}")
     return {"pass": not fails, "failures": fails, "flags": []}
+
+
+def evaluate_double_actual(m, tol, config_name=None):
+    """Real-configuration rule for double builds: R0's own shift sensitivity of the configuration bounds the limits
+    (its entry in tol["double_actual"], else "default"); a large max is only flagged. Messages name the entry used."""
+    entries = tol["double_actual"]
+    entry = config_name if entries.get(config_name) else "default"
+    d = entries[entry]
+    fails = _common_failures(m)
+    for key in ("mean", "p999", "p9999", "offmask_max"):
+        if m[key] > d[key]:
+            fails.append(f"{key}={m[key]:.3e} > {d[key]:.1e} [{entry}]")
+    if abs(m["sum_ratio"]) > d["sum_ratio"]:
+        fails.append(f"|sum_ratio|={abs(m['sum_ratio']):.3e} > {d['sum_ratio']:.1e} [{entry}]")
+    flags = [f"max={m['max']:.3e} > {d['flag_max']:.1e} [{entry}]"] if m["max"] > d["flag_max"] else []
+    return {"pass": not fails, "failures": fails, "flags": flags}
 
 
 def evaluate_float(m_truth, ref_truth, m_r0, tol):
