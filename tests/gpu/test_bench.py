@@ -762,6 +762,24 @@ class RegressTests(unittest.TestCase):
             self.assertIn("no configurations selected", err.getvalue())
             self.assertFalse((Path(d) / "results").exists())
 
+    def test_earlier_result_file_does_not_survive_an_abort(self):
+        with tempfile.TemporaryDirectory() as d:
+            build = self.write_fake_regression(d)
+            result = Path(d) / "results" / "regression_ladder.json"
+            bench_lib.write_json(result, {"complete": True, "pass": True, "configs": []})
+            # KeyboardInterrupt stands in for a killed job: it is not an Exception, so the per-configuration handler does not see it
+            with mock.patch.object(bench_lib, "run_ipm", side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    self.run_fake_regression(d, build, {"FAKE_IPM_VALUE": "2.0"})
+            out = bench_lib.read_json(result)
+            self.assertFalse(out["complete"])
+            self.assertEqual(out["configs"], [])
+            # a later complete run replaces the file
+            self.assertEqual(self.run_fake_regression(d, build, {"FAKE_IPM_VALUE": "2.0"}), 0)
+            out = bench_lib.read_json(result)
+            self.assertTrue(out["complete"])
+            self.assertEqual(out["n_configs"], 4)
+
 
 if __name__ == "__main__":
     unittest.main()
