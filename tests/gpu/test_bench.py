@@ -1188,5 +1188,63 @@ class CalibrateTests(unittest.TestCase):
                 self.assertIn("WARNING " + w, printed.splitlines())
 
 
+import time_rung  # noqa: E402
+import time_ladder  # noqa: E402
+
+
+class TimingTests(unittest.TestCase):
+    def test_summarize_medians(self):
+        recs = [{"config": "nb_f", "ok": True, "wall_s": 3.0, "t_shoot_cells": 2.0},
+                {"config": "nb_f", "ok": True, "wall_s": 1.0, "t_shoot_cells": 0.5},
+                {"config": "nb_f", "ok": True, "wall_s": 2.0, "t_shoot_cells": 1.0},
+                {"config": "nb_d", "ok": False, "wall_s": 9.0, "t_shoot_cells": None}]
+        s = time_rung.summarize(recs)
+        self.assertEqual(s["nb_f"], {"median_wall_s": 2.0, "median_t_shoot_cells": 1.0, "n": 3})
+        self.assertNotIn("nb_d", s)
+
+    def test_time_rung_main_with_fake(self):
+        with tempfile.TemporaryDirectory() as d:
+            build = fake_build_dir(Path(d) / "build")
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = time_rung.main(["--build", str(build), "--rung", "R1a", "--repeats", "2", "--ref-root", f"{d}/ref",
+                                     "--results", f"{d}/results", "--scratch", f"{d}/scratch", "--no-warmup"])
+            self.assertEqual(rc, 0)
+            out = bench_lib.read_json(Path(d) / "results" / "timing_ladder.json")
+            self.assertEqual(out["repeats"], 2)
+            self.assertEqual(len(out["records"]), 8)
+            self.assertEqual(out["summary"]["hm100_f"]["n"], 2)
+            self.assertEqual(out["summary"]["nb_d"]["median_t_shoot_cells"], 0.123)
+            self.assertFalse((Path(d) / "scratch" / "nb_f").exists())
+            # existing results are not overwritten without --force
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = time_rung.main(["--build", str(build), "--rung", "R1a", "--ref-root", f"{d}/ref",
+                                     "--results", f"{d}/results", "--scratch", f"{d}/scratch", "--no-warmup"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(bench_lib.read_json(Path(d) / "results" / "timing_ladder.json")["repeats"], 2)
+
+    def test_time_ladder_interleaves_and_resumes(self):
+        with tempfile.TemporaryDirectory() as d:
+            builds = Path(d) / "builds"
+            for rung in ("R0", "R2p", "R5"):
+                fake_build_dir(builds / rung)
+            out_path = Path(d) / "ladder.json"
+            argv = ["--rungs", "R0", "R2p", "R5", "--builds-root", str(builds), "--repeats", "2",
+                    "--ref-root", f"{d}/ref", "--out", str(out_path), "--scratch", f"{d}/scratch", "--no-warmup"]
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(time_ladder.main(argv), 0)
+            out = bench_lib.read_json(out_path)
+            order = [(r["repeat"], r["rung"], r["config"]) for r in out["records"]]
+            self.assertEqual(order[:5], [(1, "R0", "nb_f"), (1, "R0", "nb_d"), (1, "R0", "rect_f"), (1, "R0", "hm100_f"), (1, "R2p", "nb_d")])
+            self.assertEqual(len(out["records"]), 2 * (4 + 1 + 4))
+            self.assertEqual(out["summary"]["R2p"]["nb_d"]["n"], 2)
+            self.assertNotIn("nb_f", out["summary"]["R2p"])
+            # resume: drop the last record and rerun; only that one is re-measured
+            out["records"].pop()
+            bench_lib.write_json(out_path, out)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(time_ladder.main(argv), 0)
+            self.assertEqual(len(bench_lib.read_json(out_path)["records"]), 18)
+
+
 if __name__ == "__main__":
     unittest.main()
