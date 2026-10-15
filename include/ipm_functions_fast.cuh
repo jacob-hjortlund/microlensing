@@ -183,12 +183,6 @@ namespace ipm_fast
 						  z.im * (1 - kappa - gamma) - a_star.im - a_local.im - a_smooth.im);
 	}
 
-	template <typename T>
-	__device__ __forceinline__ bool inside(Complex<T> z, const TreeNode<T>* node)
-	{
-		return fabs(z.re - node->center.re) <= node->half_length && fabs(z.im - node->center.im) <= node->half_length;
-	}
-
 	/******************************************************************************
 	lens equation evaluated from the compact leaf data (shared or global memory):
 	direct stars from one contiguous padded list, local coefficients in SoA form
@@ -271,7 +265,7 @@ namespace ipm_fast
 	  cell and warp-aggregated before the atomic
 
 	\tparam T -- precision of the lens mapping and of the pixel arrays
-	\tparam P -- precision of the pixel-allocation arithmetic (float is enough)
+	\tparam P -- precision of the pixel-allocation arithmetic (the map precision T in both builds)
 	******************************************************************************/
 	template <typename T, typename P>
 	__global__ void __launch_bounds__(TILE * TILE, min_blocks_per_sm<T>())
@@ -286,7 +280,6 @@ namespace ipm_fast
 		//plain arrays: a class with a constructor cannot be a __shared__ variable
 		__shared__ T s_cre[NCORNER];
 		__shared__ T s_cim[NCORNER];
-		__shared__ TreeNode<T>* s_node;
 		__shared__ int s_leaf;
 		__shared__ T s_lcx, s_lcy, s_lhl;
 		__shared__ int s_lp, s_lcount;
@@ -322,7 +315,6 @@ namespace ipm_fast
 			{
 				Complex<T> xc(origin.re + step.re * (i0 + TILE / 2), origin.im + step.im * (j0 + TILE / 2));
 				TreeNode<T>* node = treenode::get_nearest_node(xc, root);
-				s_node = node;
 				s_leaf = node->leaf_index;
 				if (s_leaf >= 0)
 				{
