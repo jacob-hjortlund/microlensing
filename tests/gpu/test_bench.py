@@ -628,5 +628,108 @@ class MakeReferenceTests(unittest.TestCase):
             self.assertEqual(list((Path(d) / "ref").rglob("*.partial")), [])
 
 
+import regress  # noqa: E402
+
+
+def synthetic_reference(ref_root, name, value, shape=(30, 20), parities=False, k=1):
+    d = Path(ref_root) / name / f"run{k}"
+    d.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(7)
+    base = value + rng.random(shape)
+    write_map(d / "ipm_magnifications.bin", base.astype(np.float64))
+    if parities:
+        write_map(d / "ipm_magnifications_minima.bin", (0.4 * base).astype(np.float64))
+        write_map(d / "ipm_magnifications_saddles.bin", (0.6 * base).astype(np.float64))
+    (d / "ipm_parameter_info.txt").write_text("t_shoot_cells 1.0\n")
+    return base
+
+
+class RegressTests(unittest.TestCase):
+    def tolerances(self):
+        tol = compare_maps.default_tolerances()
+        err = {"mean": 1e-6, "p999": 1e-5, "p9999": 2e-5, "max": 5e-5}
+        tol["float_truth_error"] = {"nb_f": {"pixels": err}, "par_f": {"pixels": err, "minima": err, "saddles": err}}
+        return tol
+
+    def test_double_config_pass_and_fail(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = synthetic_reference(f"{d}/ref", "nb_d", 5.0)
+            out = Path(d) / "out"
+            out.mkdir()
+            write_map(out / "ipm_magnifications.bin", base * (1 + 1e-9))
+            res = regress.check_config(configs.CONFIGS["nb_d"], out, f"{d}/ref", self.tolerances(), "R3")
+            self.assertTrue(res["pass"], res["failures"])
+            write_map(out / "ipm_magnifications.bin", base * (1 + 1e-4))
+            res = regress.check_config(configs.CONFIGS["nb_d"], out, f"{d}/ref", self.tolerances(), "R3")
+            self.assertFalse(res["pass"])
+            self.assertTrue(any("pixels" in f for f in res["failures"]))
+
+    def test_float_config_uses_truth(self):
+        with tempfile.TemporaryDirectory() as d:
+            truth = synthetic_reference(f"{d}/ref", "nb_d", 5.0)
+            synthetic_reference(f"{d}/ref", "nb_f", 5.0)      # same values: R0-float == truth here
+            out = Path(d) / "out"
+            out.mkdir()
+            write_map(out / "ipm_magnifications.bin", (truth * (1 + 1e-6)).astype(np.float32))
+            res = regress.check_config(configs.CONFIGS["nb_f"], out, f"{d}/ref", self.tolerances(), "R2")
+            self.assertTrue(res["pass"], res["failures"])
+            self.assertIn("vs_truth", res["maps"]["pixels"])
+            write_map(out / "ipm_magnifications.bin", (truth * (1 + 1e-4)).astype(np.float32))
+            res = regress.check_config(configs.CONFIGS["nb_f"], out, f"{d}/ref", self.tolerances(), "R2")
+            self.assertFalse(res["pass"])
+
+    def test_parity_maps_are_checked(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = synthetic_reference(f"{d}/ref", "par_d", 5.0, parities=True)
+            synthetic_reference(f"{d}/ref", "par_f", 5.0, parities=True)
+            out = Path(d) / "out"
+            out.mkdir()
+            write_map(out / "ipm_magnifications.bin", base.astype(np.float32))
+            write_map(out / "ipm_magnifications_minima.bin", (0.4 * base).astype(np.float32))
+            write_map(out / "ipm_magnifications_saddles.bin", (0.6 * base).astype(np.float32))
+            res = regress.check_config(configs.CONFIGS["par_f"], out, f"{d}/ref", self.tolerances(), "R4")
+            self.assertTrue(res["pass"], res["failures"])
+            self.assertEqual(set(res["maps"]), {"pixels", "minima", "saddles"})
+            write_map(out / "ipm_magnifications_saddles.bin", (0.7 * base).astype(np.float32))
+            res = regress.check_config(configs.CONFIGS["par_f"], out, f"{d}/ref", self.tolerances(), "R4")
+            self.assertFalse(res["pass"])
+
+    def test_missing_reference_is_an_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "out"
+            out.mkdir()
+            write_map(out / "ipm_magnifications.bin", np.ones((3, 3)))
+            with self.assertRaises(FileNotFoundError) as ctx:
+                regress.check_config(configs.CONFIGS["nb_d"], out, f"{d}/ref", self.tolerances(), "R1a")
+            self.assertIn("nb_d/run1", str(ctx.exception))
+
+    def test_main_with_fake_executable(self):
+        with tempfile.TemporaryDirectory() as d:
+            build = fake_build_dir(Path(d) / "build")
+            # fake writes float32 maps of constant 2.0; references of the same value pass
+            for name in ("nb_d", "nb_f", "rect_d", "rect_f", "hm100_d", "hm100_f"):
+                ref = Path(d) / "ref" / name / "run1"
+                ref.mkdir(parents=True)
+                write_map(ref / "ipm_magnifications.bin", np.full((3, 4), 2.0, dtype=np.float32))
+                (ref / "ipm_parameter_info.txt").write_text("t_shoot_cells 1.0\n")
+            tol = self.tolerances()
+            for name in ("nb_f", "rect_f", "hm100_f"):
+                tol["float_truth_error"][name] = {"pixels": {"mean": 1e-6, "p999": 1e-5, "p9999": 2e-5, "max": 5e-5}}
+            bench_lib.write_json(Path(d) / "tolerances.json", tol)
+            os.environ["FAKE_IPM_VALUE"] = "2.0"
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = regress.main(["--build", str(build), "--rung", "R1a", "--ref-root", f"{d}/ref",
+                                       "--tolerances", f"{d}/tolerances.json", "--results", f"{d}/results",
+                                       "--scratch", f"{d}/scratch"])
+            finally:
+                os.environ.pop("FAKE_IPM_VALUE")
+            self.assertEqual(rc, 0)
+            out = bench_lib.read_json(Path(d) / "results" / "regression_ladder.json")
+            self.assertTrue(out["pass"])
+            self.assertEqual([c["config"] for c in out["configs"]], ["nb_f", "nb_d", "rect_f", "hm100_f"])
+            self.assertFalse((Path(d) / "scratch" / "nb_f").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
