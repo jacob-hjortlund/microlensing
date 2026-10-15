@@ -10,8 +10,9 @@
 #include "stopwatch.hpp"
 #include "util/util.cuh"
 
+#include <thrust/device_ptr.h> //for thrust::device_ptr
 #include <thrust/execution_policy.h> //for thrust::device
-#include <thrust/extrema.h> //for thrust::min_element, thrust::max_element
+#include <thrust/extrema.h> //for thrust::minmax_element
 #include <thrust/fill.h> //for thrust::fill
 #include <thrust/functional.h> //for thrust::plus
 #include <thrust/transform.h> //for thrust::transform
@@ -113,10 +114,18 @@ private:
 
 	/******************************************************************************
 	dynamic memory
+	the maps live in plain device memory (cudaMalloc) while they are being built
+	and are copied once into pinned host memory afterwards. the host copies are
+	what get_pixels() returns and what the file writers read. this replaces the
+	fault-driven migrations of cudaMallocManaged, which for large maps cost more
+	than the shooting itself.
 	******************************************************************************/
-	T* pixels = nullptr;
-	T* pixels_minima = nullptr;
-	T* pixels_saddles = nullptr;
+	T* pixels = nullptr;          //host (pinned)
+	T* pixels_minima = nullptr;   //host (pinned)
+	T* pixels_saddles = nullptr;  //host (pinned)
+	T* d_pixels = nullptr;        //device
+	T* d_pixels_minima = nullptr; //device
+	T* d_pixels_saddles = nullptr; //device
 
 	/******************************************************************************
 	compact tree for the shooting kernel (device)
@@ -155,17 +164,29 @@ private:
 
 		if (!Microlensing<T>::clear_memory(verbose, return_on_error)) return false;
 
-		cudaFree(pixels);
-		if (return_on_error && cuda_error("cudaFree(*pixels)", false, __FILE__, __LINE__)) return false;
+		cudaFreeHost(pixels);
+		if (return_on_error && cuda_error("cudaFreeHost(*pixels)", false, __FILE__, __LINE__)) return false;
 		pixels = nullptr;
 		
-		cudaFree(pixels_minima);
-		if (return_on_error && cuda_error("cudaFree(*pixels_minima)", false, __FILE__, __LINE__)) return false;
+		cudaFreeHost(pixels_minima);
+		if (return_on_error && cuda_error("cudaFreeHost(*pixels_minima)", false, __FILE__, __LINE__)) return false;
 		pixels_minima = nullptr;
 		
-		cudaFree(pixels_saddles);
-		if (return_on_error && cuda_error("cudaFree(*pixels_saddles)", false, __FILE__, __LINE__)) return false;
+		cudaFreeHost(pixels_saddles);
+		if (return_on_error && cuda_error("cudaFreeHost(*pixels_saddles)", false, __FILE__, __LINE__)) return false;
 		pixels_saddles = nullptr;
+
+		cudaFree(d_pixels);
+		if (return_on_error && cuda_error("cudaFree(*d_pixels)", false, __FILE__, __LINE__)) return false;
+		d_pixels = nullptr;
+
+		cudaFree(d_pixels_minima);
+		if (return_on_error && cuda_error("cudaFree(*d_pixels_minima)", false, __FILE__, __LINE__)) return false;
+		d_pixels_minima = nullptr;
+
+		cudaFree(d_pixels_saddles);
+		if (return_on_error && cuda_error("cudaFree(*d_pixels_saddles)", false, __FILE__, __LINE__)) return false;
+		d_pixels_saddles = nullptr;
 
 		cudaFree(leaves);
 		if (return_on_error && cuda_error("cudaFree(*leaves)", false, __FILE__, __LINE__)) return false;
@@ -411,16 +432,24 @@ private:
 		if (!Microlensing<T>::allocate_initialize_memory(verbose)) return false;
 
 		/******************************************************************************
-		allocate memory for pixels
+		allocate memory for pixels: device arrays for accumulation, pinned host
+		arrays for the results
 		******************************************************************************/
-		cudaMallocManaged(&pixels, (1ULL * num_pixels_y.re * num_pixels_y.im) * sizeof(T));
-		if (cuda_error("cudaMallocManaged(*pixels)", false, __FILE__, __LINE__)) return false;
+		const size_t pixel_bytes = (1ULL * num_pixels_y.re * num_pixels_y.im) * sizeof(T);
+		cudaMalloc(&d_pixels, pixel_bytes);
+		if (cuda_error("cudaMalloc(*d_pixels)", false, __FILE__, __LINE__)) return false;
+		cudaMallocHost(&pixels, pixel_bytes);
+		if (cuda_error("cudaMallocHost(*pixels)", false, __FILE__, __LINE__)) return false;
 		if (write_parities)
 		{
-			cudaMallocManaged(&pixels_minima, (1ULL * num_pixels_y.re * num_pixels_y.im) * sizeof(T));
-			if (cuda_error("cudaMallocManaged(*pixels_minima)", false, __FILE__, __LINE__)) return false;
-			cudaMallocManaged(&pixels_saddles, (1ULL * num_pixels_y.re * num_pixels_y.im) * sizeof(T));
-			if (cuda_error("cudaMallocManaged(*pixels_saddles)", false, __FILE__, __LINE__)) return false;
+			cudaMalloc(&d_pixels_minima, pixel_bytes);
+			if (cuda_error("cudaMalloc(*d_pixels_minima)", false, __FILE__, __LINE__)) return false;
+			cudaMalloc(&d_pixels_saddles, pixel_bytes);
+			if (cuda_error("cudaMalloc(*d_pixels_saddles)", false, __FILE__, __LINE__)) return false;
+			cudaMallocHost(&pixels_minima, pixel_bytes);
+			if (cuda_error("cudaMallocHost(*pixels_minima)", false, __FILE__, __LINE__)) return false;
+			cudaMallocHost(&pixels_saddles, pixel_bytes);
+			if (cuda_error("cudaMallocHost(*pixels_saddles)", false, __FILE__, __LINE__)) return false;
 		}
 
 		t_elapsed = stopwatch.stop();
@@ -433,11 +462,14 @@ private:
 		print_verbose("Initializing array values...\n", verbose, 3);
 		stopwatch.start();
 
-		thrust::fill(thrust::device, pixels, pixels + (1ULL * num_pixels_y.re * num_pixels_y.im), 0);
+		cudaMemset(d_pixels, 0, pixel_bytes);
+		if (cuda_error("cudaMemset(*d_pixels)", false, __FILE__, __LINE__)) return false;
 		if (write_parities)
 		{
-			thrust::fill(thrust::device, pixels_minima, pixels_minima + (1ULL * num_pixels_y.re * num_pixels_y.im), 0);
-			thrust::fill(thrust::device, pixels_saddles, pixels_saddles + (1ULL * num_pixels_y.re * num_pixels_y.im), 0);
+			cudaMemset(d_pixels_minima, 0, pixel_bytes);
+			if (cuda_error("cudaMemset(*d_pixels_minima)", false, __FILE__, __LINE__)) return false;
+			cudaMemset(d_pixels_saddles, 0, pixel_bytes);
+			if (cuda_error("cudaMemset(*d_pixels_saddles)", false, __FILE__, __LINE__)) return false;
 		}
 
 		t_elapsed = stopwatch.stop();
@@ -494,7 +526,7 @@ private:
 			leaves, leaf_coef_re, leaf_coef_im, expansion_order + 1, direct_stars,
 			rectangular, corner, approx, taylor_smooth, smooth_const,
 			ray_half_sep, num_ray_threads, center_x, half_length_x,
-			center_y, half_length_y, pixels_minima, pixels_saddles, pixels, num_pixels_y, percentage, verbose);
+			center_y, half_length_y, d_pixels_minima, d_pixels_saddles, d_pixels, num_pixels_y, percentage, verbose);
 		if (cuda_error("shoot_cells_tiled_kernel", true, __FILE__, __LINE__)) return false;
 		t_shoot_cells = stopwatch.stop();
 		print_verbose("\nDone shooting cells. Elapsed time: " << t_shoot_cells << " seconds.\n", verbose, 1);
@@ -506,10 +538,10 @@ private:
 		if (write_parities)
 		{
 			print_verbose("Adding arrays...\n", verbose, 2);
-			thrust::transform(thrust::device, 
-							  pixels_minima, pixels_minima + (1ULL * num_pixels_y.re * num_pixels_y.im), 
-							  pixels_saddles, 
-							  pixels, 
+			thrust::transform(thrust::device,
+							  thrust::device_pointer_cast(d_pixels_minima), thrust::device_pointer_cast(d_pixels_minima) + (1ULL * num_pixels_y.re * num_pixels_y.im),
+							  thrust::device_pointer_cast(d_pixels_saddles),
+							  thrust::device_pointer_cast(d_pixels),
 							  thrust::plus<T>());
 			print_verbose("Done adding arrays.\n", verbose, 2);
 		}
@@ -538,9 +570,23 @@ private:
 
 			/******************************************************************************
 			histogram of mu
+			one fused min/max pass per array (device memory, so go through
+			thrust::device_ptr; dereferencing copies the value to the host)
 			******************************************************************************/
-			min_mag = std::round(*thrust::min_element(thrust::device, pixels, pixels + (1ULL * num_pixels_y.re * num_pixels_y.im)) * factor);
-			max_mag = std::round(*thrust::max_element(thrust::device, pixels, pixels + (1ULL * num_pixels_y.re * num_pixels_y.im)) * factor);
+			const size_t npix_total = 1ULL * num_pixels_y.re * num_pixels_y.im;
+			auto minmax = [&](T* d_arr, T& lo, T& hi)
+			{
+				thrust::device_ptr<T> dp = thrust::device_pointer_cast(d_arr);
+				auto mm = thrust::minmax_element(thrust::device, dp, dp + npix_total);
+				lo = *mm.first;
+				hi = *mm.second;
+			};
+			T lo_all, hi_all;
+			minmax(d_pixels, lo_all, hi_all);
+			min_mag = std::round(lo_all * factor);
+			max_mag = std::round(hi_all * factor);
+			min_log_mag = std::round(std::log10(lo_all) * factor);
+			max_log_mag = std::round(std::log10(hi_all) * factor);
 
 			T mu_min_theory = 1 / ((1 - kappa_tot + kappa_star) * (1 - kappa_tot + kappa_star));
 			T mu_min_actual = 1.0 * min_mag / factor;
@@ -556,8 +602,11 @@ private:
 
 			if (write_parities)
 			{
-				int min_mag_minima = std::round(*thrust::min_element(thrust::device, pixels_minima, pixels_minima + (1ULL * num_pixels_y.re * num_pixels_y.im)) * factor);
-				int max_mag_minima = std::round(*thrust::max_element(thrust::device, pixels_minima, pixels_minima + (1ULL * num_pixels_y.re * num_pixels_y.im)) * factor);
+				T lo_min, hi_min, lo_sad, hi_sad;
+				minmax(d_pixels_minima, lo_min, hi_min);
+				minmax(d_pixels_saddles, lo_sad, hi_sad);
+				int min_mag_minima = std::round(lo_min * factor);
+				int max_mag_minima = std::round(hi_min * factor);
 
 				mu_min_actual = 1.0 * min_mag_minima / factor;
 
@@ -570,11 +619,19 @@ private:
 					print_verbose("\n", verbose * (verbose < 2), 1);
 				}
 
-				int min_mag_saddles = std::round(*thrust::min_element(thrust::device, pixels_saddles, pixels_saddles + (1ULL * num_pixels_y.re * num_pixels_y.im)) * factor);
-				int max_mag_saddles = std::round(*thrust::max_element(thrust::device, pixels_saddles, pixels_saddles + (1ULL * num_pixels_y.re * num_pixels_y.im)) * factor);
+				int min_mag_saddles = std::round(lo_sad * factor);
+				int max_mag_saddles = std::round(hi_sad * factor);
 
 				min_mag = std::min({min_mag, min_mag_minima, min_mag_saddles});
 				max_mag = std::max({max_mag, max_mag_minima, max_mag_saddles});
+
+				int min_log_mag_minima = std::round(std::log10(lo_min) * factor);
+				int max_log_mag_minima = std::round(std::log10(hi_min) * factor);
+				int min_log_mag_saddles = std::round(std::log10(lo_sad) * factor);
+				int max_log_mag_saddles = std::round(std::log10(hi_sad) * factor);
+
+				min_log_mag = std::min({min_log_mag, min_log_mag_minima, min_log_mag_saddles});
+				max_log_mag = std::max({max_log_mag, max_log_mag_minima, max_log_mag_saddles});
 			}
 
 			histogram_length = max_mag - min_mag + 1;
@@ -601,35 +658,20 @@ private:
 			set_threads(threads, 16, 16);
 			set_blocks(threads, blocks, num_pixels_y.re, num_pixels_y.im);
 
-			histogram_kernel<T> <<<blocks, threads>>> (pixels, num_pixels_y, min_mag, histogram, factor);
+			histogram_kernel<T> <<<blocks, threads>>> (d_pixels, num_pixels_y, min_mag, histogram, factor);
 			if (cuda_error("histogram_kernel", true, __FILE__, __LINE__)) return false;
 			if (write_parities)
 			{
-				histogram_kernel<T> <<<blocks, threads>>> (pixels_minima, num_pixels_y, min_mag, histogram_minima, factor);
+				histogram_kernel<T> <<<blocks, threads>>> (d_pixels_minima, num_pixels_y, min_mag, histogram_minima, factor);
 				if (cuda_error("histogram_kernel", true, __FILE__, __LINE__)) return false;
-				histogram_kernel<T> <<<blocks, threads>>> (pixels_saddles, num_pixels_y, min_mag, histogram_saddles, factor);
+				histogram_kernel<T> <<<blocks, threads>>> (d_pixels_saddles, num_pixels_y, min_mag, histogram_saddles, factor);
 				if (cuda_error("histogram_kernel", true, __FILE__, __LINE__)) return false;
 			}
 			
 
 			/******************************************************************************
-			histogram of log_10(mu)
+			histogram of log_10(mu) (ranges computed above)
 			******************************************************************************/
-
-			min_log_mag = std::round(std::log10(*thrust::min_element(thrust::device, pixels, pixels + (1ULL * num_pixels_y.re * num_pixels_y.im))) * factor);
-			max_log_mag = std::round(std::log10(*thrust::max_element(thrust::device, pixels, pixels + (1ULL * num_pixels_y.re * num_pixels_y.im))) * factor);
-
-			if (write_parities)
-			{
-				int min_log_mag_minima = std::round(std::log10(*thrust::min_element(thrust::device, pixels_minima, pixels_minima + (1ULL * num_pixels_y.re * num_pixels_y.im))) * factor);
-				int max_log_mag_minima = std::round(std::log10(*thrust::max_element(thrust::device, pixels_minima, pixels_minima + (1ULL * num_pixels_y.re * num_pixels_y.im))) * factor);
-
-				int min_log_mag_saddles = std::round(std::log10(*thrust::min_element(thrust::device, pixels_saddles, pixels_saddles + (1ULL * num_pixels_y.re * num_pixels_y.im))) * factor);
-				int max_log_mag_saddles = std::round(std::log10(*thrust::max_element(thrust::device, pixels_saddles, pixels_saddles + (1ULL * num_pixels_y.re * num_pixels_y.im))) * factor);
-
-				min_log_mag = std::min({min_log_mag, min_log_mag_minima, min_log_mag_saddles});
-				max_log_mag = std::max({max_log_mag, max_log_mag_minima, max_log_mag_saddles});
-			}
 
 			log_histogram_length = max_log_mag - min_log_mag + 1;
 
@@ -655,13 +697,13 @@ private:
 			set_threads(threads, 16, 16);
 			set_blocks(threads, blocks, num_pixels_y.re, num_pixels_y.im);
 
-			log_histogram_kernel<T> <<<blocks, threads>>> (pixels, num_pixels_y, min_log_mag, log_histogram, factor);
+			log_histogram_kernel<T> <<<blocks, threads>>> (d_pixels, num_pixels_y, min_log_mag, log_histogram, factor);
 			if (cuda_error("log_histogram_kernel", true, __FILE__, __LINE__)) return false;
 			if (write_parities)
 			{
-				log_histogram_kernel<T> <<<blocks, threads>>> (pixels_minima, num_pixels_y, min_log_mag, log_histogram_minima, factor);
+				log_histogram_kernel<T> <<<blocks, threads>>> (d_pixels_minima, num_pixels_y, min_log_mag, log_histogram_minima, factor);
 				if (cuda_error("log_histogram_kernel", true, __FILE__, __LINE__)) return false;
-				log_histogram_kernel<T> <<<blocks, threads>>> (pixels_saddles, num_pixels_y, min_log_mag, log_histogram_saddles, factor);
+				log_histogram_kernel<T> <<<blocks, threads>>> (d_pixels_saddles, num_pixels_y, min_log_mag, log_histogram_saddles, factor);
 				if (cuda_error("log_histogram_kernel", true, __FILE__, __LINE__)) return false;
 			}
 
@@ -844,6 +886,9 @@ public:
 		pixels = nullptr;
 		pixels_minima = nullptr;
 		pixels_saddles = nullptr;
+		d_pixels = nullptr;
+		d_pixels_minima = nullptr;
+		d_pixels_saddles = nullptr;
 		leaves = nullptr;
 		leaf_coef_re = nullptr;
 		leaf_coef_im = nullptr;
@@ -870,6 +915,9 @@ public:
 		pixels = nullptr;
 		pixels_minima = nullptr;
 		pixels_saddles = nullptr;
+		d_pixels = nullptr;
+		d_pixels_minima = nullptr;
+		d_pixels_saddles = nullptr;
 		leaves = nullptr;
 		leaf_coef_re = nullptr;
 		leaf_coef_im = nullptr;
@@ -886,6 +934,25 @@ public:
 		return *this;
 	}
 
+	bool copy_maps_to_host(int verbose)
+	{
+		print_verbose("Copying magnification maps to host...\n", verbose, 2);
+		stopwatch.start();
+		const size_t pixel_bytes = (1ULL * num_pixels_y.re * num_pixels_y.im) * sizeof(T);
+		cudaMemcpy(pixels, d_pixels, pixel_bytes, cudaMemcpyDeviceToHost);
+		if (cuda_error("cudaMemcpy(*pixels)", false, __FILE__, __LINE__)) return false;
+		if (write_parities)
+		{
+			cudaMemcpy(pixels_minima, d_pixels_minima, pixel_bytes, cudaMemcpyDeviceToHost);
+			if (cuda_error("cudaMemcpy(*pixels_minima)", false, __FILE__, __LINE__)) return false;
+			cudaMemcpy(pixels_saddles, d_pixels_saddles, pixel_bytes, cudaMemcpyDeviceToHost);
+			if (cuda_error("cudaMemcpy(*pixels_saddles)", false, __FILE__, __LINE__)) return false;
+		}
+		t_elapsed = stopwatch.stop();
+		print_verbose("Done copying magnification maps to host. Elapsed time: " << t_elapsed << " seconds.\n", verbose, 2);
+		return true;
+	}
+
 	bool run(int verbose)
 	{
 		if (!Microlensing<T>::set_cuda_devices(verbose)) return false;
@@ -898,6 +965,7 @@ public:
 		if (!build_compact_tree(verbose)) return false;
 		if (!shoot_cells(verbose)) return false;
 		if (!create_histograms(verbose)) return false;
+		if (!copy_maps_to_host(verbose)) return false;
 
 		return true;
 	}
