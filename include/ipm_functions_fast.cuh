@@ -5,6 +5,7 @@
 #include "deflection_angles/alpha_smooth.cuh"
 #include "star.cuh"
 #include "tree_node.cuh"
+#include "ipm_leaf.cuh"
 #include "triangle_coverage.cuh"
 #include "util/util.cuh"
 
@@ -185,6 +186,41 @@ namespace ipm_fast
 		return fabs(z.re - node->center.re) <= node->half_length && fabs(z.im - node->center.im) <= node->half_length;
 	}
 
+	/******************************************************************************
+	lens equation evaluated from the compact leaf data (shared or global memory):
+	direct stars from one contiguous padded list, local coefficients in SoA form
+	******************************************************************************/
+	template <typename T>
+	__device__ __forceinline__ Complex<T> w_compact(Complex<T> z, T kappa, T gamma, T theta2, T kappastar,
+		T lcx, T lcy, T lhl, int p, const T* __restrict__ cre, const T* __restrict__ cim,
+		const ipm_leaf::StarXYM<T>* __restrict__ ds, int count,
+		int rectangular, Complex<T> corner, int approx, int taylor_smooth, const SmoothConst<T>& sc)
+	{
+		T acc_re = 0, acc_im = 0;
+		for (int i = 0; i < count; i++)
+		{
+			const ipm_leaf::StarXYM<T> s = ds[i];
+			T dre = z.re - s.x;
+			T dim = z.im - s.y;
+			T w = s.m / fma(dre, dre, dim * dim);
+			acc_re = fma(dre, w, acc_re);
+			acc_im = fma(dim, w, acc_im);
+		}
+
+		T inv_hl = T(1) / lhl;
+		Complex<T> dz((z.re - lcx) * inv_hl, (z.im - lcy) * inv_hl);
+		Complex<T> loc(0, 0);
+		for (int i = p; i >= 1; i--)
+		{
+			loc = cfma(loc, dz, Complex<T>(cre[i] * i, cim[i] * i));
+		}
+		T f = theta2 * inv_hl;
+
+		Complex<T> a_smooth = alpha_smooth_fast(z, kappastar, rectangular, corner, approx, taylor_smooth, sc);
+		return Complex<T>(z.re * (1 - kappa + gamma) - acc_re * theta2 - loc.re * f - a_smooth.re,
+						  z.im * (1 - kappa - gamma) - acc_im * theta2 + loc.im * f - a_smooth.im);
+	}
+
 	constexpr int TILE = 16; //cells per tile side; a block handles one TILE x TILE tile at a time
 	constexpr int NCORNER = (TILE + 1) * (TILE + 1);
 #ifndef IPM_MIN_BLOCKS_PER_SM
@@ -193,7 +229,7 @@ namespace ipm_fast
 	/******************************************************************************
 	resident blocks per SM that ptxas is asked to make room for (sm_80, 256 threads):
 	float fits 4 blocks in 64 registers without spilling; double fits 3 in 80
-	registers with a few hundred bytes of spills, which beats 2 blocks at 130 registers
+	registers with ~56 bytes of spills, which beats 2 blocks at 130 registers
 	******************************************************************************/
 	template <typename T>
 	constexpr int min_blocks_per_sm() { return IPM_MIN_BLOCKS_PER_SM > 0 ? IPM_MIN_BLOCKS_PER_SM : (sizeof(T) == 4 ? 4 : 3); }
@@ -204,16 +240,22 @@ namespace ipm_fast
 
 	- the (TILE+1)^2 lattice corners of a tile are mapped once into shared memory
 	  instead of 4x per corner
-	- the leaf of the tile centre is looked up once and reused for every corner
-	  that lies inside it
-	- plain-FMA complex arithmetic and hoisted smooth-matter series (w_fast); the pixel allocation is the closed-form per-pixel coverage (tri_cov::allocate_triangle)
+	- the leaf of the tile centre is staged into shared memory (record, local
+	  coefficients, contiguous direct-star list) and reused for every corner that
+	  lies inside it; other corners read the compact global arrays
+	- pixel allocation runs in precision P (float even for T = double) on
+	  origin-shifted coordinates
+	- single-pixel triangles (the hot path in magnified regions) are merged per
+	  cell and warp-aggregated before the atomic
 
 	\tparam T -- precision of the lens mapping and of the pixel arrays
-	\tparam P -- precision of the pixel-allocation arithmetic
+	\tparam P -- precision of the pixel-allocation arithmetic (float is enough)
 	******************************************************************************/
 	template <typename T, typename P>
 	__global__ void __launch_bounds__(TILE * TILE, min_blocks_per_sm<T>())
 	shoot_cells_tiled_kernel(T kappa, T gamma, T theta, const star<T>* __restrict__ stars, T kappastar, TreeNode<T>* root,
+		const ipm_leaf::LeafRecord<T>* __restrict__ leaves, const T* __restrict__ leaf_cre, const T* __restrict__ leaf_cim,
+		int coef_stride, const ipm_leaf::StarXYM<T>* __restrict__ direct_stars,
 		int rectangular, Complex<T> corner, int approx, int taylor_smooth, SmoothConst<T> sc,
 		Complex<T> ray_half_sep, Complex<int> num_ray_threads, Complex<T> center_x, Complex<T> hlx,
 		Complex<T> center_y, Complex<T> hly, T* pixmin, T* pixsad, T* pixels, Complex<int> npixels,
@@ -223,6 +265,12 @@ namespace ipm_fast
 		__shared__ T s_cre[NCORNER];
 		__shared__ T s_cim[NCORNER];
 		__shared__ TreeNode<T>* s_node;
+		__shared__ int s_leaf;
+		__shared__ T s_lcx, s_lcy, s_lhl;
+		__shared__ int s_lp, s_lcount;
+		__shared__ T s_coef_re[treenode::MAX_EXPANSION_ORDER + 1];
+		__shared__ T s_coef_im[treenode::MAX_EXPANSION_ORDER + 1];
+		__shared__ ipm_leaf::StarXYM<T> s_stars[treenode::MAX_NUM_STARS_DIRECT];
 
 		const int tiles_x = (num_ray_threads.re + TILE - 1) / TILE;
 		const int tiles_y = (num_ray_threads.im + TILE - 1) / TILE;
@@ -230,7 +278,6 @@ namespace ipm_fast
 		const int tid = threadIdx.y * TILE + threadIdx.x;
 
 		const T theta2 = theta * theta;
-
 		const Complex<T> origin = center_x - hlx; //lattice corner (0, 0)
 		const Complex<T> step = 2 * ray_half_sep;
 		const T sx = npixels.re / (2 * hly.re); //pixels per unit length
@@ -253,11 +300,40 @@ namespace ipm_fast
 			{
 				Complex<T> xc(origin.re + step.re * (i0 + TILE / 2), origin.im + step.im * (j0 + TILE / 2));
 				TreeNode<T>* node = treenode::get_nearest_node(xc, root);
-				//cache a leaf only: for a centre outside the root box the walk returns the root itself
-				s_node = (node->num_children == 0) ? node : nullptr;
+				s_node = node;
+				s_leaf = node->leaf_index;
+				if (s_leaf >= 0)
+				{
+					const ipm_leaf::LeafRecord<T> rec = leaves[s_leaf];
+					s_lcx = rec.cx;
+					s_lcy = rec.cy;
+					s_lhl = rec.half_length;
+					s_lp = rec.expansion_order;
+					s_lcount = rec.direct_count;
+					//the tree guarantees <= MAX_NUM_STARS_DIRECT direct stars per leaf; never overrun shared memory if not
+					if (rec.direct_count > treenode::MAX_NUM_STARS_DIRECT || rec.expansion_order >= coef_stride) s_leaf = -1;
+				}
 			}
 			__syncthreads();
-			TreeNode<T>* tile_node = s_node;
+			const int leaf = s_leaf;
+			if (leaf >= 0)
+			{
+				/******************************************************************************
+				stage the leaf's coefficients and direct stars
+				******************************************************************************/
+				if (tid < coef_stride)
+				{
+					s_coef_re[tid] = leaf_cre[1LL * leaf * coef_stride + tid];
+					s_coef_im[tid] = leaf_cim[1LL * leaf * coef_stride + tid];
+				}
+				if (tid < s_lcount)
+				{
+					s_stars[tid] = direct_stars[leaves[leaf].direct_begin + tid];
+				}
+			}
+			__syncthreads();
+			const T lcx = s_lcx, lcy = s_lcy, lhl = s_lhl;
+			const int lp = s_lp, lcount = s_lcount;
 
 			/******************************************************************************
 			map the lattice corners of this tile
@@ -269,8 +345,29 @@ namespace ipm_fast
 				if (i0 + a > num_ray_threads.re || j0 + b > num_ray_threads.im) continue;
 
 				Complex<T> x(origin.re + step.re * (i0 + a), origin.im + step.im * (j0 + b));
-				TreeNode<T>* node = (tile_node != nullptr && inside(x, tile_node)) ? tile_node : treenode::get_nearest_node(x, root);
-				Complex<T> y = w_fast(x, kappa, gamma, theta2, stars, kappastar, node, rectangular, corner, approx, taylor_smooth, sc);
+				Complex<T> y;
+				if (leaf >= 0 && fabs(x.re - lcx) <= lhl && fabs(x.im - lcy) <= lhl)
+				{
+					y = w_compact(x, kappa, gamma, theta2, kappastar, lcx, lcy, lhl, lp, s_coef_re, s_coef_im, s_stars, lcount,
+						rectangular, corner, approx, taylor_smooth, sc);
+				}
+				else
+				{
+					TreeNode<T>* node = treenode::get_nearest_node(x, root);
+					if (node->leaf_index >= 0)
+					{
+						const int li = node->leaf_index;
+						const ipm_leaf::LeafRecord<T> rec = leaves[li];
+						y = w_compact(x, kappa, gamma, theta2, kappastar, rec.cx, rec.cy, rec.half_length, rec.expansion_order,
+							leaf_cre + 1LL * li * coef_stride, leaf_cim + 1LL * li * coef_stride, direct_stars + rec.direct_begin, rec.direct_count,
+							rectangular, corner, approx, taylor_smooth, sc);
+					}
+					else
+					{
+						//outside the root box: only the root node applies (as in the original code)
+						y = w_fast(x, kappa, gamma, theta2, stars, kappastar, node, rectangular, corner, approx, taylor_smooth, sc);
+					}
+				}
 				/******************************************************************************
 				pixel coordinates, y axis reversed so the array is in image orientation
 				******************************************************************************/

@@ -4,6 +4,7 @@
 #include "complex.cuh"
 #include "ipm_functions.cuh"
 #include "ipm_functions_fast.cuh"
+#include "ipm_leaf.cuh"
 #include "microlensing.cuh"
 #include "star.cuh"
 #include "stopwatch.hpp"
@@ -84,6 +85,7 @@ private:
 	using Microlensing<T>::root_half_length;
 	using Microlensing<T>::tree_levels;
 	using Microlensing<T>::tree;
+	using Microlensing<T>::num_nodes;
 	using Microlensing<T>::stars;
 
 	/******************************************************************************
@@ -115,6 +117,16 @@ private:
 	T* pixels = nullptr;
 	T* pixels_minima = nullptr;
 	T* pixels_saddles = nullptr;
+
+	/******************************************************************************
+	compact tree for the shooting kernel (device)
+	******************************************************************************/
+	ipm_leaf::LeafRecord<T>* leaves = nullptr;
+	T* leaf_coef_re = nullptr;
+	T* leaf_coef_im = nullptr;
+	ipm_leaf::StarXYM<T>* direct_stars = nullptr;
+	int num_leaves = 0;
+	int num_direct = 0;
 
 	int min_mag;
 	int max_mag;
@@ -154,6 +166,22 @@ private:
 		cudaFree(pixels_saddles);
 		if (return_on_error && cuda_error("cudaFree(*pixels_saddles)", false, __FILE__, __LINE__)) return false;
 		pixels_saddles = nullptr;
+
+		cudaFree(leaves);
+		if (return_on_error && cuda_error("cudaFree(*leaves)", false, __FILE__, __LINE__)) return false;
+		leaves = nullptr;
+
+		cudaFree(leaf_coef_re);
+		if (return_on_error && cuda_error("cudaFree(*leaf_coef_re)", false, __FILE__, __LINE__)) return false;
+		leaf_coef_re = nullptr;
+
+		cudaFree(leaf_coef_im);
+		if (return_on_error && cuda_error("cudaFree(*leaf_coef_im)", false, __FILE__, __LINE__)) return false;
+		leaf_coef_im = nullptr;
+
+		cudaFree(direct_stars);
+		if (return_on_error && cuda_error("cudaFree(*direct_stars)", false, __FILE__, __LINE__)) return false;
+		direct_stars = nullptr;
 		
 		cudaFree(histogram);
 		if (return_on_error && cuda_error("cudaFree(*histogram)", false, __FILE__, __LINE__)) return false;
@@ -418,6 +446,17 @@ private:
 		return true;
 	}
 
+	bool build_compact_tree(int verbose)
+	{
+		print_verbose("Building compact leaf records...\n", verbose, 2);
+		stopwatch.start();
+		if (!ipm_leaf::build_leaf_records<T>(tree, num_nodes, stars, expansion_order,
+			leaves, leaf_coef_re, leaf_coef_im, direct_stars, num_leaves, num_direct, verbose)) return false;
+		t_elapsed = stopwatch.stop();
+		print_verbose("Done building compact leaf records. Elapsed time: " << t_elapsed << " seconds.\n", verbose, 2);
+		return true;
+	}
+
 	bool shoot_cells(int verbose)
 	{
 		/******************************************************************************
@@ -452,6 +491,7 @@ private:
 		stopwatch.start();
 		ipm_fast::shoot_cells_tiled_kernel<T, pixel_arith_t> <<<static_cast<unsigned int>(grid), dim3(ipm_fast::TILE, ipm_fast::TILE)>>> (
 			kappa_tot, shear, theta_star, stars, kappa_star, tree[0],
+			leaves, leaf_coef_re, leaf_coef_im, expansion_order + 1, direct_stars,
 			rectangular, corner, approx, taylor_smooth, smooth_const,
 			ray_half_sep, num_ray_threads, center_x, half_length_x,
 			center_y, half_length_y, pixels_minima, pixels_saddles, pixels, num_pixels_y, percentage, verbose);
@@ -802,6 +842,10 @@ public:
 		pixels = nullptr;
 		pixels_minima = nullptr;
 		pixels_saddles = nullptr;
+		leaves = nullptr;
+		leaf_coef_re = nullptr;
+		leaf_coef_im = nullptr;
+		direct_stars = nullptr;
 
 		histogram = nullptr;
 		histogram_minima = nullptr;
@@ -824,6 +868,10 @@ public:
 		pixels = nullptr;
 		pixels_minima = nullptr;
 		pixels_saddles = nullptr;
+		leaves = nullptr;
+		leaf_coef_re = nullptr;
+		leaf_coef_im = nullptr;
+		direct_stars = nullptr;
 
 		histogram = nullptr;
 		histogram_minima = nullptr;
@@ -845,6 +893,7 @@ public:
 		if (!allocate_initialize_memory(verbose)) return false;
 		if (!Microlensing<T>::populate_star_array(verbose)) return false;
 		if (!Microlensing<T>::create_tree(verbose)) return false;
+		if (!build_compact_tree(verbose)) return false;
 		if (!shoot_cells(verbose)) return false;
 		if (!create_histograms(verbose)) return false;
 
