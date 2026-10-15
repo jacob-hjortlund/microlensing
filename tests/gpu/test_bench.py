@@ -703,32 +703,64 @@ class RegressTests(unittest.TestCase):
                 regress.check_config(configs.CONFIGS["nb_d"], out, f"{d}/ref", self.tolerances(), "R1a")
             self.assertIn("nb_d/run1", str(ctx.exception))
 
+    def write_fake_regression(self, d):
+        """Fake build, 3x4 ladder references and a tolerances file under d; returns the build directory."""
+        build = fake_build_dir(Path(d) / "build")
+        # fake writes float32 maps of constant 2.0; references of the same value pass
+        for name in ("nb_d", "nb_f", "rect_d", "rect_f", "hm100_d", "hm100_f"):
+            ref = Path(d) / "ref" / name / "run1"
+            ref.mkdir(parents=True)
+            write_map(ref / "ipm_magnifications.bin", np.full((3, 4), 2.0, dtype=np.float32))
+            (ref / "ipm_parameter_info.txt").write_text("t_shoot_cells 1.0\n")
+        tol = self.tolerances()
+        for name in ("nb_f", "rect_f", "hm100_f"):
+            tol["float_truth_error"][name] = {"pixels": {"mean": 1e-6, "p999": 1e-5, "p9999": 2e-5, "max": 5e-5}}
+        bench_lib.write_json(Path(d) / "tolerances.json", tol)
+        return build
+
+    def run_fake_regression(self, d, build, env):
+        """regress.main over the fixture under d with the given environment switches; returns the exit code."""
+        argv = ["--build", str(build), "--rung", "R1a", "--ref-root", f"{d}/ref",
+                "--tolerances", f"{d}/tolerances.json", "--results", f"{d}/results", "--scratch", f"{d}/scratch"]
+        with mock.patch.dict(os.environ, env), contextlib.redirect_stdout(io.StringIO()):
+            return regress.main(argv)
+
     def test_main_with_fake_executable(self):
         with tempfile.TemporaryDirectory() as d:
-            build = fake_build_dir(Path(d) / "build")
-            # fake writes float32 maps of constant 2.0; references of the same value pass
-            for name in ("nb_d", "nb_f", "rect_d", "rect_f", "hm100_d", "hm100_f"):
-                ref = Path(d) / "ref" / name / "run1"
-                ref.mkdir(parents=True)
-                write_map(ref / "ipm_magnifications.bin", np.full((3, 4), 2.0, dtype=np.float32))
-                (ref / "ipm_parameter_info.txt").write_text("t_shoot_cells 1.0\n")
-            tol = self.tolerances()
-            for name in ("nb_f", "rect_f", "hm100_f"):
-                tol["float_truth_error"][name] = {"pixels": {"mean": 1e-6, "p999": 1e-5, "p9999": 2e-5, "max": 5e-5}}
-            bench_lib.write_json(Path(d) / "tolerances.json", tol)
-            os.environ["FAKE_IPM_VALUE"] = "2.0"
-            try:
-                with contextlib.redirect_stdout(io.StringIO()):
-                    rc = regress.main(["--build", str(build), "--rung", "R1a", "--ref-root", f"{d}/ref",
-                                       "--tolerances", f"{d}/tolerances.json", "--results", f"{d}/results",
-                                       "--scratch", f"{d}/scratch"])
-            finally:
-                os.environ.pop("FAKE_IPM_VALUE")
-            self.assertEqual(rc, 0)
+            build = self.write_fake_regression(d)
+            self.assertEqual(self.run_fake_regression(d, build, {"FAKE_IPM_VALUE": "2.0"}), 0)
             out = bench_lib.read_json(Path(d) / "results" / "regression_ladder.json")
             self.assertTrue(out["pass"])
+            self.assertTrue(out["complete"])
+            self.assertEqual(out["n_configs"], 4)
             self.assertEqual([c["config"] for c in out["configs"]], ["nb_f", "nb_d", "rect_f", "hm100_f"])
             self.assertFalse((Path(d) / "scratch" / "nb_f").exists())
+
+    def test_check_failure_is_recorded_not_fatal(self):
+        with tempfile.TemporaryDirectory() as d:
+            build = self.write_fake_regression(d)
+            # 5x5 maps against the 3x4 references: every check raises a shape mismatch, and every configuration still runs
+            rc = self.run_fake_regression(d, build, {"FAKE_IPM_VALUE": "2.0", "FAKE_IPM_SHAPE": "5x5"})
+            self.assertEqual(rc, 1)
+            out = bench_lib.read_json(Path(d) / "results" / "regression_ladder.json")
+            self.assertTrue(out["complete"])
+            self.assertFalse(out["pass"])
+            self.assertEqual(len(out["configs"]), 4)
+            for c in out["configs"]:
+                self.assertFalse(c["pass"])
+                self.assertTrue(any(f.startswith("check failed: ") and "shape mismatch" in f for f in c["failures"]),
+                                c["failures"])
+
+    def test_empty_selection_is_an_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                rc = regress.main(["--build", f"{d}/build", "--rung", "R1a", "--only", "does_not_exist",
+                                   "--ref-root", f"{d}/ref", "--tolerances", f"{d}/tolerances.json",
+                                   "--results", f"{d}/results", "--scratch", f"{d}/scratch"])
+            self.assertEqual(rc, 2)
+            self.assertIn("no configurations selected", err.getvalue())
+            self.assertFalse((Path(d) / "results").exists())
 
 
 if __name__ == "__main__":

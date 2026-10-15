@@ -95,17 +95,24 @@ def main(argv=None):
     cfgs = cf.regression_configs(a.rung, a.set)
     if a.only:
         cfgs = [c for c in cfgs if c.name in a.only]
+    if not cfgs:
+        print("no configurations selected", file=sys.stderr)
+        return 2
     out = {"rung": a.rung, "set": a.set, "env": bl.environment_info(), "build": bl.build_meta(a.build),
            "tolerances": {k: tol[k] for k in ("floor_frac", "double", "float", "parity_consistency")},
-           "configs": [], "pass": True}
+           "configs": [], "pass": True, "complete": False, "n_configs": len(cfgs)}
     for cfg in cf.ordered(cfgs):
         outdir = scratch / cfg.name
-        rec = bl.run_ipm(cf.exe_for(a.build, cfg.build), cf.full_args(cfg, a.ref_root), outdir)
+        rec = bl.run_ipm(cf.exe_for(a.build, cfg.build), cf.full_args(cfg, a.ref_root), outdir, timeout=3600)
         if not rec["ok"]:
             res = {"config": cfg.name, "build": cfg.build, "rung": a.rung, "pass": False,
                    "failures": [f"run failed: {rec['error']}"], "flags": [], "maps": {}}
         else:
-            res = check_config(cfg, outdir, a.ref_root, tol, a.rung)
+            try:
+                res = check_config(cfg, outdir, a.ref_root, tol, a.rung)
+            except Exception as exc:   # recorded as a failure so the remaining configurations still run
+                res = {"config": cfg.name, "build": cfg.build, "rung": a.rung, "pass": False,
+                       "failures": [f"check failed: {exc}"], "flags": [], "maps": {}}
         res["run"] = {k: rec[k] for k in ("wall_s", "t_shoot_cells", "returncode", "stderr_tail")}
         out["configs"].append(res)
         out["pass"] = out["pass"] and res["pass"]
@@ -113,6 +120,8 @@ def main(argv=None):
         if not a.keep_outputs:
             bl.clear_outputs(outdir)
         bl.write_json(results_dir / f"regression_{a.set}.json", out)
+    out["complete"] = True
+    bl.write_json(results_dir / f"regression_{a.set}.json", out)
     print("REGRESSION", "PASS" if out["pass"] else "FAIL")
     return 0 if out["pass"] else 1
 
