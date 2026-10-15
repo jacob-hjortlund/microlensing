@@ -500,11 +500,16 @@ ptxas info    : Compiling entry function '_ZN8ipm_fast24shoot_cells_tiled_kernel
 ptxas info    : Function properties for _ZN8ipm_fast24shoot_cells_tiled_kernelIdfEEvT_S1_S1_PK4starIS1_ES1_P8TreeNodeIS1_E
     48 bytes stack frame, 56 bytes spill stores, 56 bytes spill loads
 ptxas info    : Used 80 registers, 6168 bytes smem, 760 bytes cmem[0]
+=== lib_ipm.so ===
+ptxas info    : Compiling entry function '_ZN8ipm_fast24shoot_cells_tiled_kernelIffEEvT_S1_S1_PK4starIS1_ES1_P8TreeNodeIS1_E' for 'sm_80'
+ptxas info    : Function properties for _ZN8ipm_fast24shoot_cells_tiled_kernelIffEEvT_S1_S1_PK4starIS1_ES1_P8TreeNodeIS1_E
+    16 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 74 registers, 16 bytes cumulative stack size, 6168 bytes smem, 760 bytes cmem[0]
 """
 
     def test_parse_shoot_kernels(self):
         rows = ptxas_stats.parse(self.LOG)
-        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows), 3)
         self.assertEqual(rows[0]["target"], "ipm_gpu")
         self.assertEqual(rows[0]["registers"], 74)
         self.assertEqual(rows[0]["stack_bytes"], 376)
@@ -515,6 +520,9 @@ ptxas info    : Used 80 registers, 6168 bytes smem, 760 bytes cmem[0]
         self.assertEqual(rows[1]["spill_loads"], 56)
         self.assertEqual(rows[1]["smem_bytes"], 6168)
         self.assertIn("tiled", rows[1]["function"])
+        self.assertEqual(rows[2]["target"], "lib_ipm.so")
+        self.assertEqual(rows[2]["registers"], 74)
+        self.assertEqual(rows[2]["smem_bytes"], 6168)
 
 
 if __name__ == "__main__":
