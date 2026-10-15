@@ -525,5 +525,58 @@ ptxas info    : Used 74 registers, 16 bytes cumulative stack size, 6168 bytes sm
         self.assertEqual(rows[2]["smem_bytes"], 6168)
 
 
+import shutil  # noqa: E402
+import make_reference  # noqa: E402
+
+
+def fake_build_dir(build_dir):
+    """A build directory whose executables are the fake."""
+    build = Path(build_dir)
+    build.mkdir(parents=True, exist_ok=True)
+    for name in ("ipm_gpu", "ipm_gpu_double"):
+        shutil.copy(FAKE, build / name)
+        os.chmod(build / name, 0o755)
+    return build
+
+
+class MakeReferenceTests(unittest.TestCase):
+    def test_creates_runs_then_skips_existing_runs(self):
+        with tempfile.TemporaryDirectory() as d:
+            build = fake_build_dir(Path(d) / "build")
+            argv = ["--only", "nb_f", "--build", str(build), "--ref-root", f"{d}/ref",
+                    "--scratch", f"{d}/scratch", "--results", f"{d}/results"]
+            self.assertEqual(make_reference.main(argv), 0)
+            for k in (1, 2, 3):
+                self.assertTrue(make_reference.is_complete(Path(d) / "ref" / "nb_f" / f"run{k}"))
+            timing = bench_lib.read_json(Path(d) / "results" / "timing_full.json")
+            self.assertEqual(len(timing["records"]), 3)
+            self.assertEqual(timing["records"][0]["config"], "nb_f")
+            self.assertEqual(timing["rung"], "R0")
+            # a truth-only configuration gets one run and no timing record
+            self.assertEqual(make_reference.main(argv[:1] + ["nry10_d"] + argv[2:]), 0)
+            self.assertTrue(make_reference.is_complete(Path(d) / "ref" / "nry10_d" / "run1"))
+            self.assertFalse((Path(d) / "ref" / "nry10_d" / "run2").exists())
+            self.assertEqual(len(bench_lib.read_json(Path(d) / "results" / "timing_full.json")["records"]), 3)
+            # resume: remove run2, rerun, only run2 is regenerated
+            shutil.rmtree(Path(d) / "ref" / "nb_f" / "run2")
+            stamp = (Path(d) / "ref" / "nb_f" / "run1" / "ipm_parameter_info.txt").stat().st_mtime_ns
+            self.assertEqual(make_reference.main(argv), 0)
+            self.assertTrue(make_reference.is_complete(Path(d) / "ref" / "nb_f" / "run2"))
+            self.assertEqual((Path(d) / "ref" / "nb_f" / "run1" / "ipm_parameter_info.txt").stat().st_mtime_ns, stamp)
+            self.assertFalse((Path(d) / "scratch" / "nb_f" / "run2").exists())
+
+    def test_failed_run_returns_nonzero(self):
+        with tempfile.TemporaryDirectory() as d:
+            build = fake_build_dir(Path(d) / "build")
+            os.environ["FAKE_IPM_FAIL"] = "1"
+            try:
+                rc = make_reference.main(["--only", "nb_f", "--build", str(build), "--ref-root", f"{d}/ref",
+                                          "--scratch", f"{d}/scratch", "--results", f"{d}/results"])
+            finally:
+                os.environ.pop("FAKE_IPM_FAIL")
+            self.assertEqual(rc, 1)
+            self.assertFalse((Path(d) / "ref" / "nb_f" / "run1").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
