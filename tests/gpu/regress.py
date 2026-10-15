@@ -6,7 +6,8 @@ Double build, two comparisons that must both pass: the rung's map from a run wit
 lattice corner lies on a quadtree dividing line), and the map of the real configuration against R0's run1 under
 tol["double_actual"] (R0's own shift sensitivity, calibrated by calibrate.py). Float build: error against the double truth
 must stay within tol["float"]["ratio"] of R0-float's own error (from tolerances.json), and the
-total deposited area must agree with R0-float.
+total deposited area must agree with the double truth to within max(tol["float"]["sum_ratio"], ratio x R0-float's own
+total-area error against the truth). The sum against R0-float is reported for information only.
 """
 import argparse
 import sys

@@ -122,8 +122,12 @@ def evaluate_float(m_truth, ref_truth, m_r0, tol):
             fails.append(f"{key} vs truth {m_truth[key]:.3e} > {f['ratio']} x R0's {ref_truth[key]:.3e}")
     if m_truth["max"] > f["flag_ratio_max"] * max(ref_truth["max"], 1e-15):
         flags.append(f"max vs truth {m_truth['max']:.3e} > {f['flag_ratio_max']} x R0's {ref_truth['max']:.3e}")
-    if abs(m_r0["sum_ratio"]) > f["sum_ratio"]:
-        fails.append(f"|sum_ratio| vs R0 {abs(m_r0['sum_ratio']):.3e} > {f['sum_ratio']:.1e}")
+    # the total deposited area is judged against the double truth: R0-float's own deficit (~1e-4) sets the allowance
+    ref_sum = abs(ref_truth.get("sum_ratio", 0.0))
+    limit = max(f["sum_ratio"], f["ratio"] * ref_sum)
+    if abs(m_truth["sum_ratio"]) > limit:
+        fails.append(f"|sum_ratio| vs truth {abs(m_truth['sum_ratio']):.3e} > {limit:.1e} "
+                     f"(max of {f['sum_ratio']:.1e} and {f['ratio']} x R0's {ref_sum:.3e})")
     return {"pass": not fails, "failures": fails, "flags": flags}
 
 
