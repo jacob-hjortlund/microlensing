@@ -243,7 +243,7 @@ private:
 		number density of rays in the lens plane
 		******************************************************************************/
 		set_param("num_rays_x", num_rays_x,
-			1.0 * num_rays_y * num_pixels_y.re * num_pixels_y.im / (2 * half_length_y.re * 2 * half_length_y.im),
+			1.0 * num_rays_y * (1ULL * num_pixels_y.re * num_pixels_y.im) / (2 * half_length_y.re * 2 * half_length_y.im),
 			verbose);
 
 		/******************************************************************************
@@ -355,7 +355,7 @@ private:
 			taylor_smooth += 2;
 		}
 		set_param("taylor_smooth", taylor_smooth, taylor_smooth, verbose);
-		if (rectangular && taylor_smooth > MAX_TAYLOR_SMOOTH)
+		if (rectangular && approx && taylor_smooth > MAX_TAYLOR_SMOOTH)
 		{
 			std::cerr << "Error. taylor_smooth must be <= " << MAX_TAYLOR_SMOOTH << "\n";
 			return false;
@@ -377,13 +377,13 @@ private:
 		/******************************************************************************
 		allocate memory for pixels
 		******************************************************************************/
-		cudaMallocManaged(&pixels, num_pixels_y.re * num_pixels_y.im * sizeof(T));
+		cudaMallocManaged(&pixels, (1ULL * num_pixels_y.re * num_pixels_y.im) * sizeof(T));
 		if (cuda_error("cudaMallocManaged(*pixels)", false, __FILE__, __LINE__)) return false;
 		if (write_parities)
 		{
-			cudaMallocManaged(&pixels_minima, num_pixels_y.re * num_pixels_y.im * sizeof(T));
+			cudaMallocManaged(&pixels_minima, (1ULL * num_pixels_y.re * num_pixels_y.im) * sizeof(T));
 			if (cuda_error("cudaMallocManaged(*pixels_minima)", false, __FILE__, __LINE__)) return false;
-			cudaMallocManaged(&pixels_saddles, num_pixels_y.re * num_pixels_y.im * sizeof(T));
+			cudaMallocManaged(&pixels_saddles, (1ULL * num_pixels_y.re * num_pixels_y.im) * sizeof(T));
 			if (cuda_error("cudaMallocManaged(*pixels_saddles)", false, __FILE__, __LINE__)) return false;
 		}
 
@@ -397,11 +397,11 @@ private:
 		print_verbose("Initializing array values...\n", verbose, 3);
 		stopwatch.start();
 
-		thrust::fill(thrust::device, pixels, pixels + num_pixels_y.re * num_pixels_y.im, 0);
+		thrust::fill(thrust::device, pixels, pixels + (1ULL * num_pixels_y.re * num_pixels_y.im), 0);
 		if (write_parities)
 		{
-			thrust::fill(thrust::device, pixels_minima, pixels_minima + num_pixels_y.re * num_pixels_y.im, 0);
-			thrust::fill(thrust::device, pixels_saddles, pixels_saddles + num_pixels_y.re * num_pixels_y.im, 0);
+			thrust::fill(thrust::device, pixels_minima, pixels_minima + (1ULL * num_pixels_y.re * num_pixels_y.im), 0);
+			thrust::fill(thrust::device, pixels_saddles, pixels_saddles + (1ULL * num_pixels_y.re * num_pixels_y.im), 0);
 		}
 
 		t_elapsed = stopwatch.stop();
@@ -442,7 +442,7 @@ private:
 		{
 			print_verbose("Adding arrays...\n", verbose, 2);
 			thrust::transform(thrust::device, 
-							  pixels_minima, pixels_minima + num_pixels_y.re * num_pixels_y.im, 
+							  pixels_minima, pixels_minima + (1ULL * num_pixels_y.re * num_pixels_y.im), 
 							  pixels_saddles, 
 							  pixels, 
 							  thrust::plus<T>());
@@ -474,8 +474,8 @@ private:
 			/******************************************************************************
 			histogram of mu
 			******************************************************************************/
-			min_mag = std::round(*thrust::min_element(thrust::device, pixels, pixels + num_pixels_y.re * num_pixels_y.im) * factor);
-			max_mag = std::round(*thrust::max_element(thrust::device, pixels, pixels + num_pixels_y.re * num_pixels_y.im) * factor);
+			min_mag = std::round(*thrust::min_element(thrust::device, pixels, pixels + (1ULL * num_pixels_y.re * num_pixels_y.im)) * factor);
+			max_mag = std::round(*thrust::max_element(thrust::device, pixels, pixels + (1ULL * num_pixels_y.re * num_pixels_y.im)) * factor);
 
 			T mu_min_theory = 1 / ((1 - kappa_tot + kappa_star) * (1 - kappa_tot + kappa_star));
 			T mu_min_actual = 1.0 * min_mag / factor;
@@ -491,8 +491,8 @@ private:
 
 			if (write_parities)
 			{
-				int min_mag_minima = std::round(*thrust::min_element(thrust::device, pixels_minima, pixels_minima + num_pixels_y.re * num_pixels_y.im) * factor);
-				int max_mag_minima = std::round(*thrust::max_element(thrust::device, pixels_minima, pixels_minima + num_pixels_y.re * num_pixels_y.im) * factor);
+				int min_mag_minima = std::round(*thrust::min_element(thrust::device, pixels_minima, pixels_minima + (1ULL * num_pixels_y.re * num_pixels_y.im)) * factor);
+				int max_mag_minima = std::round(*thrust::max_element(thrust::device, pixels_minima, pixels_minima + (1ULL * num_pixels_y.re * num_pixels_y.im)) * factor);
 
 				mu_min_actual = 1.0 * min_mag_minima / factor;
 
@@ -505,8 +505,8 @@ private:
 					print_verbose("\n", verbose * (verbose < 2), 1);
 				}
 
-				int min_mag_saddles = std::round(*thrust::min_element(thrust::device, pixels_saddles, pixels_saddles + num_pixels_y.re * num_pixels_y.im) * factor);
-				int max_mag_saddles = std::round(*thrust::max_element(thrust::device, pixels_saddles, pixels_saddles + num_pixels_y.re * num_pixels_y.im) * factor);
+				int min_mag_saddles = std::round(*thrust::min_element(thrust::device, pixels_saddles, pixels_saddles + (1ULL * num_pixels_y.re * num_pixels_y.im)) * factor);
+				int max_mag_saddles = std::round(*thrust::max_element(thrust::device, pixels_saddles, pixels_saddles + (1ULL * num_pixels_y.re * num_pixels_y.im)) * factor);
 
 				min_mag = std::min({min_mag, min_mag_minima, min_mag_saddles});
 				max_mag = std::max({max_mag, max_mag_minima, max_mag_saddles});
@@ -550,16 +550,16 @@ private:
 			histogram of log_10(mu)
 			******************************************************************************/
 
-			min_log_mag = std::round(std::log10(*thrust::min_element(thrust::device, pixels, pixels + num_pixels_y.re * num_pixels_y.im)) * factor);
-			max_log_mag = std::round(std::log10(*thrust::max_element(thrust::device, pixels, pixels + num_pixels_y.re * num_pixels_y.im)) * factor);
+			min_log_mag = std::round(std::log10(*thrust::min_element(thrust::device, pixels, pixels + (1ULL * num_pixels_y.re * num_pixels_y.im))) * factor);
+			max_log_mag = std::round(std::log10(*thrust::max_element(thrust::device, pixels, pixels + (1ULL * num_pixels_y.re * num_pixels_y.im))) * factor);
 
 			if (write_parities)
 			{
-				int min_log_mag_minima = std::round(std::log10(*thrust::min_element(thrust::device, pixels_minima, pixels_minima + num_pixels_y.re * num_pixels_y.im)) * factor);
-				int max_log_mag_minima = std::round(std::log10(*thrust::max_element(thrust::device, pixels_minima, pixels_minima + num_pixels_y.re * num_pixels_y.im)) * factor);
+				int min_log_mag_minima = std::round(std::log10(*thrust::min_element(thrust::device, pixels_minima, pixels_minima + (1ULL * num_pixels_y.re * num_pixels_y.im))) * factor);
+				int max_log_mag_minima = std::round(std::log10(*thrust::max_element(thrust::device, pixels_minima, pixels_minima + (1ULL * num_pixels_y.re * num_pixels_y.im))) * factor);
 
-				int min_log_mag_saddles = std::round(std::log10(*thrust::min_element(thrust::device, pixels_saddles, pixels_saddles + num_pixels_y.re * num_pixels_y.im)) * factor);
-				int max_log_mag_saddles = std::round(std::log10(*thrust::max_element(thrust::device, pixels_saddles, pixels_saddles + num_pixels_y.re * num_pixels_y.im)) * factor);
+				int min_log_mag_saddles = std::round(std::log10(*thrust::min_element(thrust::device, pixels_saddles, pixels_saddles + (1ULL * num_pixels_y.re * num_pixels_y.im))) * factor);
+				int max_log_mag_saddles = std::round(std::log10(*thrust::max_element(thrust::device, pixels_saddles, pixels_saddles + (1ULL * num_pixels_y.re * num_pixels_y.im))) * factor);
 
 				min_log_mag = std::min({min_log_mag, min_log_mag_minima, min_log_mag_saddles});
 				max_log_mag = std::max({max_log_mag, max_log_mag_minima, max_log_mag_saddles});

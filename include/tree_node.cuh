@@ -368,14 +368,12 @@ namespace treenode
             TreeNode<T>* node = &nodes[j];
 
             /******************************************************************************
-            if node is empty or has no children, skip it
+            if node is empty or has no children there is nothing to sort. not a
+            "continue": all threads of the block must reach the __syncthreads below
             ******************************************************************************/
-            if (node->numstars == 0 || node->num_children == 0)
-            {
-                continue;
-            }
+            const bool active = !(node->numstars == 0 || node->num_children == 0);
 
-            if (threadIdx.x == 0)
+            if (active && threadIdx.x == 0)
             {
                 n_stars_top[threadIdx.y] = 0;
                 n_stars_bottom[threadIdx.y] = 0;
@@ -390,7 +388,7 @@ namespace treenode
             each thread is a star within the parent node in the x direction
             in the first pass, figure out whether the star is above or below the center
             ******************************************************************************/
-            for (int i = threadIdx.x; i < node->numstars; i += blockDim.x)
+            for (int i = threadIdx.x; active && i < node->numstars; i += blockDim.x)
             {
                 if (stars[node->stars + i].position.im >= node->center.im)
                 {
@@ -410,7 +408,7 @@ namespace treenode
             /******************************************************************************
             in the second pass, figure out whether the star is left or right of the center
             ******************************************************************************/
-            for (int i = threadIdx.x; i < node->numstars; i += blockDim.x)
+            for (int i = threadIdx.x; active && i < node->numstars; i += blockDim.x)
             {
                 /******************************************************************************
                 if the star was in the top, then sort left and right
@@ -447,7 +445,7 @@ namespace treenode
             once the sorting is done, assign the starting position of stars to the children
             along with the number of stars
             ******************************************************************************/
-            if (threadIdx.x == 0)
+            if (active && threadIdx.x == 0)
             {
                 node->children[0]->stars = node->stars;
                 node->children[0]->numstars = n_stars_children[threadIdx.y * treenode::MAX_NUM_CHILDREN + 0];

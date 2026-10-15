@@ -357,10 +357,10 @@ namespace polygon
 						continue;
 					}
 					T to_add = factor * fabs(bottom_poly.area()) / whole_area;
-					atomicAdd(&pixels[npixels.re * y + x], to_add);
+					atomicAdd(&pixels[1LL * npixels.re * y + x], to_add);
 				}
 				T to_add = factor * fabs(top_poly.area()) / whole_area;
-				atomicAdd(&pixels[npixels.re * ymax + x], to_add);
+				atomicAdd(&pixels[1LL * npixels.re * ymax + x], to_add);
 			}
 
 			if (numsides < 3)
@@ -383,11 +383,11 @@ namespace polygon
 					continue;
 				}
 				T to_add = factor * fabs(bottom_poly.area()) / whole_area;
-				atomicAdd(&pixels[npixels.re * y + xmax], to_add);
+				atomicAdd(&pixels[1LL * npixels.re * y + xmax], to_add);
 			}
 
 			T to_add = factor * fabs(this->area()) / whole_area;
-			atomicAdd(&pixels[npixels.re * ymax + xmax], to_add);
+			atomicAdd(&pixels[1LL * npixels.re * ymax + xmax], to_add);
 
 			return true;
 
