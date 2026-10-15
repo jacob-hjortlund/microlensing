@@ -7,7 +7,8 @@ from pathlib import Path
 TARGET = re.compile(r"^=== (\S+) ===$")
 ENTRY = re.compile(r"Compiling entry function '([^']+)' for 'sm_(\d+)'")
 STACK = re.compile(r"(\d+) bytes stack frame, (\d+) bytes spill stores, (\d+) bytes spill loads")
-USED = re.compile(r"Used (\d+) registers(?:, (\d+) bytes smem)?")
+USED = re.compile(r"Used (\d+) registers")
+SMEM = re.compile(r"(\d+) bytes smem")
 
 
 def parse(text, pattern="shoot_cells"):
@@ -29,7 +30,8 @@ def parse(text, pattern="shoot_cells"):
             continue
         m = USED.search(line)
         if m:
-            current.update(registers=int(m.group(1)), smem_bytes=int(m.group(2) or 0))
+            smem = SMEM.search(line)
+            current.update(registers=int(m.group(1)), smem_bytes=int(smem.group(1)) if smem else 0)
             rows.append(current)
             current = None
     return rows
