@@ -65,6 +65,7 @@ private:
 	using Microlensing<T>::MAX_TAYLOR_SMOOTH;
 	using Microlensing<T>::threads;
 	using Microlensing<T>::blocks;
+	using Microlensing<T>::cuda_device_prop;
 	using Microlensing<T>::mean_mass;
 	using Microlensing<T>::mean_mass2;
 	using Microlensing<T>::mean_mass2_ln_mass;
@@ -413,7 +414,27 @@ private:
 	bool shoot_cells(int verbose)
 	{
 		set_threads(threads, 16, 16);
-		set_blocks(threads, blocks, num_ray_threads.re, num_ray_threads.im);
+		/******************************************************************************
+		launch as many 16x16 blocks as the device keeps resident (occupancy API) instead
+		of one block per SM as set_blocks() does; the grid-stride loops of the kernel
+		accept any grid. both grid dimensions are scaled down by the same factor
+		******************************************************************************/
+		int blocks_per_sm = 0;
+		cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, shoot_cells_kernel<T>, threads.x * threads.y, 0);
+		if (cuda_error("cudaOccupancyMaxActiveBlocksPerMultiprocessor", false, __FILE__, __LINE__)) return false;
+		if (blocks_per_sm < 1) blocks_per_sm = 1;
+		const long long max_blocks = 1LL * blocks_per_sm * cuda_device_prop.multiProcessorCount;
+		long long bx = (num_ray_threads.re - 1) / threads.x + 1;
+		long long by = (num_ray_threads.im - 1) / threads.y + 1;
+		if (bx * by > max_blocks)
+		{
+			double factor = std::sqrt(1.0 * max_blocks / (bx * by));
+			bx = std::max(1LL, static_cast<long long>(bx * factor));
+			by = std::max(1LL, static_cast<long long>(by * factor));
+		}
+		blocks = dim3(static_cast<unsigned int>(bx), static_cast<unsigned int>(by));
+		print_verbose("Shooting with " << bx << " x " << by << " blocks of " << threads.x << " x " << threads.y
+			<< " threads (" << blocks_per_sm << " resident blocks per SM)\n", verbose, 2);
 
 		unsigned long long int* percentage = nullptr;
 		cudaMallocManaged(&percentage, sizeof(unsigned long long int));

@@ -191,12 +191,24 @@ set the number of threads per block for the kernel
 \param y -- number of threads per block in y dimension
 \param z -- number of threads per block in z dimension
 ******************************************************************************/
-void set_threads(dim3& threads, int x = 1, int y = 1, int z = 1)
+const cudaDeviceProp& cached_device_prop()
 {
-	cudaDeviceProp prop;
+	//cudaGetDeviceProperties costs ~0.5-1 ms; the tree/FMM loops called it hundreds of times
+	static cudaDeviceProp prop;
+	static int cached_device = -1;
 	int device;
 	cudaGetDevice(&device);
-	cudaGetDeviceProperties(&prop, device);
+	if (device != cached_device)
+	{
+		cudaGetDeviceProperties(&prop, device);
+		cached_device = device;
+	}
+	return prop;
+}
+
+void set_threads(dim3& threads, int x = 1, int y = 1, int z = 1)
+{
+	const cudaDeviceProp& prop = cached_device_prop();
 
 	threads.x = x;
 	threads.y = y;
@@ -233,10 +245,7 @@ set the number of blocks for the kernel
 ******************************************************************************/
 void set_blocks(dim3& threads, dim3& blocks, int x = 1, int y = 1, int z = 1)
 {
-	cudaDeviceProp prop;
-	int device;
-	cudaGetDevice(&device);
-	cudaGetDeviceProperties(&prop, device);
+	const cudaDeviceProp& prop = cached_device_prop();
 
 	blocks.x = (x - 1) / threads.x + 1;
 	blocks.y = (y - 1) / threads.y + 1;
