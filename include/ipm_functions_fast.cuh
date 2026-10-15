@@ -3,9 +3,9 @@
 #include "array_functions.cuh"
 #include "complex.cuh"
 #include "deflection_angles/alpha_smooth.cuh"
-#include "polygon.cuh"
 #include "star.cuh"
 #include "tree_node.cuh"
+#include "triangle_coverage.cuh"
 #include "util/util.cuh"
 
 #include <numbers>
@@ -206,11 +206,12 @@ namespace ipm_fast
 	  instead of 4x per corner
 	- the leaf of the tile centre is looked up once and reused for every corner
 	  that lies inside it
-	- plain-FMA complex arithmetic and hoisted smooth-matter series (w_fast); the pixel allocation is the original Polygon one
+	- plain-FMA complex arithmetic and hoisted smooth-matter series (w_fast); the pixel allocation is the closed-form per-pixel coverage (tri_cov::allocate_triangle)
 
 	\tparam T -- precision of the lens mapping and of the pixel arrays
+	\tparam P -- precision of the pixel-allocation arithmetic
 	******************************************************************************/
-	template <typename T>
+	template <typename T, typename P>
 	__global__ void __launch_bounds__(TILE * TILE, min_blocks_per_sm<T>())
 	shoot_cells_tiled_kernel(T kappa, T gamma, T theta, const star<T>* __restrict__ stars, T kappastar, TreeNode<T>* root,
 		int rectangular, Complex<T> corner, int approx, int taylor_smooth, SmoothConst<T> sc,
@@ -237,6 +238,7 @@ namespace ipm_fast
 		//area of one triangle (half a cell) in pixel units; this is what one triangle deposits in total
 		const T image_plane_area = 2 * ray_half_sep.re * ray_half_sep.im * sx * sy;
 		const T max_area = 10000 * image_plane_area;
+		const P factor = static_cast<P>(image_plane_area);
 		const bool parities = (pixmin != nullptr && pixsad != nullptr);
 
 		for (int tile = blockIdx.x; tile < num_tiles; tile += gridDim.x)
@@ -288,21 +290,16 @@ namespace ipm_fast
 				const Complex<T> y2(s_cre[k00], s_cim[k00]);         //(i,   j)
 				const Complex<T> y3(s_cre[k00 + 1], s_cim[k00 + 1]); //(i+1, j)
 
-				/******************************************************************************
-				same two triangles, area test and parity rule as the original kernel
-				******************************************************************************/
 				auto deposit = [&](Complex<T> pa, Complex<T> pb, Complex<T> pc)
 				{
-					polygon::Polygon<T> poly;
-					poly.points[0] = pa;
-					poly.points[1] = pb;
-					poly.points[2] = pc;
-					poly.numsides = 3;
-					T area = poly.area();
+					//signed area, same orientation convention as the shoelace formula
+					T area = T(0.5) * ((pb.re - pa.re) * (pc.im - pa.im) - (pc.re - pa.re) * (pb.im - pa.im));
 					//rejects NaN (ray on top of a star) and cells straddling a critical curve
 					if (!(fabs(area) < max_area)) return;
-					T* target = parities ? (area < 0 ? pixmin : pixsad) : pixels;
-					poly.allocate_area_among_pixels(image_plane_area, target, npixels);
+					const long long parity = (parities && area >= 0) ? 1 : 0;
+					T* target = parities ? (parity ? pixsad : pixmin) : pixels;
+					tri_cov::allocate_triangle<P, T>(pa, pb, pc, area, factor, npixels,
+						[&](long long idx, P v) { atomicAdd(&target[idx], static_cast<T>(v)); });
 				};
 				deposit(y0, y1, y2);
 				deposit(y2, y3, y0);
