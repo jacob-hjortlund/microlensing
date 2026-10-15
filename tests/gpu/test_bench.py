@@ -1330,5 +1330,22 @@ class TimingTests(unittest.TestCase):
             self.assertEqual([p for p in scratch.rglob("*") if p.is_dir() and p.parent != scratch], [])
 
 
+import python_check  # noqa: E402
+
+
+class PythonCheckTests(unittest.TestCase):
+    def test_keyword_table_matches_configs(self):
+        for name, kw in python_check.KW.items():
+            cfg = configs.CONFIGS[name]
+            args = dict(zip(cfg.args[::2], cfg.args[1::2]))
+            self.assertEqual(kw["kappa_tot"], float(args["-k"]), name)
+            self.assertEqual(kw["shear"], float(args["-y"]), name)
+            self.assertEqual(kw["kappa_star"], float(args["-ks"]), name)
+            self.assertEqual(kw["num_pixels_y1"], int(args["-npy1"]), name)
+            self.assertEqual(kw["half_length_y2"], float(args["-hly2"]), name)
+            self.assertEqual(kw.get("is_double", False), cfg.build == "double", name)
+            self.assertEqual(kw.get("rectangular", False), args.get("-r", "0") == "1", name)
+
+
 if __name__ == "__main__":
     unittest.main()
