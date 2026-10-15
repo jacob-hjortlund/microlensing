@@ -32,18 +32,27 @@ def main(argv=None):
     else:
         out = {"rungs": a.rungs, "repeats": a.repeats, "env": bl.environment_info(),
                "builds": {r: bl.build_meta(b) for r, b in builds.items()}, "records": []}
-    done = {(r["rung"], r["config"], r["repeat"]) for r in out["records"]}
+    # position of each (rung, config, repeat) record; only successful records count as done, and a
+    # configuration measured again replaces its failed record in place
+    index = {(r["rung"], r["config"], r["repeat"]): i for i, r in enumerate(out["records"])}
+    done = {key for key, i in index.items() if out["records"][i]["ok"]}
     if not a.no_warmup:
         warm_up(builds[a.rungs[0]], a.ref_root, a.scratch)
     for k in range(1, a.repeats + 1):
         for rung in a.rungs:
             for cfg in cf.ladder_configs(rung):
-                if (rung, cfg.name, k) in done:
+                key = (rung, cfg.name, k)
+                if key in done:
                     continue
                 outdir = Path(a.scratch) / rung / cfg.name
-                rec = bl.run_ipm(cf.exe_for(builds[rung], cfg.build), cf.full_args(cfg, a.ref_root), outdir, timeout=3600)
+                rec = bl.run_ipm(cf.exe_for(builds[rung], cfg.build), cf.full_args(cfg, a.ref_root), outdir,
+                                 timeout=3600)
                 rec.update({"config": cfg.name, "repeat": k, "rung": rung})
-                out["records"].append(rec)
+                if key in index:
+                    out["records"][index[key]] = rec
+                else:
+                    index[key] = len(out["records"])
+                    out["records"].append(rec)
                 bl.write_json(out_path, out)
                 shoot = f"{rec['t_shoot_cells']:.3f}" if rec["ok"] else "FAIL " + str(rec["error"])
                 print(f"rep{k} {rung:7s} {cfg.name:12s} wall {rec['wall_s']:.2f} s t_shoot {shoot}", flush=True)

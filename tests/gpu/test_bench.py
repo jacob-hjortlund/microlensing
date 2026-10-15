@@ -1245,6 +1245,59 @@ class TimingTests(unittest.TestCase):
                 self.assertEqual(time_ladder.main(argv), 0)
             self.assertEqual(len(bench_lib.read_json(out_path)["records"]), 18)
 
+    def test_time_ladder_replaces_a_failed_record(self):
+        with tempfile.TemporaryDirectory() as d:
+            builds = Path(d) / "builds"
+            for rung in ("R0", "R2p"):
+                fake_build_dir(builds / rung)
+            out_path = Path(d) / "ladder.json"
+            failed = {"rung": "R0", "config": "nb_f", "repeat": 1, "ok": False, "error": "exit code 3",
+                      "wall_s": 0.1, "t_shoot_cells": None}
+            bench_lib.write_json(out_path, {"rungs": ["R0", "R2p"], "repeats": 1, "env": {}, "builds": {},
+                                            "records": [failed]})
+            argv = ["--rungs", "R0", "R2p", "--builds-root", str(builds), "--repeats", "1",
+                    "--ref-root", f"{d}/ref", "--out", str(out_path), "--scratch", f"{d}/scratch", "--no-warmup"]
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(time_ladder.main(argv), 0)
+            records = bench_lib.read_json(out_path)["records"]
+            keys = [(r["rung"], r["config"], r["repeat"]) for r in records]
+            self.assertEqual(len(keys), 5)   # R0: nb_f, nb_d, rect_f, hm100_f; R2p: nb_d
+            self.assertEqual(len(set(keys)), len(keys), keys)   # one record per configuration and repeat
+            nb_f = [r for r in records if (r["rung"], r["config"]) == ("R0", "nb_f")]
+            self.assertEqual(len(nb_f), 1)
+            self.assertTrue(nb_f[0]["ok"], nb_f[0]["error"])
+
+    def test_warm_up_passes_the_timeout(self):
+        with tempfile.TemporaryDirectory() as d:
+            build = fake_build_dir(Path(d) / "build")
+            with mock.patch.object(bench_lib, "run_ipm", wraps=bench_lib.run_ipm) as spy:
+                rec = time_rung.warm_up(build, f"{d}/ref", f"{d}/scratch")
+            self.assertTrue(rec["ok"], rec["error"])
+            self.assertEqual(spy.call_args.kwargs.get("timeout"), 3600)
+
+    def test_time_rung_rejects_an_unknown_or_empty_selection(self):
+        with tempfile.TemporaryDirectory() as d:
+            build = fake_build_dir(Path(d) / "build")
+            out_path = Path(d) / "results" / "timing_ladder.json"
+            for only in (["nb_ff"], ["sf_f"], []):   # a misspelt name, a configuration outside the ladder, no name
+                with self.subTest(only=only):
+                    err = io.StringIO()
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                        rc = time_rung.main(["--build", str(build), "--rung", "R1a", "--only", *only,
+                                             "--ref-root", f"{d}/ref", "--results", f"{d}/results",
+                                             "--scratch", f"{d}/scratch", "--no-warmup"])
+                    self.assertEqual(rc, 2)
+                    self.assertIn("unknown or empty configuration selection", err.getvalue())
+                    self.assertFalse(out_path.exists())
+            # an existing timing file is left alone, and a bad selection still fails rather than reporting "exists"
+            bench_lib.write_json(out_path, {"sentinel": True})
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc = time_rung.main(["--build", str(build), "--rung", "R1a", "--only", "nb_ff",
+                                     "--ref-root", f"{d}/ref", "--results", f"{d}/results",
+                                     "--scratch", f"{d}/scratch", "--no-warmup"])
+            self.assertEqual(rc, 2)
+            self.assertEqual(bench_lib.read_json(out_path), {"sentinel": True})
+
 
 if __name__ == "__main__":
     unittest.main()
