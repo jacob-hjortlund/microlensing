@@ -482,5 +482,40 @@ class HelperTests(unittest.TestCase):
             self.assertIn(key, info)
 
 
+import ptxas_stats  # noqa: E402
+
+
+class PtxasTests(unittest.TestCase):
+    LOG = """=== ipm_gpu ===
+ptxas info    : Compiling entry function '_Z16histogram_kernelIfEvPT_7ComplexIiEiPii' for 'sm_80'
+ptxas info    : Function properties for _Z16histogram_kernelIfEvPT_7ComplexIiEiPii
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 14 registers, 384 bytes cmem[0]
+ptxas info    : Compiling entry function '_Z18shoot_cells_kernelIfEvT_S0_S0_P4starIS0_ES0_P8TreeNodeIS0_Ei7ComplexIS0_EiiS7_S6_IiES7_S7_S7_S7_PS0_S9_S9_S8_Pyi' for 'sm_80'
+ptxas info    : Function properties for _Z18shoot_cells_kernelIfEvT_S0_S0_P4starIS0_ES0_P8TreeNodeIS0_Ei7ComplexIS0_EiiS7_S6_IiES7_S7_S7_S7_PS0_S9_S9_S8_Pyi
+    376 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 74 registers, 544 bytes cmem[0]
+=== ipm_gpu_double ===
+ptxas info    : Compiling entry function '_ZN8ipm_fast24shoot_cells_tiled_kernelIdfEEvT_S1_S1_PK4starIS1_ES1_P8TreeNodeIS1_E' for 'sm_80'
+ptxas info    : Function properties for _ZN8ipm_fast24shoot_cells_tiled_kernelIdfEEvT_S1_S1_PK4starIS1_ES1_P8TreeNodeIS1_E
+    48 bytes stack frame, 56 bytes spill stores, 56 bytes spill loads
+ptxas info    : Used 80 registers, 6168 bytes smem, 760 bytes cmem[0]
+"""
+
+    def test_parse_shoot_kernels(self):
+        rows = ptxas_stats.parse(self.LOG)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["target"], "ipm_gpu")
+        self.assertEqual(rows[0]["registers"], 74)
+        self.assertEqual(rows[0]["stack_bytes"], 376)
+        self.assertEqual(rows[0]["spill_stores"], 0)
+        self.assertEqual(rows[0]["smem_bytes"], 0)
+        self.assertEqual(rows[1]["target"], "ipm_gpu_double")
+        self.assertEqual(rows[1]["registers"], 80)
+        self.assertEqual(rows[1]["spill_loads"], 56)
+        self.assertEqual(rows[1]["smem_bytes"], 6168)
+        self.assertIn("tiled", rows[1]["function"])
+
+
 if __name__ == "__main__":
     unittest.main()
