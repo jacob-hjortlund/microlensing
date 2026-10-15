@@ -437,6 +437,8 @@ private:
 		if (cuda_error("cudaMallocManaged(*percentage)", false, __FILE__, __LINE__)) return false;
 		*percentage = 1;
 
+		ipm_fast::SmoothConst<T> smooth_const = ipm_fast::make_smooth_const<T>(corner);
+
 		/******************************************************************************
 		shoot rays and calculate time taken in seconds
 		******************************************************************************/
@@ -444,7 +446,7 @@ private:
 		stopwatch.start();
 		ipm_fast::shoot_cells_tiled_kernel<T> <<<static_cast<unsigned int>(grid), dim3(ipm_fast::TILE, ipm_fast::TILE)>>> (
 			kappa_tot, shear, theta_star, stars, kappa_star, tree[0],
-			rectangular, corner, approx, taylor_smooth,
+			rectangular, corner, approx, taylor_smooth, smooth_const,
 			ray_half_sep, num_ray_threads, center_x, half_length_x,
 			center_y, half_length_y, pixels_minima, pixels_saddles, pixels, num_pixels_y, percentage, verbose);
 		if (cuda_error("shoot_cells_tiled_kernel", true, __FILE__, __LINE__)) return false;
