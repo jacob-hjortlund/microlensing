@@ -355,5 +355,99 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(configs.exe_for("/b", "double").name, "ipm_gpu_double")
 
 
+FAKE = str(HERE / "fake_ipm.py")
+
+
+class RunIpmTests(unittest.TestCase):
+    def run_fake(self, env_over=None, **kw):
+        env = dict(os.environ)
+        env.update(env_over or {})
+        with tempfile.TemporaryDirectory() as d:
+            rec = bench_lib.run_ipm(sys.executable, [FAKE, "-npy1", "4", "-npy2", "3"], Path(d) / "out", env=env, **kw)
+            files = sorted(p.name for p in (Path(d) / "out").iterdir())
+            return rec, files
+
+    def test_success_record(self):
+        rec, files = self.run_fake()
+        self.assertTrue(rec["ok"], rec)
+        self.assertIsNone(rec["error"])
+        self.assertEqual(rec["returncode"], 0)
+        self.assertEqual(rec["t_shoot_cells"], 0.123)
+        self.assertGreater(rec["wall_s"], 0.0)
+        self.assertEqual(rec["param_info"]["num_stars"], "137")
+        self.assertIn("ipm_magnifications.bin", files)
+        self.assertIn("fake run done", rec["stdout_tail"])
+        self.assertEqual(rec["args"][-2:], ["-npy2", "3"])   # -v and -o are not part of args
+
+    def test_failure_exit_code(self):
+        rec, _ = self.run_fake({"FAKE_IPM_FAIL": "1"})
+        self.assertFalse(rec["ok"])
+        self.assertEqual(rec["returncode"], 3)
+        self.assertIn("exit code 3", rec["error"])
+        self.assertIn("fake failure", rec["stderr_tail"])
+
+    def test_missing_param_file_not_ok(self):
+        rec, _ = self.run_fake({"FAKE_IPM_NO_PARAM": "1"})
+        self.assertFalse(rec["ok"])
+        self.assertIn("ipm_parameter_info.txt", rec["error"])
+        self.assertIsNone(rec["t_shoot_cells"])
+
+    def test_missing_map_not_ok(self):
+        rec, _ = self.run_fake({"FAKE_IPM_NO_MAP": "1"})
+        self.assertFalse(rec["ok"])
+        self.assertIn("ipm_magnifications.bin", rec["error"])
+        rec, _ = self.run_fake({"FAKE_IPM_NO_MAP": "1"}, expect_map=False)
+        self.assertTrue(rec["ok"])
+
+    def test_old_outputs_are_removed(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "out"
+            out.mkdir()
+            (out / "ipm_stale.bin").write_bytes(b"x")
+            bench_lib.run_ipm(sys.executable, [FAKE], out)
+            self.assertFalse((out / "ipm_stale.bin").exists())
+
+
+class SamplerTests(unittest.TestCase):
+    def test_no_index_gives_none(self):
+        saved = os.environ.get("CUDA_VISIBLE_DEVICES")
+        try:
+            os.environ["CUDA_VISIBLE_DEVICES"] = "GPU-b5449ec5-cd58-e6c6-e691-901514c1de2c"
+            self.assertIsNone(bench_lib.gpu_index())
+            self.assertIsNone(bench_lib.GpuMemorySampler().start().stop())
+            os.environ.pop("CUDA_VISIBLE_DEVICES")
+            self.assertIsNone(bench_lib.gpu_index())
+            os.environ["CUDA_VISIBLE_DEVICES"] = "4,5"
+            self.assertEqual(bench_lib.gpu_index(), "4")
+        finally:
+            if saved is None:
+                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            else:
+                os.environ["CUDA_VISIBLE_DEVICES"] = saved
+
+
+class HelperTests(unittest.TestCase):
+    def test_median(self):
+        self.assertEqual(bench_lib.median([3, 1, 2]), 2)
+        self.assertEqual(bench_lib.median([4, 1, 3, 2]), 2.5)
+        self.assertEqual(bench_lib.median([None, 5]), 5)
+        self.assertIsNone(bench_lib.median([]))
+
+    def test_json_roundtrip_and_build_meta(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "sub" / "x.json"
+            bench_lib.write_json(p, {"a": [1, 2]})
+            self.assertEqual(bench_lib.read_json(p), {"a": [1, 2]})
+            (Path(d) / "git_rev.txt").write_text("abc123 clean\n")
+            meta = bench_lib.build_meta(d)
+            self.assertEqual(meta["git_rev"], "abc123 clean")
+            self.assertIsNone(meta["nvcc_version"])
+
+    def test_environment_info_has_keys(self):
+        info = bench_lib.environment_info()
+        for key in ("hostname", "slurm_job_id", "cuda_visible_devices", "gpu", "nvcc", "timestamp"):
+            self.assertIn(key, info)
+
+
 if __name__ == "__main__":
     unittest.main()
