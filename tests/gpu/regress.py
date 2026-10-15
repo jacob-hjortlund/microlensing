@@ -93,10 +93,15 @@ def main(argv=None):
     results_dir = Path(a.results or bl.BENCH_ROOT / "results" / a.rung)
     scratch = Path(a.scratch or bl.SCRATCH / a.rung / "regress")
     cfgs = cf.regression_configs(a.rung, a.set)
+    names = {c.name for c in cfgs}
+    unknown = [n for n in (a.only or []) if n not in names]
     if a.only:
         cfgs = [c for c in cfgs if c.name in a.only]
+    if unknown:
+        print(f"unknown configuration(s): {', '.join(unknown)}", file=sys.stderr)
     if not cfgs:
         print("no configurations selected", file=sys.stderr)
+    if unknown or not cfgs:
         return 2
     out = {"rung": a.rung, "set": a.set, "env": bl.environment_info(), "build": bl.build_meta(a.build),
            "tolerances": {k: tol[k] for k in ("floor_frac", "double", "float", "parity_consistency")},
@@ -113,7 +118,7 @@ def main(argv=None):
                 res = check_config(cfg, outdir, a.ref_root, tol, a.rung)
             except Exception as exc:   # recorded as a failure so the remaining configurations still run
                 res = {"config": cfg.name, "build": cfg.build, "rung": a.rung, "pass": False,
-                       "failures": [f"check failed: {exc}"], "flags": [], "maps": {}}
+                       "failures": [f"check failed: {type(exc).__name__}: {exc}"], "flags": [], "maps": {}}
         res["run"] = {k: rec[k] for k in ("wall_s", "t_shoot_cells", "returncode", "stderr_tail")}
         out["configs"].append(res)
         out["pass"] = out["pass"] and res["pass"]
