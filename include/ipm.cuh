@@ -104,6 +104,12 @@ private:
 	Complex<int> num_ray_threads; //number of threads in x1 and x2 directions
 
 	/******************************************************************************
+	precision of the pixel-allocation arithmetic (float is enough for the
+	origin-shifted coordinates it works on, even inside the double build)
+	******************************************************************************/
+	using pixel_arith_t = T;
+
+	/******************************************************************************
 	dynamic memory
 	******************************************************************************/
 	T* pixels = nullptr;
@@ -424,7 +430,7 @@ private:
 		const long long num_tiles = 1LL * tiles_x * tiles_y;
 
 		int blocks_per_sm = 0;
-		cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, ipm_fast::shoot_cells_tiled_kernel<T>, ipm_fast::TILE * ipm_fast::TILE, 0);
+		cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, ipm_fast::shoot_cells_tiled_kernel<T, pixel_arith_t>, ipm_fast::TILE * ipm_fast::TILE, 0);
 		if (cuda_error("cudaOccupancyMaxActiveBlocksPerMultiprocessor", false, __FILE__, __LINE__)) return false;
 		if (blocks_per_sm < 1) blocks_per_sm = 1;
 		long long grid = 1LL * blocks_per_sm * cuda_device_prop.multiProcessorCount;
@@ -444,7 +450,7 @@ private:
 		******************************************************************************/
 		print_verbose("Shooting cells...\n", verbose, 1);
 		stopwatch.start();
-		ipm_fast::shoot_cells_tiled_kernel<T> <<<static_cast<unsigned int>(grid), dim3(ipm_fast::TILE, ipm_fast::TILE)>>> (
+		ipm_fast::shoot_cells_tiled_kernel<T, pixel_arith_t> <<<static_cast<unsigned int>(grid), dim3(ipm_fast::TILE, ipm_fast::TILE)>>> (
 			kappa_tot, shear, theta_star, stars, kappa_star, tree[0],
 			rectangular, corner, approx, taylor_smooth, smooth_const,
 			ray_half_sep, num_ray_threads, center_x, half_length_x,
