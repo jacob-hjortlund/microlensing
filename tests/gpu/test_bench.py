@@ -1347,5 +1347,49 @@ class PythonCheckTests(unittest.TestCase):
             self.assertEqual(kw.get("rectangular", False), args.get("-r", "0") == "1", name)
 
 
+import report  # noqa: E402
+
+
+class ReportTests(unittest.TestCase):
+    def test_ladder_table_speedups(self):
+        summary = {"R0": {"nb_f": {"median_t_shoot_cells": 10.0, "median_wall_s": 14.0}},
+                   "R0p": {"nb_f": {"median_t_shoot_cells": 10.0, "median_wall_s": 14.0}},
+                   "R1a": {"nb_f": {"median_t_shoot_cells": 5.0, "median_wall_s": 9.0}},
+                   "R2p": {},
+                   "R3": {"nb_f": {"median_t_shoot_cells": 2.5, "median_wall_s": 6.0}}}
+        table = report.ladder_table(summary, ["R0", "R0p", "R1a", "R2p", "R3"], ["nb_f"], "median_t_shoot_cells")
+        lines = table.splitlines()
+        self.assertTrue(lines[0].startswith("| rung |"))
+        self.assertIn("| R0′ | 10.000 | 1.00 | 1.00 |", table)
+        self.assertIn("| R1a | 5.000 | 2.00 | 2.00 |", table)
+        self.assertIn("| R2′ | – | – | – |", table)
+        self.assertIn("| R3 | 2.500 | 4.00 | 2.00 |", table)   # vs prev skips the empty R2′ row
+
+    def test_matrix_table(self):
+        r0 = {"nb_f": {"median_t_shoot_cells": 8.0}, "big_f": {"median_t_shoot_cells": 40.0}}
+        r5 = {"nb_f": {"median_t_shoot_cells": 2.0}}
+        table = report.matrix_table(r0, r5, "median_t_shoot_cells")
+        self.assertIn("| nb_f | 8.000 | 2.000 | 4.00 |", table)
+        self.assertIn("| big_f | 40.000 | – | – |", table)
+
+    def test_main_renders_from_results_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            rec = lambda rung, cfg, t, w: {"rung": rung, "config": cfg, "repeat": 1, "ok": True, "t_shoot_cells": t, "wall_s": w}
+            bench_lib.write_json(root / "ladder_interleaved.json", {
+                "rungs": ["R0", "R5"], "env": {"gpu": "A100", "hostname": "h", "nvcc": "x", "cuda_visible_devices": "4"},
+                "records": [rec("R0", "nb_f", 10, 12), rec("R5", "nb_f", 2, 4)],
+                "summary": {"R0": time_rung.summarize([rec("R0", "nb_f", 10, 12)]),
+                            "R5": time_rung.summarize([rec("R5", "nb_f", 2, 4)])}})
+            bench_lib.write_json(root / "R0" / "timing_full.json", {"records": [rec("R0", "nb_f", 10, 12)]})
+            bench_lib.write_json(root / "R5" / "timing_full.json", {"records": [rec("R5", "nb_f", 2, 4)],
+                                                                   "summary": time_rung.summarize([rec("R5", "nb_f", 2, 4)])})
+            out = root / "tables.md"
+            self.assertEqual(report.main(["--results", str(root), "--out", str(out)]), 0)
+            text = out.read_text()
+            self.assertIn("| R5 | 2.000 | 5.00 | 5.00 |", text)
+            self.assertIn("A100", text)
+
+
 if __name__ == "__main__":
     unittest.main()
