@@ -251,7 +251,7 @@ namespace ipm_fast
 	/******************************************************************************
 	resident blocks per SM that ptxas is asked to make room for (sm_80, 256 threads):
 	float fits 4 blocks in 64 registers without spilling; double fits 3 in 80
-	registers with ~56 bytes of spills, which beats 2 blocks at 130 registers
+	registers with a few hundred bytes of spills, which beats 2 blocks at 130 registers
 	******************************************************************************/
 	template <typename T>
 	constexpr int min_blocks_per_sm() { return IPM_MIN_BLOCKS_PER_SM > 0 ? IPM_MIN_BLOCKS_PER_SM : (sizeof(T) == 4 ? 4 : 3); }
@@ -265,7 +265,7 @@ namespace ipm_fast
 	- the leaf of the tile centre is staged into shared memory (record, local
 	  coefficients, contiguous direct-star list) and reused for every corner that
 	  lies inside it; other corners read the compact global arrays
-	- pixel allocation runs in precision P (float even for T = double) on
+	- pixel allocation runs in precision P (the map precision T; see ipm.cuh) on
 	  origin-shifted coordinates
 	- single-pixel triangles (the hot path in magnified regions) are merged per
 	  cell and warp-aggregated before the atomic

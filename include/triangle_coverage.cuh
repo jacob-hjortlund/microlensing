@@ -23,8 +23,10 @@ Two precisions are involved: T is the precision of the vertices (the lens
 mapping), P the precision used for the per-pixel arithmetic. Before the
 per-pixel work the vertices are shifted so that the lower-left pixel of the
 (clamped) bounding box is the origin; the coordinates that remain are a few
-pixels in size, so P = float loses nothing even inside the double build and
-even for maps with 10^5 pixels per side.
+pixels in size, so P = float would be viable even inside the double build and
+even for maps with 10^5 pixels per side. The double build nevertheless uses
+P = T: single-precision pixel arithmetic changes its maps at the 1e-7 (mean)
+to 1e-5 (p99.9) relative level, far above its 1e-13 rounding floor.
 
 The original code adds factor*|piece|/|whole| per pixel; summing the signed
 coverage and scaling by factor/area (signed) is identical.
@@ -189,7 +191,8 @@ namespace tri_cov
 			columns outside the span of the edges that cross this row receive zero
 			coverage (the edge integrals cancel), so visit only the span. without this
 			a sliver triangle with a tiny area but a huge bounding box costs as much
-			as the whole map
+			as the whole map, and the cancellation left rounding noise of up to
+			factor per pixel in thin slivers
 			******************************************************************************/
 			P lo = static_cast<P>(ix1 - ix0 + 1), hi = P(-1);
 			if (L0 > 0) { lo = fmin(lo, fmin(xra0, xrb0)); hi = fmax(hi, fmax(xra0, xrb0)); }
