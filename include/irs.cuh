@@ -131,7 +131,7 @@ private:
 	star<T>* stars = nullptr;
 	star<T>* temp_stars = nullptr;
 
-	int* binomial_coeffs = nullptr;
+	long long* binomial_coeffs = nullptr;
 
 	int* pixels = nullptr;
 	int* pixels_minima = nullptr;
@@ -604,7 +604,7 @@ private:
 		/******************************************************************************
 		allocate memory for binomial coefficients
 		******************************************************************************/
-		cudaMallocManaged(&binomial_coeffs, (2 * treenode::MAX_EXPANSION_ORDER * (2 * treenode::MAX_EXPANSION_ORDER + 3) / 2 + 1) * sizeof(int));
+		cudaMallocManaged(&binomial_coeffs, (2 * treenode::MAX_EXPANSION_ORDER * (2 * treenode::MAX_EXPANSION_ORDER + 3) / 2 + 1) * sizeof(long long));
 		if (cuda_error("cudaMallocManaged(*binomial_coeffs)", false, __FILE__, __LINE__)) return false;
 
 		/******************************************************************************
