@@ -101,6 +101,7 @@ def main(argv=None):
     out = {"rung": a.rung, "set": a.set, "env": bl.environment_info(), "build": bl.build_meta(a.build),
            "tolerances": {k: tol[k] for k in ("floor_frac", "double", "float", "parity_consistency")},
            "configs": [], "pass": True, "complete": False, "n_configs": len(cfgs)}
+    bl.write_json(results_dir / f"regression_{a.set}.json", out)   # an earlier result file must not outlive an abort
     for cfg in cf.ordered(cfgs):
         outdir = scratch / cfg.name
         rec = bl.run_ipm(cf.exe_for(a.build, cfg.build), cf.full_args(cfg, a.ref_root), outdir, timeout=3600)
