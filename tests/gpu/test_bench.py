@@ -5,8 +5,10 @@ import os
 import struct
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -406,6 +408,37 @@ class RunIpmTests(unittest.TestCase):
             (out / "ipm_stale.bin").write_bytes(b"x")
             bench_lib.run_ipm(sys.executable, [FAKE], out)
             self.assertFalse((out / "ipm_stale.bin").exists())
+
+    def test_timeout_gives_failed_record(self):
+        rec, _ = self.run_fake({"FAKE_IPM_SLEEP": "3"}, timeout=0.5)
+        self.assertFalse(rec["ok"])
+        self.assertEqual(rec["returncode"], -1)
+        self.assertIn("timeout", rec["error"])
+        self.assertIsInstance(rec["stdout_tail"], str)
+        with tempfile.TemporaryDirectory() as d:
+            bench_lib.write_json(Path(d) / "rec.json", rec)
+            self.assertEqual(bench_lib.read_json(Path(d) / "rec.json")["error"], rec["error"])
+
+    def test_timeout_keeps_partial_output_as_text(self):
+        # The fake prints nothing before its sleep, so this child prints first to exercise the bytes path.
+        code = "import time; print('partial', flush=True); time.sleep(30)"
+        with tempfile.TemporaryDirectory() as d:
+            rec = bench_lib.run_ipm(sys.executable, ["-c", code], Path(d) / "out", timeout=2)
+            self.assertFalse(rec["ok"])
+            self.assertEqual(rec["stdout_tail"], "partial\n")
+            bench_lib.write_json(Path(d) / "rec.json", rec)
+
+    def test_missing_executable_gives_failed_record(self):
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0"}), tempfile.TemporaryDirectory() as d:
+            before = threading.active_count()
+            rec = bench_lib.run_ipm("/nonexistent/ipm_gpu", [], Path(d) / "out", sample_gpu=True)
+            after = threading.active_count()
+        self.assertFalse(rec["ok"])
+        self.assertIn("cannot start", rec["error"])
+        self.assertIn("/nonexistent/ipm_gpu", rec["error"])
+        self.assertIsNone(rec["returncode"])
+        self.assertEqual((rec["stdout_tail"], rec["stderr_tail"]), ("", ""))
+        self.assertEqual(before, after)
 
 
 class SamplerTests(unittest.TestCase):

@@ -113,6 +113,13 @@ class GpuMemorySampler:
         return max(self.samples) if self.samples else None
 
 
+def _as_text(data):
+    """Decode the raw bytes that TimeoutExpired carries even with text=True; None becomes ''."""
+    if isinstance(data, bytes):
+        return data.decode(errors="replace")
+    return data or ""
+
+
 def run_ipm(exe, args, outdir, verbose=1, sample_gpu=False, expect_map=True, timeout=None, env=None):
     """Run one IPM executable with `-v <verbose> -o <outdir>/`; wall time covers process start to exit."""
     outdir = Path(outdir)
@@ -122,19 +129,29 @@ def run_ipm(exe, args, outdir, verbose=1, sample_gpu=False, expect_map=True, tim
     cmd = [str(exe)] + [str(a) for a in args] + ["-v", str(verbose), "-o", str(outdir) + "/"]
     sampler = GpuMemorySampler().start() if sample_gpu else None
     t0 = time.perf_counter()
+    timed_out, start_error = False, None
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
         returncode, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
     except subprocess.TimeoutExpired as exc:
-        returncode, stdout, stderr = -1, (exc.stdout or ""), f"timeout after {timeout} s"
-    wall = time.perf_counter() - t0
-    peak = sampler.stop() if sampler else None
+        timed_out = True
+        returncode, stdout, stderr = -1, _as_text(exc.stdout), _as_text(exc.stderr)
+    except OSError as exc:
+        start_error = f"cannot start {exe}: {exc}"
+        returncode, stdout, stderr = None, "", ""
+    finally:
+        wall = time.perf_counter() - t0
+        peak = sampler.stop() if sampler else None
     record = {"exe": str(exe), "args": [str(a) for a in args], "outdir": str(outdir),
               "returncode": returncode, "wall_s": wall, "t_shoot_cells": None, "param_info": {},
               "peak_gpu_mem_mib": peak, "stdout_tail": stdout[-2000:], "stderr_tail": stderr[-2000:],
               "ok": False, "error": None}
     param_path = outdir / "ipm_parameter_info.txt"
-    if returncode != 0:
+    if start_error is not None:
+        record["error"] = start_error
+    elif timed_out:
+        record["error"] = f"timeout after {timeout} s"
+    elif returncode != 0:
         record["error"] = f"exit code {returncode}"
     elif not param_path.exists():
         record["error"] = "ipm_parameter_info.txt not written"
