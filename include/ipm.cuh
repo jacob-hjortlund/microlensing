@@ -106,8 +106,9 @@ private:
 	Complex<int> num_ray_threads; //number of threads in x1 and x2 directions
 
 	/******************************************************************************
-	precision of the pixel-allocation arithmetic (float is enough for the
-	origin-shifted coordinates it works on, even inside the double build)
+	precision of the pixel-allocation arithmetic: the map precision. single
+	precision would suffice for the origin-shifted coordinates in the float build,
+	but in the double build it changes the maps beyond their rounding floor
 	******************************************************************************/
 	using pixel_arith_t = T;
 
