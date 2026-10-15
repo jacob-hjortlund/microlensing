@@ -9,6 +9,9 @@
 #include "triangle_coverage.cuh"
 #include "util/util.cuh"
 
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+
 #include <numbers>
 
 
@@ -221,6 +224,25 @@ namespace ipm_fast
 						  z.im * (1 - kappa - gamma) - acc_im * theta2 + loc.im * f - a_smooth.im);
 	}
 
+	/******************************************************************************
+	warp-aggregated atomic add: lanes of the (opportunistically) coalesced group
+	that target the same key are reduced with shuffles and only their leader
+	issues the atomic. in magnified regions a whole warp lands in one pixel, so
+	this turns 32 serialised L2 atomics into one.
+	******************************************************************************/
+	template <typename T, typename P>
+	__device__ __forceinline__ void warp_aggregated_add(T* __restrict__ base, long long key, P v)
+	{
+		namespace cg = cooperative_groups;
+		cg::coalesced_group active = cg::coalesced_threads();
+		auto same = cg::labeled_partition(active, key);
+		P sum = cg::reduce(same, v, cg::plus<P>());
+		if (same.thread_rank() == 0)
+		{
+			atomicAdd(base + key, static_cast<T>(sum));
+		}
+	}
+
 	constexpr int TILE = 16; //cells per tile side; a block handles one TILE x TILE tile at a time
 	constexpr int NCORNER = (TILE + 1) * (TILE + 1);
 #ifndef IPM_MIN_BLOCKS_PER_SM
@@ -387,6 +409,22 @@ namespace ipm_fast
 				const Complex<T> y2(s_cre[k00], s_cim[k00]);         //(i,   j)
 				const Complex<T> y3(s_cre[k00 + 1], s_cim[k00 + 1]); //(i+1, j)
 
+				/******************************************************************************
+				single-pixel contributions of the two triangles are merged per cell and
+				flushed once through the warp-aggregated path. the key encodes the
+				target array (parity) in its low bit.
+				******************************************************************************/
+				long long pend_key = -1;
+				P pend_val = 0;
+				auto flush = [&]()
+				{
+					if (pend_key >= 0)
+					{
+						T* base = parities ? ((pend_key & 1) ? pixsad : pixmin) : pixels;
+						warp_aggregated_add<T, P>(base, pend_key >> 1, pend_val);
+					}
+				};
+
 				auto deposit = [&](Complex<T> pa, Complex<T> pb, Complex<T> pc)
 				{
 					//signed area, same orientation convention as the shoelace formula
@@ -396,10 +434,25 @@ namespace ipm_fast
 					const long long parity = (parities && area >= 0) ? 1 : 0;
 					T* target = parities ? (parity ? pixsad : pixmin) : pixels;
 					tri_cov::allocate_triangle<P, T>(pa, pb, pc, area, factor, npixels,
+						[&](long long idx, P v)
+						{
+							const long long key = (idx << 1) | parity;
+							if (key == pend_key)
+							{
+								pend_val += v;
+							}
+							else
+							{
+								flush();
+								pend_key = key;
+								pend_val = v;
+							}
+						},
 						[&](long long idx, P v) { atomicAdd(&target[idx], static_cast<T>(v)); });
 				};
 				deposit(y0, y1, y2);
 				deposit(y2, y3, y0);
+				flush();
 			}
 
 			if (tid == 0)
