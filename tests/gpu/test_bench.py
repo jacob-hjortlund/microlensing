@@ -343,13 +343,16 @@ class ConfigTests(unittest.TestCase):
                 self.assertNotIn("-o", args)
                 self.assertEqual(len(args) % 2, 0)
 
-    def test_hm1000_differs_from_hm100_only_in_y(self):
+    def test_hm1000_differs_from_hm100_only_in_y_and_a(self):
         hm100 = list(configs.CONFIGS["hm100_f"].args)
         hm1000 = list(configs.CONFIGS["hm1000_f"].args)
         i = hm100.index("0.49")
         self.assertEqual(hm100[i - 1], "-y")
+        j = hm100.index("-a") + 1
+        self.assertEqual(hm100[j], "1")
         expected = list(hm100)
         expected[i] = "0.499"
+        expected[j] = "0"
         self.assertEqual(hm1000, expected)
 
     def test_exe_for(self):
