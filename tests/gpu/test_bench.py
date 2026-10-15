@@ -1385,7 +1385,9 @@ class ReportTests(unittest.TestCase):
             bench_lib.write_json(root / "R5" / "timing_full.json", {"records": [rec("R5", "nb_f", 2, 4)],
                                                                    "summary": time_rung.summarize([rec("R5", "nb_f", 2, 4)])})
             out = root / "tables.md"
-            self.assertEqual(report.main(["--results", str(root), "--out", str(out)]), 0)
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = report.main(["--results", str(root), "--out", str(out)])
+            self.assertEqual(rc, 0)
             text = out.read_text()
             self.assertIn("| R5 | 2.000 | 5.00 | 5.00 |", text)
             self.assertIn("A100", text)
