@@ -163,18 +163,17 @@ class EvaluateTests(unittest.TestCase):
 
     def test_float_rule_uses_ratio_to_reference_error(self):
         tol = compare_maps.default_tolerances()
-        ref = {"mean": 1e-5, "p999": 1e-3, "p9999": 3e-3, "max": 1e-2}
-        ok = compare_maps.evaluate_float({"mean": 1.2e-5, "p999": 1.4e-3, "p9999": 4e-3, "max": 1.5e-2},
+        ref = {"mean": 1e-5, "p999": 1e-3, "p9999": 3e-3, "max": 1e-2, "sum_ratio": 0.0}
+        ok = compare_maps.evaluate_float({"mean": 1.2e-5, "p999": 1.4e-3, "p9999": 4e-3, "max": 1.5e-2, "sum_ratio": 0.0},
                                          ref, self.metrics(), tol)
         self.assertTrue(ok["pass"])
         self.assertEqual(ok["flags"], [])
-        bad = compare_maps.evaluate_float({"mean": 1.2e-5, "p999": 1.6e-3, "p9999": 4e-3, "max": 5e-2},
+        bad = compare_maps.evaluate_float({"mean": 1.2e-5, "p999": 1.6e-3, "p9999": 4e-3, "max": 5e-2, "sum_ratio": 0.0},
                                           ref, self.metrics(), tol)
         self.assertFalse(bad["pass"])
         self.assertTrue(any("p999" in f for f in bad["failures"]))
         self.assertTrue(any("max" in f for f in bad["flags"]))
-        bad_sum = compare_maps.evaluate_float({"mean": 1e-5, "p999": 1e-3, "p9999": 3e-3, "max": 1e-2},
-                                              ref, self.metrics(sum_ratio=2e-5), tol)
+        bad_sum = compare_maps.evaluate_float({**ref, "sum_ratio": 2e-5}, ref, self.metrics(), tol)
         self.assertFalse(bad_sum["pass"])
 
 
@@ -255,7 +254,7 @@ class EvaluateRuleTests(unittest.TestCase):
 
     def test_float_common_failures_gate_the_rule(self):
         tol = compare_maps.default_tolerances()
-        ref = {"mean": 1e-5, "p999": 1e-3, "p9999": 3e-3, "max": 1e-2}
+        ref = {"mean": 1e-5, "p999": 1e-3, "p9999": 3e-3, "max": 1e-2, "sum_ratio": 0.0}
         v = compare_maps.evaluate_float(ref, ref, self.metrics(finite=False), tol)
         self.assertFalse(v["pass"])
         self.assertIn("non-finite pixels", v["failures"])
@@ -265,8 +264,8 @@ class EvaluateRuleTests(unittest.TestCase):
 
     def test_float_max_excess_is_a_flag_not_a_failure(self):
         tol = compare_maps.default_tolerances()
-        ref = {"mean": 1e-5, "p999": 1e-3, "p9999": 3e-3, "max": 1e-2}
-        m_truth = {"mean": 1e-5, "p999": 1e-3, "p9999": 3e-3, "max": 4e-2}  # max above 3.0x R0's, rest within 1.5x
+        ref = {"mean": 1e-5, "p999": 1e-3, "p9999": 3e-3, "max": 1e-2, "sum_ratio": 0.0}
+        m_truth = {"mean": 1e-5, "p999": 1e-3, "p9999": 3e-3, "max": 4e-2, "sum_ratio": 0.0}  # max above 3.0x R0's, rest within 1.5x
         v = compare_maps.evaluate_float(m_truth, ref, self.metrics(), tol)
         self.assertIs(v["pass"], True)
         self.assertEqual(v["failures"], [])
@@ -275,8 +274,8 @@ class EvaluateRuleTests(unittest.TestCase):
 
     def test_float_mean_limit_alone_fails(self):
         tol = compare_maps.default_tolerances()
-        ref = {"mean": 1e-5, "p999": 1e-3, "p9999": 3e-3, "max": 1e-2}
-        m_truth = {"mean": 1.6e-5, "p999": 1e-3, "p9999": 3e-3, "max": 1e-2}  # mean above 1.5x, rest within
+        ref = {"mean": 1e-5, "p999": 1e-3, "p9999": 3e-3, "max": 1e-2, "sum_ratio": 0.0}
+        m_truth = {"mean": 1.6e-5, "p999": 1e-3, "p9999": 3e-3, "max": 1e-2, "sum_ratio": 0.0}  # mean above 1.5x, rest within
         v = compare_maps.evaluate_float(m_truth, ref, self.metrics(), tol)
         self.assertFalse(v["pass"])
         self.assertEqual(len(v["failures"]), 1)
@@ -284,19 +283,28 @@ class EvaluateRuleTests(unittest.TestCase):
 
     def test_float_p9999_limit_alone_fails(self):
         tol = compare_maps.default_tolerances()
-        ref = {"mean": 1e-5, "p999": 1e-3, "p9999": 3e-3, "max": 1e-2}
-        m_truth = {"mean": 1e-5, "p999": 1e-3, "p9999": 5e-3, "max": 1e-2}  # p9999 above 1.5x, rest within
+        ref = {"mean": 1e-5, "p999": 1e-3, "p9999": 3e-3, "max": 1e-2, "sum_ratio": 0.0}
+        m_truth = {"mean": 1e-5, "p999": 1e-3, "p9999": 5e-3, "max": 1e-2, "sum_ratio": 0.0}  # p9999 above 1.5x, rest within
         v = compare_maps.evaluate_float(m_truth, ref, self.metrics(), tol)
         self.assertFalse(v["pass"])
         self.assertEqual(len(v["failures"]), 1)
         self.assertTrue(v["failures"][0].startswith("p9999 "), v["failures"])
 
-    def test_float_sum_ratio_uses_absolute_value(self):
+    def test_float_sum_ratio_is_judged_against_the_truth_with_an_absolute_floor(self):
         tol = compare_maps.default_tolerances()
-        ref = {"mean": 1e-5, "p999": 1e-3, "p9999": 3e-3, "max": 1e-2}
-        v = compare_maps.evaluate_float(ref, ref, self.metrics(sum_ratio=-2e-5), tol)
-        self.assertFalse(v["pass"])
-        self.assertTrue(any("sum_ratio" in f for f in v["failures"]), v["failures"])
+        stats = {"mean": 1e-5, "p999": 1e-3, "p9999": 3e-3, "max": 1e-2}
+        # the limit is max(1e-5, 1.5 x |R0's sum error|), applied to |sum_ratio| (either sign)
+        for ref_sum, limit in ((0.0, 1e-5), (-9e-5, 1.35e-4)):
+            ref = {**stats, "sum_ratio": ref_sum}
+            for sign in (1, -1):
+                ok = compare_maps.evaluate_float({**stats, "sum_ratio": sign * 0.99 * limit}, ref, self.metrics(), tol)
+                self.assertTrue(ok["pass"], (ref_sum, sign, ok["failures"]))
+                bad = compare_maps.evaluate_float({**stats, "sum_ratio": sign * 1.01 * limit}, ref, self.metrics(), tol)
+                self.assertFalse(bad["pass"], (ref_sum, sign))
+                self.assertTrue(any(f.startswith("|sum_ratio| vs truth") and "x R0's" in f for f in bad["failures"]), bad["failures"])
+        # the direct sum against R0-float no longer decides
+        ref = {**stats, "sum_ratio": 0.0}
+        self.assertTrue(compare_maps.evaluate_float({**stats, "sum_ratio": 0.0}, ref, self.metrics(sum_ratio=1e-3), tol)["pass"])
 
     def test_double_negative_off_mask_pixel_fails(self):
         rng = np.random.default_rng(1)
@@ -965,18 +973,25 @@ class RegressTests(unittest.TestCase):
             self.assertFalse(res["pass"])
             self.assertTrue(res["failures"] and all("vs truth" in f for f in res["failures"]), res["failures"])
 
-    def test_sum_ratio_is_judged_against_r0_float(self):
+    def test_sum_ratio_is_judged_against_the_truth(self):
         with tempfile.TemporaryDirectory() as d:
             truth = synthetic_reference(f"{d}/ref", "nb_d", 5.0)
             ref_f = Path(d) / "ref" / "nb_f" / "run1"
             ref_f.mkdir(parents=True)
-            write_map(ref_f / "ipm_magnifications.bin", truth * (1 + 2e-5))
+            write_map(ref_f / "ipm_magnifications.bin", truth * (1 - 1e-4))   # R0-float deposits 1e-4 too little
             out = Path(d) / "out"
             out.mkdir()
-            write_map(out / "ipm_magnifications.bin", truth)   # equal to the truth, so only the R0-float sum can fail
-            res = regress.check_config(configs.CONFIGS["nb_f"], out, f"{d}/ref", self.tolerances(), "R2")
+            tol = self.tolerances()
+            tol["float_truth_error"]["nb_f"]["pixels"]["sum_ratio"] = -1e-4
+            check = lambda: regress.check_config(configs.CONFIGS["nb_f"], out, f"{d}/ref", tol, "R2")
+            write_map(out / "ipm_magnifications.bin", truth)   # conserves the area: far from R0-float, equal to the truth
+            res = check()
+            self.assertTrue(res["pass"], res["failures"])
+            self.assertAlmostEqual(res["maps"]["pixels"]["vs_r0"]["sum_ratio"], 1e-4, places=6)   # information only
+            write_map(out / "ipm_magnifications.bin", truth * (1 - 1.6e-4))   # truth error above 1.5 x 1e-4
+            res = check()
             self.assertFalse(res["pass"])
-            self.assertTrue(res["failures"] and all("sum_ratio" in f for f in res["failures"]), res["failures"])
+            self.assertTrue(any("|sum_ratio| vs truth" in f for f in res["failures"]), res["failures"])
 
     def test_parity_consistency_fails_alone(self):
         with tempfile.TemporaryDirectory() as d:
