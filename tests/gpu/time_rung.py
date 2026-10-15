@@ -12,7 +12,7 @@ import configs as cf  # noqa: E402
 def warm_up(build, ref_root, scratch):
     cfg = cf.CONFIGS["nb_f"]
     outdir = Path(scratch) / "warmup"
-    rec = bl.run_ipm(cf.exe_for(build, cfg.build), cf.full_args(cfg, ref_root), outdir)
+    rec = bl.run_ipm(cf.exe_for(build, cfg.build), cf.full_args(cfg, ref_root), outdir, timeout=3600)
     bl.clear_outputs(outdir)
     return rec
 
@@ -57,15 +57,19 @@ def main(argv=None):
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--no-warmup", action="store_true")
     a = ap.parse_args(argv)
+    selectable = cf.ladder_configs(a.rung) if a.set == "ladder" else cf.configs_in(a.set)
+    names = {c.name for c in selectable}
+    unknown = [n for n in (a.only or []) if n not in names]
+    cfgs = selectable if a.only is None else [c for c in selectable if c.name in a.only]
+    if unknown or not cfgs:
+        print("unknown or empty configuration selection", file=sys.stderr)
+        return 2
     results_dir = Path(a.results or bl.BENCH_ROOT / "results" / a.rung)
     out_path = results_dir / f"timing_{a.set}.json"
     if out_path.exists() and not a.force:
         print(f"{out_path} exists; use --force to re-time")
         return 0
     scratch = Path(a.scratch or bl.SCRATCH / a.rung / "time")
-    cfgs = cf.ladder_configs(a.rung) if a.set == "ladder" else cf.configs_in(a.set)
-    if a.only:
-        cfgs = [c for c in cfgs if c.name in a.only]
     if not a.no_warmup:
         warm_up(a.build, a.ref_root, scratch)
     records = time_configs(a.build, a.rung, cfgs, a.repeats, a.ref_root, scratch, sample_gpu=(a.set == "memory"))
