@@ -1,5 +1,7 @@
 """Unit tests for the IPM GPU benchmark harness. No GPU needed:
 python -m unittest discover -s tests/gpu -v"""
+import contextlib
+import io
 import json
 import os
 import struct
@@ -548,7 +550,8 @@ class MakeReferenceTests(unittest.TestCase):
             build = fake_build_dir(Path(d) / "build")
             argv = ["--only", "nb_f", "--build", str(build), "--ref-root", f"{d}/ref",
                     "--scratch", f"{d}/scratch", "--results", f"{d}/results"]
-            self.assertEqual(make_reference.main(argv), 0)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(make_reference.main(argv), 0)
             for k in (1, 2, 3):
                 self.assertTrue(make_reference.is_complete(Path(d) / "ref" / "nb_f" / f"run{k}"))
             timing = bench_lib.read_json(Path(d) / "results" / "timing_full.json")
@@ -556,29 +559,70 @@ class MakeReferenceTests(unittest.TestCase):
             self.assertEqual(timing["records"][0]["config"], "nb_f")
             self.assertEqual(timing["rung"], "R0")
             # a truth-only configuration gets one run and no timing record
-            self.assertEqual(make_reference.main(argv[:1] + ["nry10_d"] + argv[2:]), 0)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(make_reference.main(argv[:1] + ["nry10_d"] + argv[2:]), 0)
             self.assertTrue(make_reference.is_complete(Path(d) / "ref" / "nry10_d" / "run1"))
             self.assertFalse((Path(d) / "ref" / "nry10_d" / "run2").exists())
             self.assertEqual(len(bench_lib.read_json(Path(d) / "results" / "timing_full.json")["records"]), 3)
-            # resume: remove run2, rerun, only run2 is regenerated
+            # resume: remove run2, rerun, only run2 is regenerated and its record is replaced, not duplicated
             shutil.rmtree(Path(d) / "ref" / "nb_f" / "run2")
             stamp = (Path(d) / "ref" / "nb_f" / "run1" / "ipm_parameter_info.txt").stat().st_mtime_ns
-            self.assertEqual(make_reference.main(argv), 0)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(make_reference.main(argv), 0)
             self.assertTrue(make_reference.is_complete(Path(d) / "ref" / "nb_f" / "run2"))
             self.assertEqual((Path(d) / "ref" / "nb_f" / "run1" / "ipm_parameter_info.txt").stat().st_mtime_ns, stamp)
             self.assertFalse((Path(d) / "scratch" / "nb_f" / "run2").exists())
+            self.assertEqual(len(bench_lib.read_json(Path(d) / "results" / "timing_full.json")["records"]), 3)
 
     def test_failed_run_returns_nonzero(self):
         with tempfile.TemporaryDirectory() as d:
             build = fake_build_dir(Path(d) / "build")
             os.environ["FAKE_IPM_FAIL"] = "1"
             try:
-                rc = make_reference.main(["--only", "nb_f", "--build", str(build), "--ref-root", f"{d}/ref",
-                                          "--scratch", f"{d}/scratch", "--results", f"{d}/results"])
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = make_reference.main(["--only", "nb_f", "--build", str(build), "--ref-root", f"{d}/ref",
+                                              "--scratch", f"{d}/scratch", "--results", f"{d}/results"])
             finally:
                 os.environ.pop("FAKE_IPM_FAIL")
             self.assertEqual(rc, 1)
             self.assertFalse((Path(d) / "ref" / "nb_f" / "run1").exists())
+
+    def test_force_replaces_reference_and_record(self):
+        with tempfile.TemporaryDirectory() as d:
+            build = fake_build_dir(Path(d) / "build")
+            argv = ["--only", "nb_f", "--build", str(build), "--ref-root", f"{d}/ref",
+                    "--scratch", f"{d}/scratch", "--results", f"{d}/results"]
+            timing_path = Path(d) / "results" / "timing_full.json"
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(make_reference.main(argv), 0)
+            timing = bench_lib.read_json(timing_path)
+            for r in timing["records"]:
+                r["wall_s"] = -1.0                      # marks the first pass so a replacement is visible
+            bench_lib.write_json(timing_path, timing)
+            os.environ["FAKE_IPM_VALUE"] = "7.0"
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(make_reference.main(argv + ["--force"]), 0)
+            finally:
+                os.environ.pop("FAKE_IPM_VALUE")
+            np.testing.assert_array_equal(
+                bench_lib.read_map(Path(d) / "ref" / "nb_f" / "run1" / "ipm_magnifications.bin"), np.full((3, 4), 7.0))
+            records = bench_lib.read_json(timing_path)["records"]
+            self.assertEqual(sorted((r["config"], r["repeat"]) for r in records), [("nb_f", 1), ("nb_f", 2), ("nb_f", 3)])
+            self.assertTrue(all(r["wall_s"] > 0 for r in records))
+
+    def test_failure_of_one_config_does_not_stop_the_rest(self):
+        with tempfile.TemporaryDirectory() as d:
+            build = fake_build_dir(Path(d) / "build")
+            (build / "ipm_gpu").write_text("#!/bin/sh\nexit 3\n")   # the float build fails
+            os.chmod(build / "ipm_gpu", 0o755)
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = make_reference.main(["--only", "nb_f", "nb_d", "--build", str(build), "--ref-root", f"{d}/ref",
+                                          "--scratch", f"{d}/scratch", "--results", f"{d}/results"])
+            self.assertEqual(rc, 1)
+            self.assertTrue(make_reference.is_complete(Path(d) / "ref" / "nb_d" / "run1"))
+            self.assertFalse((Path(d) / "ref" / "nb_f" / "run1").exists())
+            self.assertEqual(list((Path(d) / "ref").rglob("*.partial")), [])
 
 
 if __name__ == "__main__":

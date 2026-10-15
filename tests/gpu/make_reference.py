@@ -6,6 +6,7 @@ one run per truth-only configuration. Runs execute in the scratch directory and 
 ref/<config>/run<k>/ afterwards, so their wall times double as R0's full-matrix timing.
 """
 import argparse
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -42,7 +43,7 @@ def main(argv=None):
         timing = bl.read_json(timing_path)
     else:
         timing = {"rung": "R0", "set": "full", "env": bl.environment_info(), "build": bl.build_meta(a.build), "records": []}
-    done = {(r["config"], r["repeat"]) for r in timing["records"]}
+    done = {(r["config"], r["repeat"]): i for i, r in enumerate(timing["records"])}
     failures = []
     for cfg in cf.ordered(wanted):
         exe = cf.exe_for(a.build, cfg.build)
@@ -53,19 +54,35 @@ def main(argv=None):
                 continue
             scratch = Path(a.scratch) / cfg.name / f"run{k}"
             print(f"run  {cfg.name} run{k}", flush=True)
-            rec = bl.run_ipm(exe, cf.full_args(cfg, a.ref_root), scratch)
-            rec.update({"config": cfg.name, "repeat": k, "rung": "R0"})
+            rec = bl.run_ipm(exe, cf.full_args(cfg, a.ref_root), scratch, timeout=3600)
+            rec.update({"config": cfg.name, "repeat": k, "rung": "R0", "outdir": str(dest)})
             if not rec["ok"]:
                 failures.append(f"{cfg.name} run{k}: {rec['error']}\n{rec['stderr_tail']}")
                 print(failures[-1], flush=True)
                 continue
-            if dest.exists():
-                shutil.rmtree(dest)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(scratch), str(dest))
-            if "full" in cfg.sets and (cfg.name, k) not in done:
-                timing["records"].append(rec)
+            if "full" in cfg.sets:
+                key = (cfg.name, k)
+                if key in done:
+                    timing["records"][done[key]] = rec
+                else:
+                    done[key] = len(timing["records"])
+                    timing["records"].append(rec)
                 bl.write_json(timing_path, timing)
+            # publish: stage a copy beside the destination, then rename it into place
+            staging = dest.with_name(dest.name + ".partial")
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                if staging.exists():
+                    shutil.rmtree(staging)
+                shutil.move(str(scratch), str(staging))
+                if dest.exists():
+                    shutil.rmtree(dest)
+                os.replace(staging, dest)
+            except OSError as exc:
+                shutil.rmtree(staging, ignore_errors=True)
+                failures.append(f"{cfg.name} run{k}: publish failed: {exc}")
+                print(failures[-1], flush=True)
+                continue
             print(f"     wall {rec['wall_s']:.2f} s, t_shoot_cells {rec['t_shoot_cells']:.3f} s", flush=True)
     if failures:
         print("\nFAILED:\n" + "\n".join(failures))
