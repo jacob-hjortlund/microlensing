@@ -64,7 +64,7 @@ CONFIGS = {c.name: c for c in [
 ]}
 
 LADDER = ["nb_f", "nb_d", "rect_f", "hm100_f"]
-# R2p changes only the double build: its ladder entry is nb_d and its regression covers every double configuration
+# R2p changes only the double build: its ladder entry is nb_d and its regression covers every double configuration of the full matrix
 RUNG_LADDER_SKIP = {"R2p": {"nb_f", "rect_f", "hm100_f"}}
 
 

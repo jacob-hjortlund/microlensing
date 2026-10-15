@@ -297,7 +297,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual([c.name for c in configs.ladder_configs("R2p")], ["nb_d"])
         full = {c.name for c in configs.configs_in("full")}
         self.assertEqual(len(full), 15)
-        self.assertTrue(all(c.build == "double" for c in configs.regression_configs("R2p", "ladder")))
+        self.assertEqual({c.name for c in configs.regression_configs("R2p", "ladder")},
+                         {"nb_d", "rect_d", "rect_a0_d", "hm100_d"})
         self.assertEqual({c.name for c in configs.regression_configs("R3", "full")}, full)
         self.assertEqual({c.name for c in configs.configs_in("memory")}, {"big_f", "hm1000_f", "stars1e6_f"})
 
@@ -312,8 +313,42 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(len(args) % 2, 0)
 
     def test_ordered_puts_starfile_users_last(self):
-        order = [c.name for c in configs.ordered(configs.configs_in("full"))]
+        # reversed declaration order puts every star-file user ahead of its source
+        order = [c.name for c in configs.ordered(list(reversed(list(configs.CONFIGS.values()))))]
+        self.assertEqual(sorted(order), sorted(configs.CONFIGS))
+        users = [i for i, n in enumerate(order) if configs.CONFIGS[n].starfile_from is not None]
+        others = [i for i, n in enumerate(order) if configs.CONFIGS[n].starfile_from is None]
+        self.assertGreater(min(users), max(others))
         self.assertGreater(order.index("sf_f"), order.index("nb_f"))
+        self.assertGreater(order.index("sf_d"), order.index("nb_f"))
+
+    def test_exact_membership_of_each_set(self):
+        self.assertEqual({c.name for c in configs.configs_in("full")}, {
+            "nb_f", "nb_d", "rect_f", "hm100_f", "circ_a0_f", "rect_a0_f", "rect_d", "rect_a0_d",
+            "par_f", "nry10_f", "big_f", "hm1000_f", "hm100_d", "sf_f", "stars1e6_f"})
+        self.assertEqual({c.name for c in configs.configs_in("truth")}, {
+            "circ_a0_d", "par_d", "nry10_d", "big_d", "hm1000_d", "sf_d", "stars1e6_d"})
+        self.assertEqual({c.name for c in configs.configs_in("ladder")}, {"nb_f", "nb_d", "rect_f", "hm100_f"})
+
+    def test_binding_constraints_hold_for_every_configuration(self):
+        for cfg in configs.CONFIGS.values():
+            with self.subTest(config=cfg.name):
+                self.assertIn(cfg.build, ("float", "double"))
+                self.assertEqual(cfg.parities, "-wp" in cfg.args)
+                args = configs.full_args(cfg, "/ref")
+                self.assertEqual(args[:len(configs.COMMON)], list(configs.COMMON))
+                self.assertNotIn("-v", args)
+                self.assertNotIn("-o", args)
+                self.assertEqual(len(args) % 2, 0)
+
+    def test_hm1000_differs_from_hm100_only_in_y(self):
+        hm100 = list(configs.CONFIGS["hm100_f"].args)
+        hm1000 = list(configs.CONFIGS["hm1000_f"].args)
+        i = hm100.index("0.49")
+        self.assertEqual(hm100[i - 1], "-y")
+        expected = list(hm100)
+        expected[i] = "0.499"
+        self.assertEqual(hm1000, expected)
 
     def test_exe_for(self):
         self.assertEqual(configs.exe_for("/b", "float").name, "ipm_gpu")
