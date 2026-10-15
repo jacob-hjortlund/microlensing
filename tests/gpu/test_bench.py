@@ -1238,11 +1238,13 @@ class TimingTests(unittest.TestCase):
             self.assertEqual(len(out["records"]), 2 * (4 + 1 + 4))
             self.assertEqual(out["summary"]["R2p"]["nb_d"]["n"], 2)
             self.assertNotIn("nb_f", out["summary"]["R2p"])
-            # resume: drop the last record and rerun; only that one is re-measured
+            # resume: drop the last record and rerun; only that record is re-measured (one run_ipm call)
             out["records"].pop()
             bench_lib.write_json(out_path, out)
-            with contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch.object(bench_lib, "run_ipm", wraps=bench_lib.run_ipm) as spy, \
+                    contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(time_ladder.main(argv), 0)
+            self.assertEqual(spy.call_count, 1)
             self.assertEqual(len(bench_lib.read_json(out_path)["records"]), 18)
 
     def test_time_ladder_replaces_a_failed_record(self):
@@ -1279,7 +1281,7 @@ class TimingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             build = fake_build_dir(Path(d) / "build")
             out_path = Path(d) / "results" / "timing_ladder.json"
-            for only in (["nb_ff"], ["sf_f"], []):   # a misspelt name, a configuration outside the ladder, no name
+            for only in (["nb_ff"], ["sf_f"], [], ["nb_f", "nb_ff"]):   # misspelt, outside the ladder, none, one bad of two
                 with self.subTest(only=only):
                     err = io.StringIO()
                     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
@@ -1297,6 +1299,35 @@ class TimingTests(unittest.TestCase):
                                      "--scratch", f"{d}/scratch", "--no-warmup"])
             self.assertEqual(rc, 2)
             self.assertEqual(bench_lib.read_json(out_path), {"sentinel": True})
+
+    def test_time_rung_main_bounds_every_run_and_cleans_scratch(self):
+        with tempfile.TemporaryDirectory() as d:
+            build = fake_build_dir(Path(d) / "build")
+            with mock.patch.object(bench_lib, "run_ipm", wraps=bench_lib.run_ipm) as spy, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                rc = time_rung.main(["--build", str(build), "--rung", "R1a", "--repeats", "1", "--ref-root", f"{d}/ref",
+                                     "--results", f"{d}/results", "--scratch", f"{d}/scratch"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(spy.call_count, 5)   # warm-up and the four ladder configurations
+            self.assertEqual({c.kwargs.get("timeout") for c in spy.call_args_list}, {3600})
+            self.assertEqual(list((Path(d) / "scratch").glob("*")), [])
+
+    def test_time_ladder_bounds_every_run_and_cleans_scratch(self):
+        with tempfile.TemporaryDirectory() as d:
+            builds = Path(d) / "builds"
+            for rung in ("R0", "R2p"):
+                fake_build_dir(builds / rung)
+            out_path = Path(d) / "ladder.json"
+            argv = ["--rungs", "R0", "R2p", "--builds-root", str(builds), "--repeats", "1",
+                    "--ref-root", f"{d}/ref", "--out", str(out_path), "--scratch", f"{d}/scratch"]
+            with mock.patch.object(bench_lib, "run_ipm", wraps=bench_lib.run_ipm) as spy, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(time_ladder.main(argv), 0)
+            self.assertEqual(spy.call_count, 6)   # warm-up and the five ladder records
+            self.assertEqual({c.kwargs.get("timeout") for c in spy.call_args_list}, {3600})
+            scratch = Path(d) / "scratch"
+            self.assertEqual([p for p in scratch.rglob("*") if p.is_file()], [])
+            self.assertEqual([p for p in scratch.rglob("*") if p.is_dir() and p.parent != scratch], [])
 
 
 if __name__ == "__main__":
