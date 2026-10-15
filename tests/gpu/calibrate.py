@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Noise floors and float truth errors from the R0 references; writes tolerances.json (spec section 8)."""
+"""Noise floors and float truth errors from the R0 references; writes tolerances.json (spec section 8).
+
+An existing tolerances.json keeps its thresholds (double, float, floor_frac, parity_consistency), so hand edits survive
+a re-run; floors, float_truth_error, parity_floor and warnings are always measured afresh.
+"""
 import argparse
 import sys
 from pathlib import Path
@@ -12,7 +16,7 @@ from regress import reference_map  # noqa: E402
 
 
 def sanity_warnings(tol):
-    """Double thresholds must be at least 10x the measured double noise floor."""
+    """Double thresholds and the parity threshold must be at least 10x the measured noise floor."""
     warnings = []
     for name, per_map in tol["floors"].items():
         if cf.CONFIGS[name].build != "double":
@@ -22,12 +26,24 @@ def sanity_warnings(tol):
                 worst = max(f[key] for f in floors)
                 if worst * 10 > tol["double"][key]:
                     warnings.append(f"{name} {which}: double floor {key}={worst:.2e} is within 10x of the threshold {tol['double'][key]:.1e}")
+    for name, values in tol.get("parity_floor", {}).items():
+        worst = max(values)
+        if worst * 10 > tol["parity_consistency"]:
+            warnings.append(f"{name} parity: consistency floor {worst:.2e} is within 10x of the threshold {tol['parity_consistency']:.1e}")
     return warnings
+
+
+def parity_floors(ref_root, cfg):
+    """pixels vs minima + saddles for run1, run2 and run3 of a parity configuration, then for run1 of its double twin."""
+    runs = [(cfg.name, k) for k in (1, 2, 3)] + ([(cfg.truth, 1)] if cfg.truth else [])
+    return [cm.parity_consistency(*(reference_map(ref_root, name, k, which) for which in ("pixels", "minima", "saddles")))
+            for name, k in runs]
 
 
 def calibrate(ref_root, tol):
     tol["floors"] = {}
     tol["float_truth_error"] = {}
+    tol["parity_floor"] = {}
     lines = []
     for cfg in cf.configs_in("full"):
         which_list = ["pixels", "minima", "saddles"] if cfg.parities else ["pixels"]
@@ -44,6 +60,14 @@ def calibrate(ref_root, tol):
                          f"p99.99 {err['p9999']:.2e} max {err['max']:.2e}")
             lines.append(line)
             print(line, flush=True)
+        if cfg.parities:
+            values = parity_floors(ref_root, cfg)
+            tol["parity_floor"][cfg.name] = values
+            line = f"{cfg.name:12s} {'parity':7s} consistency " + " ".join(f"run{k} {v:.2e}" for k, v in enumerate(values[:3], start=1))
+            if cfg.truth:
+                line += f" | {cfg.truth} run1 {values[3]:.2e}"
+            lines.append(line)
+            print(line, flush=True)
     warnings = sanity_warnings(tol)
     tol["warnings"] = warnings
     for w in warnings:
@@ -56,7 +80,7 @@ def main(argv=None):
     ap.add_argument("--ref-root", default=str(bl.BENCH_ROOT / "ref"))
     ap.add_argument("--out", default=str(bl.BENCH_ROOT / "results" / "tolerances.json"))
     a = ap.parse_args(argv)
-    tol, lines, warnings = calibrate(a.ref_root, cm.default_tolerances())
+    tol, lines, warnings = calibrate(a.ref_root, cm.load_tolerances(a.out))
     bl.write_json(a.out, tol)
     summary = Path(a.out).with_name("tolerances_summary.md")
     summary.write_text("```\n" + "\n".join(lines + warnings) + "\n```\n")

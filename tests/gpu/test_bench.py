@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import struct
 import sys
 import tempfile
@@ -876,6 +877,79 @@ class RegressTests(unittest.TestCase):
 
 import calibrate  # noqa: E402
 
+# Synthetic references for calibrate.py. Every relative difference is amplitude * SPREAD. The outlier gives the spread a
+# heavy tail, so the mean, p99.9, p99.99 and max of a comparison differ in their first three digits (what the summary
+# lines print) and are known in closed form.
+SPREAD = np.append(np.linspace(0.5, 1.5, 599), 20.0).reshape(30, 20)
+FLOAT_AMPLITUDE = {"nb_f": 4e-6, "rect_f": 5e-6, "hm100_f": 6e-6, "circ_a0_f": 7e-6, "rect_a0_f": 8e-6,
+                   "nry10_f": 9e-6, "big_f": 1.0e-5, "hm1000_f": 1.1e-5, "sf_f": 1.2e-5, "stars1e6_f": 1.3e-5}
+PARITY_AMPLITUDE = {"minima": 2e-6, "saddles": 3e-6}   # par_f; its pixels are minima + saddles
+
+
+def spread_stats(amplitude):
+    return {"mean": amplitude * SPREAD.mean(), "p999": amplitude * np.percentile(SPREAD, 99.9),
+            "p9999": amplitude * np.percentile(SPREAD, 99.99), "max": amplitude * SPREAD.max()}
+
+
+def map_path(ref, name, k, which):
+    return Path(ref) / name / f"run{k}" / regress.MAP_FILES[which]
+
+
+def calibration_tree(ref):
+    """Write synthetic references for all 22 configurations; returns {(float configuration, map): amplitude}.
+
+    A double configuration has a map level of its own. A float configuration is its double twin times
+    (1 + amplitude * SPREAD), with a different amplitude for every configuration and map, and the pixels of a parity
+    configuration are minima + saddles. The configurations with three runs get run2 and run3 as run1 times
+    (1 + 2e-9 * SPREAD) and (1 + 3e-9 * SPREAD).
+    """
+    texture = np.random.default_rng(7).random(SPREAD.shape)
+    maps = {}
+    for i, cfg in enumerate(c for c in configs.CONFIGS.values() if c.build == "double"):
+        pixels = 5.0 + 0.5 * i + texture
+        maps[cfg.name] = {"pixels": pixels}
+        if cfg.parities:
+            maps[cfg.name].update(minima=0.4 * pixels, saddles=0.6 * pixels)
+    amplitude = {}
+    for cfg in configs.CONFIGS.values():
+        if cfg.build == "float":
+            twin = maps[cfg.truth]
+            if cfg.parities:
+                run = {which: twin[which] * (1 + a * SPREAD) for which, a in PARITY_AMPLITUDE.items()}
+                run["pixels"] = run["minima"] + run["saddles"]
+                amplitude.update({(cfg.name, which): a for which, a in PARITY_AMPLITUDE.items()})
+                amplitude[(cfg.name, "pixels")] = 0.4 * PARITY_AMPLITUDE["minima"] + 0.6 * PARITY_AMPLITUDE["saddles"]
+            else:
+                run = {"pixels": twin["pixels"] * (1 + FLOAT_AMPLITUDE[cfg.name] * SPREAD)}
+                amplitude[(cfg.name, "pixels")] = FLOAT_AMPLITUDE[cfg.name]
+            maps[cfg.name] = run
+    for name, run1 in maps.items():
+        runs = [run1]
+        if "full" in configs.CONFIGS[name].sets:
+            runs += [{which: m * (1 + eps * SPREAD) for which, m in run1.items()} for eps in (2e-9, 3e-9)]
+        for k, run in enumerate(runs, start=1):
+            for which, arr in run.items():
+                map_path(ref, name, k, which).parent.mkdir(parents=True, exist_ok=True)
+                write_map(map_path(ref, name, k, which), arr)
+    return amplitude
+
+
+def perturb(ref, name, k, which, factor):
+    path = map_path(ref, name, k, which)
+    write_map(path, bench_lib.read_map(path) * factor)
+
+
+def run_quietly(func, *args):
+    """Call func with its printed output captured; returns (result, printed text)."""
+    printed = io.StringIO()
+    with contextlib.redirect_stdout(printed):
+        result = func(*args)
+    return result, printed.getvalue()
+
+
+def numbers_in(line):
+    return [float(x) for x in re.findall(r"\d\.\d\de[+-]\d\d", line)]
+
 
 class CalibrateTests(unittest.TestCase):
     def test_floors_and_truth_errors(self):
@@ -908,6 +982,210 @@ class CalibrateTests(unittest.TestCase):
         tol["floors"] = {"nb_d": {"pixels": [{"mean": 0, "p999": 2e-6, "p9999": 0, "offmask_max": 0}]}}
         self.assertEqual(len(calibrate.sanity_warnings(tol)), 1)
         self.assertIn("nb_d", calibrate.sanity_warnings(tol)[0])
+
+    def test_stored_floors_and_truth_errors_follow_the_references(self):
+        with tempfile.TemporaryDirectory() as d:
+            amplitude = calibration_tree(f"{d}/ref")
+            (tol, _, warnings), _ = run_quietly(calibrate.calibrate, f"{d}/ref", compare_maps.default_tolerances())
+        full = {cfg.name: cfg for cfg in configs.configs_in("full")}
+        self.assertEqual(set(tol["floors"]), set(full))
+        for name, cfg in full.items():
+            maps = ["pixels", "minima", "saddles"] if cfg.parities else ["pixels"]
+            self.assertEqual(set(tol["floors"][name]), set(maps))
+            for which in maps:
+                run2, run3 = tol["floors"][name][which]   # exactly two entries: run2 vs run1, then run3 vs run1
+                for stored, eps in ((run2, 2e-9), (run3, 3e-9)):
+                    for key, want in spread_stats(eps).items():
+                        self.assertAlmostEqual(stored[key], want, places=12, msg=f"{name} {which} {key}")
+        floats = {name for name, cfg in full.items() if cfg.build == "float"}
+        self.assertEqual(set(tol["float_truth_error"]), floats)   # every float configuration and no double one
+        self.assertEqual({name for name, _ in amplitude}, floats)
+        for (name, which), amp in amplitude.items():
+            self.assertEqual(set(tol["float_truth_error"][name]), {"pixels", "minima", "saddles"} if name == "par_f" else {"pixels"})
+            for key, want in spread_stats(amp).items():   # against its own double twin, in this order of arguments
+                self.assertAlmostEqual(tol["float_truth_error"][name][which][key], want, places=12, msg=f"{name} {which} {key}")
+        self.assertEqual(warnings, [])
+
+    def test_summary_lines_show_the_stored_numbers(self):
+        with tempfile.TemporaryDirectory() as d:
+            calibration_tree(f"{d}/ref")
+            (tol, lines, _), printed = run_quietly(calibrate.calibrate, f"{d}/ref", compare_maps.default_tolerances())
+        self.assertEqual(printed.splitlines(), lines)
+        shown = [tuple(line.split()[:2]) for line in lines]
+        stored = [(name, which) for name, per_map in tol["floors"].items() for which in per_map] + [("par_f", "parity")]
+        self.assertEqual(sorted(shown), sorted(stored))   # every map once, plus one parity line
+        for line in lines:
+            name, which = line.split()[:2]
+            if which == "parity":
+                want = tol["parity_floor"][name]
+            else:
+                floors = tol["floors"][name][which]
+                want = [max(f[key] for f in floors) for key in ("mean", "p999", "max")]
+                if name in tol["float_truth_error"]:
+                    want += [tol["float_truth_error"][name][which][key] for key in ("mean", "p999", "p9999", "max")]
+            self.assertEqual(numbers_in(line), [float(f"{v:.2e}") for v in want], line)
+
+    def test_floor_fraction_comes_from_the_tolerances(self):
+        with tempfile.TemporaryDirectory() as d:
+            calibration_tree(f"{d}/ref")
+            tol = compare_maps.default_tolerances()
+            tol["floor_frac"] = 1.0   # only the pixels at or above the mean are compared
+            (tol, _, _), _ = run_quietly(calibrate.calibrate, f"{d}/ref", tol)
+        stored = [m for per_map in tol["floors"].values() for floors in per_map.values() for m in floors]
+        stored += [m for per_map in tol["float_truth_error"].values() for m in per_map.values()]
+        self.assertEqual(len(stored), 2 * 17 + 13)   # two floors for each of 17 maps, a truth error for each of 13 float maps
+        for m in stored:
+            self.assertTrue(0 < m["n_mask"] < m["n_total"], m)
+
+    def test_double_floor_rule_per_key(self):
+        def floor(key=None, value=0.0):
+            return {"mean": 0.0, "p999": 0.0, "p9999": 0.0, "offmask_max": 0.0, **({key: value} if key else {})}
+
+        for key in ("mean", "p999", "p9999", "offmask_max"):
+            with self.subTest(key=key):
+                tol = compare_maps.default_tolerances()
+                tenth = tol["double"][key] / 10
+                for floors in ([floor(), floor(key, 2 * tenth)], [floor(key, 2 * tenth), floor()]):   # the worse run decides
+                    tol["floors"] = {"nb_d": {"pixels": floors}}
+                    found = calibrate.sanity_warnings(tol)
+                    self.assertEqual(len(found), 1, found)
+                    self.assertIn("nb_d pixels", found[0])
+                    self.assertIn(f" {key}={2 * tenth:.2e} ", found[0])   # the floor ...
+                    self.assertIn(f"threshold {tol['double'][key]:.1e}", found[0])   # ... and the threshold it is compared with
+                for value, count in ((0.99 * tenth, 0), (1.01 * tenth, 1)):   # just below and above threshold / 10
+                    tol["floors"] = {"nb_d": {"pixels": [floor(key, value), floor()]}}
+                    self.assertEqual(len(calibrate.sanity_warnings(tol)), count, value)
+                tol["double"][key] = 1.0
+                tol["floors"] = {"nb_d": {"pixels": [floor(key, 0.1), floor()]}}   # exactly 10x is still allowed
+                self.assertEqual(calibrate.sanity_warnings(tol), [])
+
+    def test_float_floors_are_not_checked_and_every_double_map_is(self):
+        big = {"mean": 1.0, "p999": 1.0, "p9999": 1.0, "offmask_max": 1.0}
+        tol = compare_maps.default_tolerances()
+        tol["floors"] = {"nb_f": {"pixels": [big, big]}}
+        self.assertEqual(calibrate.sanity_warnings(tol), [])   # float noise is far above the double thresholds
+        for order in (("nb_f", "nb_d"), ("nb_d", "nb_f")):   # a float configuration does not hide a double one
+            tol["floors"] = {name: {"pixels": [big, big]} for name in order}
+            found = calibrate.sanity_warnings(tol)
+            self.assertEqual(len(found), 4, found)   # one per key
+            self.assertTrue(all(w.startswith("nb_d pixels") for w in found), found)
+        ok = {"mean": 0.0, "p999": 0.0, "p9999": 0.0, "offmask_max": 0.0}
+        tol["floors"] = {"par_d": {"pixels": [ok, ok], "minima": [{**ok, "mean": 1.0}, ok], "saddles": [ok, {**ok, "mean": 1.0}]}}
+        found = calibrate.sanity_warnings(tol)
+        self.assertEqual(sorted(w.split(":")[0] for w in found), ["par_d minima", "par_d saddles"])
+
+    def test_main_round_trip_with_a_regress_check(self):
+        with tempfile.TemporaryDirectory() as d:
+            ref, out = f"{d}/ref", f"{d}/results/tolerances.json"
+            calibration_tree(ref)
+            rc, printed = run_quietly(calibrate.main, ["--ref-root", ref, "--out", out])
+            self.assertEqual(rc, 0)
+            (measured, lines, _), _ = run_quietly(calibrate.calibrate, ref, compare_maps.default_tolerances())
+            tol = compare_maps.load_tolerances(out)
+            self.assertEqual(tol, json.loads(json.dumps(measured)))   # the file holds what calibrate() measures
+            self.assertEqual(tol["double"], compare_maps.default_tolerances()["double"])   # no earlier file: the defaults
+            self.assertEqual(tol["warnings"], [])
+            self.assertEqual(set(tol["parity_floor"]), {"par_f"})
+            summary = Path(out).with_name("tolerances_summary.md")
+            self.assertEqual(summary.read_text(), "```\n" + "\n".join(lines) + "\n```\n")
+            self.assertEqual(printed.splitlines(), lines + [f"wrote {out} and {summary}"])
+            cand = Path(d) / "cand"   # a candidate equal to the references passes with that file, one that is off does not
+            cand.mkdir()
+            for fname in regress.MAP_FILES.values():
+                shutil.copy(Path(ref) / "par_f" / "run1" / fname, cand / fname)
+            res = regress.check_config(configs.CONFIGS["par_f"], cand, ref, tol, "R3")
+            self.assertTrue(res["pass"], res["failures"])
+            saddles = cand / regress.MAP_FILES["saddles"]
+            write_map(saddles, bench_lib.read_map(saddles) * 1.001)
+            self.assertFalse(regress.check_config(configs.CONFIGS["par_f"], cand, ref, tol, "R3")["pass"])
+
+    def test_main_defaults_to_the_bench_root(self):
+        with tempfile.TemporaryDirectory() as d:
+            calibration_tree(f"{d}/ref")
+            with mock.patch.object(bench_lib, "BENCH_ROOT", Path(d)):
+                rc, _ = run_quietly(calibrate.main, [])
+            self.assertEqual(rc, 0)
+            self.assertEqual(sorted(p.name for p in (Path(d) / "results").iterdir()), ["tolerances.json", "tolerances_summary.md"])
+
+    def test_parity_floor_has_a_slot_for_each_run_and_the_double_twin(self):
+        with tempfile.TemporaryDirectory() as d:
+            ref = f"{d}/ref"
+            calibration_tree(ref)
+            (tol, _, warnings), _ = run_quietly(calibrate.calibrate, ref, compare_maps.default_tolerances())
+            self.assertEqual(set(tol["parity_floor"]), {"par_f"})
+            self.assertEqual(len(tol["parity_floor"]["par_f"]), 4)
+            self.assertLess(max(tol["parity_floor"]["par_f"]), 1e-12)   # consistent references
+            self.assertEqual(warnings, [])
+            # a different inconsistency in run1, run2 and run3 of par_f and in run1 of par_d lands in its own slot
+            want = []
+            for i, (name, k) in enumerate([("par_f", 1), ("par_f", 2), ("par_f", 3), ("par_d", 1)], start=1):
+                eps = i * 1e-4
+                pixels, saddles = (bench_lib.read_map(map_path(ref, name, k, which)) for which in ("pixels", "saddles"))
+                want.append(float((saddles * eps).max() / pixels.mean()))
+                perturb(ref, name, k, "saddles", 1 + eps)
+            (tol, lines, warnings), _ = run_quietly(calibrate.calibrate, ref, compare_maps.default_tolerances())
+            got = tol["parity_floor"]["par_f"]
+            for g, w in zip(got, want):
+                self.assertAlmostEqual(g, w, delta=1e-9)
+            (line,) = [line for line in lines if line.startswith("par_f") and "parity" in line]
+            self.assertEqual(numbers_in(line), [float(f"{v:.2e}") for v in got])
+            self.assertIn("par_d", line)
+            self.assertEqual(len(warnings), 1, warnings)
+
+    def test_one_inconsistent_run_is_enough_for_a_parity_warning(self):
+        for name, k in (("par_f", 1), ("par_f", 2), ("par_f", 3), ("par_d", 1)):
+            with self.subTest(run=f"{name} run{k}"), tempfile.TemporaryDirectory() as d:
+                calibration_tree(f"{d}/ref")
+                perturb(f"{d}/ref", name, k, "saddles", 1 + 1e-3)
+                (tol, _, warnings), printed = run_quietly(calibrate.calibrate, f"{d}/ref", compare_maps.default_tolerances())
+                self.assertEqual(len(warnings), 1, warnings)
+                self.assertTrue(warnings[0].startswith("par_f parity"), warnings)
+                self.assertEqual(tol["warnings"], warnings)
+                self.assertIn("WARNING " + warnings[0], printed.splitlines())
+
+    def test_parity_floor_warning_rule(self):
+        for limit in (1e-5, 1e-3):   # the default threshold and an edited one
+            tol = compare_maps.default_tolerances()
+            tol["parity_consistency"] = limit
+            below, above = 0.99 * limit / 10, 1.01 * limit / 10
+            for values, count in (([below] * 4, 0), ([above, 0, 0, 0], 1), ([0, above, 0, 0], 1),
+                                  ([0, 0, above, 0], 1), ([0, 0, 0, above], 1)):
+                tol["parity_floor"] = {"par_f": values}
+                found = calibrate.sanity_warnings(tol)
+                self.assertEqual(len(found), count, (limit, values))
+                if count:
+                    self.assertTrue(found[0].startswith("par_f parity"), found)
+                    self.assertIn(f"floor {above:.2e} ", found[0])   # the worst value ...
+                    self.assertIn(f"threshold {limit:.1e}", found[0])   # ... against the threshold
+        tol["parity_consistency"] = 1.0
+        tol["parity_floor"] = {"par_f": [0.1]}   # exactly 10x is still allowed
+        self.assertEqual(calibrate.sanity_warnings(tol), [])
+
+    def test_rerun_keeps_edited_thresholds_and_replaces_the_measurements(self):
+        with tempfile.TemporaryDirectory() as d:
+            ref, out = f"{d}/ref", Path(d) / "results" / "tolerances.json"
+            calibration_tree(ref)
+            bench_lib.write_json(out, {"double": {"p999": 2e-5, "mean": 1e-9}, "float": {"ratio": 1.2},
+                                       "floors": {"stale": {}}, "float_truth_error": {"stale": {}},
+                                       "parity_floor": {"stale": [1.0]}, "warnings": ["stale"]})
+            rc, printed = run_quietly(calibrate.main, ["--ref-root", ref, "--out", str(out)])
+            self.assertEqual(rc, 0)
+            tol = json.loads(out.read_text())
+            default = compare_maps.default_tolerances()
+            self.assertEqual(tol["double"], {**default["double"], "p999": 2e-5, "mean": 1e-9})
+            self.assertEqual(tol["float"], {**default["float"], "ratio": 1.2})
+            for key in ("floors", "float_truth_error", "parity_floor"):
+                self.assertNotIn("stale", tol[key])
+            self.assertEqual(len(tol["floors"]), 15)
+            # the edited threshold is the one the sanity check uses: the four double configurations are now too close
+            self.assertEqual(sorted(w.split(" pixels")[0] for w in tol["warnings"]), ["hm100_d", "nb_d", "rect_a0_d", "rect_d"])
+            self.assertTrue(all(" mean=" in w for w in tol["warnings"]), tol["warnings"])
+            body = out.with_name("tolerances_summary.md").read_text().splitlines()[1:-1]   # inside the fences
+            n = len(tol["warnings"])
+            self.assertEqual(body[-n:], tol["warnings"])   # the warnings follow the measurements
+            self.assertFalse(set(body[:-n]) & set(tol["warnings"]))
+            for w in tol["warnings"]:
+                self.assertIn("WARNING " + w, printed.splitlines())
 
 
 if __name__ == "__main__":
