@@ -188,5 +188,94 @@ class ToleranceTests(unittest.TestCase):
         self.assertEqual(compare_maps.load_tolerances("/nonexistent/t.json"), compare_maps.default_tolerances())
 
 
+class EvaluateRuleTests(unittest.TestCase):
+    def metrics(self, **over):
+        m = {"mean": 1e-9, "p999": 1e-7, "p9999": 1e-7, "max": 1e-6, "offmask_max": 1e-8,
+             "sum_ratio": 1e-8, "n_mask": 10, "n_total": 10, "finite": True, "nonneg": True}
+        m.update(over)
+        return m
+
+    def test_double_threshold_for_each_key(self):
+        tol = compare_maps.default_tolerances()
+        for key in ("mean", "p999", "p9999", "offmask_max"):
+            thr = tol["double"][key]
+            with self.subTest(key=key):
+                above = compare_maps.evaluate_double(self.metrics(**{key: 1.01 * thr}), tol)
+                self.assertFalse(above["pass"])
+                self.assertTrue(any(f.startswith(key + "=") for f in above["failures"]), above["failures"])
+                below = compare_maps.evaluate_double(self.metrics(**{key: 0.99 * thr}), tol)
+                self.assertTrue(below["pass"], below["failures"])
+
+    def test_float_common_failures_gate_the_rule(self):
+        tol = compare_maps.default_tolerances()
+        ref = {"mean": 1e-5, "p999": 1e-3, "p9999": 3e-3, "max": 1e-2}
+        v = compare_maps.evaluate_float(ref, ref, self.metrics(finite=False), tol)
+        self.assertFalse(v["pass"])
+        self.assertIn("non-finite pixels", v["failures"])
+        v = compare_maps.evaluate_float(ref, ref, self.metrics(nonneg=False), tol)
+        self.assertFalse(v["pass"])
+        self.assertIn("negative pixels", v["failures"])
+
+    def test_float_max_excess_is_a_flag_not_a_failure(self):
+        tol = compare_maps.default_tolerances()
+        ref = {"mean": 1e-5, "p999": 1e-3, "p9999": 3e-3, "max": 1e-2}
+        m_truth = {"mean": 1e-5, "p999": 1e-3, "p9999": 3e-3, "max": 4e-2}  # max above 3.0x R0's, rest within 1.5x
+        v = compare_maps.evaluate_float(m_truth, ref, self.metrics(), tol)
+        self.assertIs(v["pass"], True)
+        self.assertEqual(v["failures"], [])
+        self.assertTrue(v["flags"])
+        self.assertTrue(any(f.startswith("max ") for f in v["flags"]), v["flags"])
+
+    def test_float_mean_limit_alone_fails(self):
+        tol = compare_maps.default_tolerances()
+        ref = {"mean": 1e-5, "p999": 1e-3, "p9999": 3e-3, "max": 1e-2}
+        m_truth = {"mean": 1.6e-5, "p999": 1e-3, "p9999": 3e-3, "max": 1e-2}  # mean above 1.5x, rest within
+        v = compare_maps.evaluate_float(m_truth, ref, self.metrics(), tol)
+        self.assertFalse(v["pass"])
+        self.assertEqual(len(v["failures"]), 1)
+        self.assertTrue(v["failures"][0].startswith("mean "), v["failures"])
+
+    def test_float_p9999_limit_alone_fails(self):
+        tol = compare_maps.default_tolerances()
+        ref = {"mean": 1e-5, "p999": 1e-3, "p9999": 3e-3, "max": 1e-2}
+        m_truth = {"mean": 1e-5, "p999": 1e-3, "p9999": 5e-3, "max": 1e-2}  # p9999 above 1.5x, rest within
+        v = compare_maps.evaluate_float(m_truth, ref, self.metrics(), tol)
+        self.assertFalse(v["pass"])
+        self.assertEqual(len(v["failures"]), 1)
+        self.assertTrue(v["failures"][0].startswith("p9999 "), v["failures"])
+
+    def test_float_sum_ratio_uses_absolute_value(self):
+        tol = compare_maps.default_tolerances()
+        ref = {"mean": 1e-5, "p999": 1e-3, "p9999": 3e-3, "max": 1e-2}
+        v = compare_maps.evaluate_float(ref, ref, self.metrics(sum_ratio=-2e-5), tol)
+        self.assertFalse(v["pass"])
+        self.assertTrue(any("sum_ratio" in f for f in v["failures"]), v["failures"])
+
+    def test_double_negative_off_mask_pixel_fails(self):
+        rng = np.random.default_rng(1)
+        b = 5.0 + rng.random((50, 40))
+        b[0, 0] = 1e-9                  # far below 1e-3 x mean, so off the mask
+        a = b.copy()
+        a[0, 0] = -1e-9
+        m = compare_maps.map_metrics(a, b)
+        self.assertTrue(m["finite"])
+        self.assertFalse(m["nonneg"])
+        self.assertEqual(m["mean"], 0.0)
+        self.assertEqual(m["p999"], 0.0)
+        v = compare_maps.evaluate_double(m, compare_maps.default_tolerances())
+        self.assertFalse(v["pass"])
+        self.assertIn("negative pixels", v["failures"])
+
+    def test_parity_consistency_hand_value_and_scale(self):
+        total = np.array([[2.0, 4.0], [6.0, 8.0]])          # mean(total) = 5
+        minima = np.array([[1.0, 2.0], [3.0, 4.0]])
+        saddles = np.array([[1.0, 2.8], [3.0, 3.5]])
+        # total - (minima + saddles) = [[0, -0.8], [0, 0.5]], so max |.| / mean(total) = 0.8 / 5
+        value = compare_maps.parity_consistency(total, minima, saddles)
+        self.assertAlmostEqual(value, 0.8 / 5.0, places=12)
+        scaled = compare_maps.parity_consistency(10 * total, 10 * minima, 10 * saddles)
+        self.assertAlmostEqual(scaled, value, places=12)
+
+
 if __name__ == "__main__":
     unittest.main()
