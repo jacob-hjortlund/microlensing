@@ -2,7 +2,6 @@
 
 #include "array_functions.cuh"
 #include "complex.cuh"
-#include "ipm_functions.cuh"
 #include "ipm_functions_fast.cuh"
 #include "ipm_leaf.cuh"
 #include "microlensing.cuh"
