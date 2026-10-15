@@ -345,17 +345,20 @@ class ConfigTests(unittest.TestCase):
                 self.assertNotIn("-o", args)
                 self.assertEqual(len(args) % 2, 0)
 
-    def test_hm1000_differs_from_hm100_only_in_y_and_a(self):
+    def test_hm1000_differs_from_hm100_only_in_kappa_and_shear(self):
         hm100 = list(configs.CONFIGS["hm100_f"].args)
         hm1000 = list(configs.CONFIGS["hm1000_f"].args)
-        i = hm100.index("0.49")
-        self.assertEqual(hm100[i - 1], "-y")
-        j = hm100.index("-a") + 1
-        self.assertEqual(hm100[j], "1")
+        k = hm100.index("-k") + 1
+        self.assertEqual(hm100[k], "0.5")
+        y = hm100.index("-y") + 1
+        self.assertEqual(hm100[y], "0.49")
+        a = hm100.index("-a") + 1
+        self.assertEqual(hm100[a], "1")
         expected = list(hm100)
-        expected[i] = "0.499"
-        expected[j] = "0"
+        expected[k] = "0.7252"
+        expected[y] = "0.2729"
         self.assertEqual(hm1000, expected)
+        self.assertEqual(hm1000[a], "1")
 
     def test_exe_for(self):
         self.assertEqual(configs.exe_for("/b", "float").name, "ipm_gpu")
