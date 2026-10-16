@@ -123,7 +123,7 @@ class GpuMemorySampler:
 
 class HostMemorySampler:
     """Polls VmHWM (MiB) of a process from /proc/<pid>/status in a thread; stop() returns the last peak seen,
-    or None if it was never readable. A vanished process ends the loop."""
+    or None if it was never readable (a child that exits before the first poll gives None). A vanished process ends the loop."""
 
     def __init__(self, pid, interval=0.05):
         self.pid = pid
@@ -207,6 +207,10 @@ def run_ipm(exe, args, outdir, verbose=1, sample_gpu=False, expect_map=True, tim
             stdout, stderr = proc.communicate()
             timed_out = True
             returncode, stdout, stderr = -1, _as_text(stdout), _as_text(stderr)
+        except BaseException:
+            proc.kill()
+            proc.wait()
+            raise
     except OSError as exc:
         start_error = f"cannot start {exe}: {exc}"
         returncode, stdout, stderr = None, "", ""
