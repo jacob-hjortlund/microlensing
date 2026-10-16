@@ -117,7 +117,10 @@ namespace tri_cov
 	                  the whole triangle lies inside one pixel (the hot path in
 	                  magnified regions; the caller may aggregate these)
 	\param add_many -- callable add_many(long long pixel_index, P value), used for
-	                   the general multi-pixel case
+	                   the general multi-pixel case. on the direct path the
+	                   values are clamped to [0, factor]; on the perimeter path
+	                   they are partial values, possibly negative and not
+	                   clamped, that are exact only once the steps are summed
 	\param add_step -- callable add_step(long long pixel_index, P value), used only
 	                   by the perimeter path. the values go to a step buffer of
 	                   the map's size whose row-wise inclusive prefix sum the

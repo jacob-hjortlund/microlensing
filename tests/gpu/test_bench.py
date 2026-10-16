@@ -556,6 +556,18 @@ class RunIpmTests(unittest.TestCase):
             self.assertEqual(rec["stdout_tail"], "partial\n")
             bench_lib.write_json(Path(d) / "rec.json", rec)
 
+    def test_keep_stdout_returns_the_whole_output(self):
+        # messages printed early in a run (before the progress output and the file list) fall out of stdout_tail
+        code = "print('early message'); print('x' * 5000)"
+        with tempfile.TemporaryDirectory() as d:
+            rec = bench_lib.run_ipm(sys.executable, ["-c", code], Path(d) / "out", keep_stdout=True)
+            self.assertTrue(rec["stdout"].startswith("early message\n"), rec["stdout"][:40])
+            self.assertNotIn("early message", rec["stdout_tail"])
+            rec = bench_lib.run_ipm(sys.executable, ["-c", code], Path(d) / "out")
+            self.assertNotIn("stdout", rec)
+            rec = bench_lib.run_ipm("/nonexistent/ipm_gpu", [], Path(d) / "out", keep_stdout=True)
+            self.assertEqual(rec["stdout"], "")
+
     def test_missing_executable_gives_failed_record(self):
         with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0"}), tempfile.TemporaryDirectory() as d:
             before = threading.active_count()
@@ -1719,6 +1731,184 @@ class PythonCheckDoubleTests(unittest.TestCase):
             self.assertTrue(any(f.startswith("vs_r0: max=") for f in v["flags"]), v["flags"])
             with self.assertRaises(FileNotFoundError):
                 python_check.judge_double(good, good, f"{d}/ref", "rect_d", tol)
+
+
+import a2_checks  # noqa: E402
+
+PERIMETER_LINE = "Perimeter deposit for bounding boxes above 64 pixels.\n"
+FORCED_LINE = "Perimeter deposit disabled for testing.\n"
+FALLBACK_LINE = "Perimeter deposit disabled: step buffers need 11188 MiB, 5871 MiB free.\n"
+CLAMP_LINE = "Row sums clamped 12 pixels, total -3.5e-08.\n"
+
+
+def fake_a2_build(build_dir):
+    """A fake build directory with the four executables a2_checks needs."""
+    build = fake_build_dir(build_dir)
+    for name in ("ipm_gpu_direct", "ipm_gpu_double_direct"):
+        shutil.copy(FAKE, build / name)
+        os.chmod(build / name, 0o755)
+    return build
+
+
+class A2ChecksTests(unittest.TestCase):
+    def test_arguments_and_limits_are_the_planned_ones(self):
+        self.assertEqual(a2_checks.NONSQUARE, ("-k", "0.4", "-y", "0.4", "-ks", "0.2", "-hly1", "15", "-hly2", "10",
+                                               "-npy1", "3000", "-npy2", "2000", "-rs", "20261015", "-ws", "0", "-wm", "1",
+                                               "-wh", "0"))
+        for label, sizes in (("1x1", ("1", "1", "0.5", "0.5")), ("7x3", ("7", "3", "3.5", "1.5"))):
+            args = dict(zip(a2_checks.TINY[label][::2], a2_checks.TINY[label][1::2]))
+            self.assertEqual((args["-npy1"], args["-npy2"], args["-hly1"], args["-hly2"]), sizes)
+            rest = {k: v for k, v in args.items() if k not in ("-npy1", "-npy2", "-hly1", "-hly2")}
+            nonsquare = dict(zip(a2_checks.NONSQUARE[::2], a2_checks.NONSQUARE[1::2]))
+            self.assertEqual(rest, {k: v for k, v in nonsquare.items() if k not in ("-npy1", "-npy2", "-hly1", "-hly2")})
+        self.assertEqual(a2_checks.NONSQUARE_LIMITS, {"mean": 1e-12, "p999": 1e-9, "sum_ratio": 1e-12})
+        self.assertEqual(a2_checks.TINY_LIMITS, {"sum_ratio": 1e-12, "max": 1e-9})
+        self.assertEqual(set(a2_checks.CHECKS), {"natural_fallback", "nonsquare_double", "tiny_maps_double", "clamp_counts"})
+
+    def test_parse_clamp(self):
+        self.assertEqual(a2_checks.parse_clamp("Shooting cells...\n" + CLAMP_LINE + "Adding arrays...\n"), (12, -3.5e-08))
+        self.assertEqual(a2_checks.parse_clamp("Row sums clamped 0 pixels, total 0.\n"), (0, 0.0))
+        self.assertEqual(a2_checks.parse_clamp("Row sums clamped 3 pixels, total -1.19209e-07.\n"), (3, -1.19209e-07))
+        self.assertEqual(a2_checks.parse_clamp("Row sums clamped 1 pixels, total -1.\nRow sums clamped 2 pixels, total -2.\n"),
+                         (2, -2.0))
+        for text in (PERIMETER_LINE + FORCED_LINE + FALLBACK_LINE, "", None):
+            self.assertIsNone(a2_checks.parse_clamp(text))
+
+    def test_fallback_message_detection(self):
+        self.assertTrue(a2_checks.reports_fallback("Shooting 12 tiles\n" + FALLBACK_LINE + "Shooting cells...\n"))
+        for text in (PERIMETER_LINE + CLAMP_LINE, FORCED_LINE, "", None):
+            self.assertFalse(a2_checks.reports_fallback(text), text)
+        self.assertEqual(a2_checks.parse_fallback(FALLBACK_LINE), {"need_mib": 11188, "free_mib": 5871})
+        self.assertIsNone(a2_checks.parse_fallback(FORCED_LINE))
+
+    def test_limit_failures(self):
+        m = {"mean": 1e-12, "p999": 1e-9, "max": 1e-9, "sum_ratio": -1e-12, "finite": True, "nonneg": True}
+        self.assertEqual(a2_checks.limit_failures(m, a2_checks.NONSQUARE_LIMITS), [])   # a value at its limit passes
+        self.assertEqual(a2_checks.limit_failures(m, a2_checks.TINY_LIMITS), [])
+        for key, value in (("mean", 2e-12), ("p999", 2e-9), ("sum_ratio", -2e-12), ("sum_ratio", 2e-12), ("mean", float("nan"))):
+            fails = a2_checks.limit_failures({**m, key: value}, a2_checks.NONSQUARE_LIMITS)
+            self.assertEqual(len(fails), 1, (key, value, fails))
+            self.assertTrue(fails[0].startswith(("|sum_ratio|=" if key == "sum_ratio" else f"{key}=")), fails)
+        # max is judged only on the tiny maps, mean and p99.9 only on the non-square map
+        self.assertEqual(a2_checks.limit_failures({**m, "max": 1e-6}, a2_checks.NONSQUARE_LIMITS), [])
+        self.assertEqual(len(a2_checks.limit_failures({**m, "max": 1e-6}, a2_checks.TINY_LIMITS)), 1)
+        self.assertEqual(a2_checks.limit_failures({**m, "mean": 1e-6, "p999": 1e-6}, a2_checks.TINY_LIMITS), [])
+        self.assertIn("non-finite pixels", a2_checks.limit_failures({**m, "finite": False, "nonneg": False}, a2_checks.TINY_LIMITS))
+        self.assertIn("negative pixels", a2_checks.limit_failures({**m, "nonneg": False}, a2_checks.TINY_LIMITS))
+
+    def test_judge_pair(self):
+        direct = 1 + np.random.default_rng(3).random((2, 3))
+        edge_out = PERIMETER_LINE + CLAMP_LINE
+        m, fails, clamp = a2_checks.judge_pair(edge_out, FORCED_LINE, direct * (1 + 1e-13), direct, a2_checks.NONSQUARE_LIMITS)
+        self.assertEqual(fails, [])
+        self.assertEqual(clamp, (12, -3.5e-08))
+        self.assertLess(m["mean"], 1e-12)
+        # a perimeter run that fell back, or a direct run that was not forced, would compare one path with itself
+        fails = a2_checks.judge_pair(FALLBACK_LINE, FORCED_LINE, direct, direct, a2_checks.NONSQUARE_LIMITS)[1]
+        self.assertEqual(len(fails), 1)
+        self.assertTrue(fails[0].startswith("perimeter run:"), fails)
+        fails = a2_checks.judge_pair(edge_out, edge_out, direct, direct, a2_checks.NONSQUARE_LIMITS)[1]
+        self.assertEqual(len(fails), 1)
+        self.assertTrue(fails[0].startswith("direct run:"), fails)
+        fails = a2_checks.judge_pair(edge_out, FORCED_LINE, direct * (1 + 1e-6), direct, a2_checks.NONSQUARE_LIMITS)[1]
+        self.assertEqual(len(fails), 3, fails)   # mean, p99.9 and the sum
+        bad = direct.copy()
+        bad[0, 0] = -1.0
+        fails = a2_checks.judge_pair(edge_out, FORCED_LINE, direct, bad, a2_checks.TINY_LIMITS)[1]
+        self.assertIn("direct map: non-finite or negative pixels", fails)
+        # a 1x1 map has one pixel and no off-mask pixels
+        m, fails, _ = a2_checks.judge_pair(edge_out, FORCED_LINE, np.array([[5.0]]), np.array([[5.0]]), a2_checks.TINY_LIMITS)
+        self.assertEqual((fails, m["max"], m["n_total"]), ([], 0.0, 1))
+
+    def test_judge_natural_fallback(self):
+        rng = np.random.default_rng(5)
+        minima, saddles = rng.random((4, 5)), rng.random((4, 5))
+        maps = {"pixels": minima + saddles, "minima": minima, "saddles": saddles}
+        tol = compare_maps.default_tolerances()
+        info, fails = a2_checks.judge_natural_fallback(FALLBACK_LINE, maps, tol)
+        self.assertEqual(fails, [])
+        self.assertEqual(info["fallback"], {"need_mib": 11188, "free_mib": 5871})
+        self.assertLess(info["parity_consistency"], 1e-12)
+        fails = a2_checks.judge_natural_fallback(PERIMETER_LINE + CLAMP_LINE, maps, tol)[1]
+        self.assertEqual(len(fails), 1)
+        self.assertIn(a2_checks.FALLBACK_MESSAGE, fails[0])
+        for which, value, text in (("minima", -1.0, "negative"), ("saddles", np.nan, "non-finite"), ("pixels", np.inf, "non-finite")):
+            bad = {k: v.copy() for k, v in maps.items()}
+            bad[which][0, 0] = value
+            with np.errstate(invalid="ignore"):   # inf / inf in the parity consistency
+                fails = a2_checks.judge_natural_fallback(FALLBACK_LINE, bad, tol)[1]
+            self.assertIn(f"{which}: {text} pixels", fails)
+        fails = a2_checks.judge_natural_fallback(FALLBACK_LINE, dict(maps, pixels=maps["pixels"] * (1 + 1e-4)), tol)[1]
+        self.assertEqual(len(fails), 1)
+        self.assertTrue(fails[0].startswith("pixels != minima + saddles"), fails)
+
+    def run_main(self, d, build, env, extra=()):
+        argv = ["--build", str(build), "--rung", "A2", "--ref-root", f"{d}/ref", "--tolerances", f"{d}/tolerances.json",
+                "--results", f"{d}/results", "--scratch", f"{d}/scratch", *extra]
+        with mock.patch.dict(os.environ, env), contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            return a2_checks.main(argv)
+
+    def test_missing_executables_fail_before_any_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            build = fake_build_dir(Path(d) / "build")   # ipm_gpu and ipm_gpu_double, no _direct drivers
+            with mock.patch.object(a2_checks.bl, "run_ipm", side_effect=AssertionError("ran")) as run:
+                rc = self.run_main(d, build, {})
+            self.assertEqual(rc, 1)
+            run.assert_not_called()
+            out = bench_lib.read_json(Path(d) / "results" / "a2_checks.json")
+            self.assertFalse(out["pass"])
+            self.assertEqual(sorted(Path(p).name for p in out["missing_executables"]), ["ipm_gpu_direct", "ipm_gpu_double_direct"])
+            self.assertFalse((Path(d) / "scratch").exists())
+
+    def test_main_with_fake_executables(self):
+        with tempfile.TemporaryDirectory() as d:
+            build = fake_a2_build(Path(d) / "build")
+            every_message = PERIMETER_LINE + FORCED_LINE + FALLBACK_LINE + CLAMP_LINE
+            self.assertEqual(self.run_main(d, build, {"FAKE_IPM_STDOUT": every_message}), 0)
+            out = bench_lib.read_json(Path(d) / "results" / "a2_checks.json")
+            self.assertTrue(out["pass"] and out["complete"], out)
+            self.assertEqual(sorted(out["checks"]), sorted(a2_checks.CHECKS))   # write_json sorts the keys
+            self.assertTrue(all(c["pass"] for c in out["checks"].values()))
+            clamp = out["checks"]["clamp_counts"]["configs"]
+            self.assertEqual([c["config"] for c in clamp], ["nb_f", "nb_d", "rect_f", "hm100_f"])
+            self.assertEqual({(c["count"], c["total"]) for c in clamp}, {(12, -3.5e-08)})
+            self.assertEqual([Path(c["run"]["exe"]).name for c in clamp], ["ipm_gpu", "ipm_gpu_double", "ipm_gpu", "ipm_gpu"])
+            pair = out["checks"]["nonsquare_double"]["maps"]["3000x2000"]
+            self.assertEqual((Path(pair["edge"]["exe"]).name, Path(pair["direct"]["exe"]).name),
+                             ("ipm_gpu_double", "ipm_gpu_double_direct"))
+            self.assertEqual(pair["edge"]["args"], list(a2_checks.NONSQUARE))
+            self.assertEqual(set(out["checks"]["tiny_maps_double"]["maps"]), {"1x1", "7x3"})
+            fb = out["checks"]["natural_fallback"]
+            self.assertEqual((Path(fb["run"]["exe"]).name, fb["fallback"]), ("ipm_gpu", {"need_mib": 11188, "free_mib": 5871}))
+            self.assertIn("-wp", fb["run"]["args"])
+            self.assertEqual([p for p in (Path(d) / "scratch").rglob("*") if p.is_file()], [])
+            # without the fallback message only natural_fallback fails; --only runs the named checks
+            self.assertEqual(self.run_main(d, build, {"FAKE_IPM_STDOUT": PERIMETER_LINE + FORCED_LINE + CLAMP_LINE}), 1)
+            out = bench_lib.read_json(Path(d) / "results" / "a2_checks.json")
+            self.assertEqual({k: c["pass"] for k, c in out["checks"].items()},
+                             {"natural_fallback": False, "nonsquare_double": True, "tiny_maps_double": True, "clamp_counts": True})
+            self.assertFalse(out["pass"])
+            self.assertEqual(self.run_main(d, build, {"FAKE_IPM_STDOUT": every_message}, ["--only", "tiny_maps_double"]), 0)
+            self.assertEqual(list(bench_lib.read_json(Path(d) / "results" / "a2_checks.json")["checks"]), ["tiny_maps_double"])
+
+    def test_a_failed_run_or_check_is_recorded_and_the_rest_still_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            build = fake_a2_build(Path(d) / "build")
+            every_message = PERIMETER_LINE + FORCED_LINE + FALLBACK_LINE + CLAMP_LINE
+            self.assertEqual(self.run_main(d, build, {"FAKE_IPM_STDOUT": every_message, "FAKE_IPM_FAIL": "1"}), 1)
+            out = bench_lib.read_json(Path(d) / "results" / "a2_checks.json")
+            self.assertTrue(out["complete"])
+            self.assertEqual(sorted(out["checks"]), sorted(a2_checks.CHECKS))   # write_json sorts the keys
+            for name, c in out["checks"].items():
+                self.assertFalse(c["pass"], name)
+                self.assertTrue(any("run failed: exit code 3" in f for f in c["failures"]), (name, c["failures"]))
+            with mock.patch.object(a2_checks, "judge_pair", side_effect=ValueError("boom")):
+                self.assertEqual(self.run_main(d, build, {"FAKE_IPM_STDOUT": every_message}), 1)
+            out = bench_lib.read_json(Path(d) / "results" / "a2_checks.json")
+            self.assertEqual(out["checks"]["nonsquare_double"]["failures"], ["check failed: ValueError: boom"])
+            self.assertTrue(out["checks"]["clamp_counts"]["pass"] and out["checks"]["natural_fallback"]["pass"])
+            self.assertEqual([p for p in (Path(d) / "scratch").rglob("*") if p.is_file()], [])
 
 
 import report  # noqa: E402
