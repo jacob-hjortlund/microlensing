@@ -2000,6 +2000,35 @@ class ReportRound2Tests(unittest.TestCase):
             self.assertIn("GPU 4, job 906277", kernel)
             self.assertIn("GPU 0, job 906674", kernel)
 
+    def test_kernel_flag_uses_round1_base(self):
+        rec, env = self.rec, {**self.ENV, "cuda_visible_devices": "0", "slurm_job_id": "906674"}
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            sm = lambda recs: {r: time_rung.summarize([x for x in recs if x["rung"] == r]) for r in {x["rung"] for x in recs}}
+            bench_lib.write_json(root / "final" / "timing_ladder.json", {
+                "env": env, "records": [rec("final", "nb_f", 0.200, 0.9), rec("final", "hm100_f", 0.208, 0.9)]})
+            bench_lib.write_json(root / "R5" / "timing_full.json", {
+                "env": env, "records": [rec("R5", "nb_f", 0.200, 0.9), rec("R5", "hm100_f", 0.339, 0.9)]})
+            lad = [rec("base", "nb_f", 0.300, 1.0), rec("A1", "nb_f", 0.210, 1.0)]
+            bench_lib.write_json(root / "round2" / "ladder_interleaved.json", {
+                "env": env, "rungs": ["base", "A1"], "records": lad, "summary": sm(lad)})
+            full = [rec("base", "hm100_f", 0.250, 1.0), rec("A4", "hm100_f", 0.215, 1.0)]
+            bench_lib.write_json(root / "round2" / "full_interleaved.json", {
+                "env": env, "rungs": ["base", "A4"], "records": full, "summary": sm(full)})
+            text = self.render(root)
+            self.assertIn("0.210 ⚠", text)            # against round 1's 0.200, not round 2's 0.300
+            self.assertIn("0.339 (ladder 0.208)", text)
+            self.assertIn("0.215 ⚠", text)            # 0.215 > 1.03 * 0.208
+            self.assertIn("Full kernel, A4, hm100_f", text)
+            self.assertIn("use the ladder value", text)
+
+    def test_missing_regression_files_are_listed(self):
+        with tempfile.TemporaryDirectory() as d:
+            text = self.render(d)
+            for rung in ("A1", "A2", "A2-direct", "A4"):
+                for s in ("ladder", "full"):
+                    self.assertIn(f"- {rung}/regression_{s}.json", text)
+
     def test_missing_inputs_are_dashes_with_a_note(self):
         with tempfile.TemporaryDirectory() as d:
             text = self.render(d)
