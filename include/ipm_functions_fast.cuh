@@ -12,6 +12,7 @@
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 
+#include <climits>
 #include <numbers>
 
 
@@ -239,6 +240,10 @@ namespace ipm_fast
 
 	constexpr int TILE = 16; //cells per tile side; a block handles one TILE x TILE tile at a time
 	constexpr int NCORNER = (TILE + 1) * (TILE + 1);
+#ifndef IPM_EDGE_MIN_BBOX
+#define IPM_EDGE_MIN_BBOX 64 //tuning knob: triangles whose clamped bounding box has more pixels than this take the perimeter path
+#endif
+	constexpr long long EDGE_MIN_BBOX = IPM_EDGE_MIN_BBOX;
 #ifndef IPM_MIN_BLOCKS_PER_SM
 #define IPM_MIN_BLOCKS_PER_SM 0 //tuning knob: 0 = automatic (4 blocks/SM for float, 3 for double), else the value given
 #endif
@@ -425,7 +430,7 @@ namespace ipm_fast
 					if (!(fabs(area) < max_area)) return;
 					const long long parity = (parities && area >= 0) ? 1 : 0;
 					T* target = parities ? (parity ? pixsad : pixmin) : pixels;
-					tri_cov::allocate_triangle<P, T>(pa, pb, pc, area, factor, npixels,
+					tri_cov::allocate_triangle<P, T>(pa, pb, pc, area, factor, npixels, LLONG_MAX,
 						[&](long long idx, P v)
 						{
 							const long long key = (idx << 1) | parity;
@@ -440,7 +445,8 @@ namespace ipm_fast
 								pend_val = v;
 							}
 						},
-						[&](long long idx, P v) { atomicAdd(&target[idx], static_cast<T>(v)); });
+						[&](long long idx, P v) { atomicAdd(&target[idx], static_cast<T>(v)); },
+						[](long long, P) {});
 				};
 				deposit(y0, y1, y2);
 				deposit(y2, y3, y0);

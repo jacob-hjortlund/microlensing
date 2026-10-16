@@ -2,6 +2,7 @@
 
 #include "complex.cuh"
 
+#include <cfloat>
 #include <cmath>
 
 /******************************************************************************
@@ -31,6 +32,10 @@ to 1e-5 (p99.9) relative level, far above its 1e-13 rounding floor.
 
 The original code adds factor*|piece|/|whole| per pixel; summing the signed
 coverage and scaling by factor/area (signed) is identical.
+
+Triangles with a large bounding box can instead be deposited along their
+perimeter, as values on the edges plus steps whose row-wise prefix sum fills
+the interior (see allocate_triangle).
 ******************************************************************************/
 namespace tri_cov
 {
@@ -43,10 +48,11 @@ namespace tri_cov
 	|a| + |b| = |a - b| = L * |slope|, so the integral equals
 	(max(a,0) + max(b,0))^2 / (2 * |slope|), and 1 / (2 |slope|) is precomputed
 	once per edge (inv2s, 0 for a vertical or horizontal edge). when both
-	endpoints are <= 0 the numerator is 0, so the result is 0 whatever inv2s is
-	(inv2s is always finite)
+	endpoints are <= 0 the numerator is 0, so the result is 0 as long as inv2s
+	is finite. make_edge keeps it finite: a subnormal slope, whose reciprocal
+	can overflow, counts as 0 (its integral is below the smallest normal number)
 
-	\param inv2s -- 1 / (2 |slope|) of the edge, or 0 when the slope is 0
+	\param inv2s -- 1 / (2 |slope|) of the edge, or 0 when |slope| is 0 or subnormal
 	******************************************************************************/
 	template <typename P>
 	__host__ __device__ __forceinline__ P int_max0(P a, P b, P L, P inv2s)
@@ -72,7 +78,7 @@ namespace tri_cov
 		P xa, ya, xb, yb; //oriented so that ya <= yb
 		P slope;          //dx/dy
 		P sgn;            //+1 if the original edge went upward, -1 if downward, 0 if horizontal
-		P inv2s;          //1 / (2 |slope|), 0 for a vertical or horizontal edge
+		P inv2s;          //1 / (2 |slope|), 0 for a vertical or horizontal edge (or a subnormal slope)
 	};
 
 	template <typename P>
@@ -90,7 +96,9 @@ namespace tri_cov
 		P dy = e.yb - e.ya;
 		e.slope = dy > 0 ? (e.xb - e.xa) / dy : P(0);
 		if (!(dy > 0)) e.sgn = 0;
-		e.inv2s = e.slope != 0 ? P(1) / (2 * fabs(e.slope)) : P(0);
+		//the smallest normal number: below it 1 / (2 |slope|) can overflow (float and double alike)
+		const P min_normal = sizeof(P) == sizeof(float) ? P(FLT_MIN) : P(DBL_MIN);
+		e.inv2s = fabs(e.slope) >= min_normal ? P(1) / (2 * fabs(e.slope)) : P(0);
 		return e;
 	}
 
@@ -102,15 +110,23 @@ namespace tri_cov
 	                     (already computed by the caller for the parity test)
 	\param factor -- total amount to distribute among the pixels
 	\param npix -- number of pixels in each direction
+	\param edge_min_bbox -- a triangle whose clamped bounding box has more pixels
+	                        than this takes the perimeter path (LLONG_MAX: never;
+	                        a triangle inside one pixel always goes to add_one)
 	\param add_one -- callable add_one(long long pixel_index, P value), used when
 	                  the whole triangle lies inside one pixel (the hot path in
 	                  magnified regions; the caller may aggregate these)
 	\param add_many -- callable add_many(long long pixel_index, P value), used for
 	                   the general multi-pixel case
+	\param add_step -- callable add_step(long long pixel_index, P value), used only
+	                   by the perimeter path. the values go to a step buffer of
+	                   the map's size whose row-wise inclusive prefix sum the
+	                   caller adds to the map once all triangles are deposited
 	******************************************************************************/
-	template <typename P, typename T, typename AddOne, typename AddMany>
+	template <typename P, typename T, typename AddOne, typename AddMany, typename AddStep>
 	__host__ __device__ __forceinline__ void allocate_triangle(Complex<T> p0, Complex<T> p1, Complex<T> p2,
-		T whole_area, P factor, Complex<int> npix, AddOne&& add_one, AddMany&& add_many)
+		T whole_area, P factor, Complex<int> npix, long long edge_min_bbox,
+		AddOne&& add_one, AddMany&& add_many, AddStep&& add_step)
 	{
 		if (whole_area == 0) return;
 
@@ -171,6 +187,59 @@ namespace tri_cov
 		Edge<P> e1 = make_edge(x1, y1, x2, y2);
 		Edge<P> e2 = make_edge(x2, y2, x0, y0);
 
+		/******************************************************************************
+		perimeter path. for one edge and one pixel row, the edge's coverage of column
+		i is sgn*L for the columns left of the edge's span in that row, the clamped
+		integral on the span, and 0 to its right. the sgn*L terms of the three edges
+		cancel, so each edge-row deposits sgn*part on its span (add_many) and a step
+		of -sgn*L at the first span column (add_step); the row-wise prefix sum of the
+		steps restores the columns between the edges. the cost is proportional to
+		the perimeter instead of the area. exact up to rounding. there is no clamp
+		to [0, factor] as in the direct path: the values deposited here are partial
+		(a span value can be negative until the steps are summed).
+
+		rows are in the frame of the clamped bounding box (rows 0..iy1-iy0); columns
+		are clamped to the map, not to the bounding box, because a step can fall on
+		the column just right of it. a span that starts left of the map has its step
+		on column 0; one that starts right of the last column has no step at all
+		******************************************************************************/
+		if (1LL * (ix1 - ix0 + 1) * (iy1 - iy0 + 1) > edge_min_bbox)
+		{
+			const int ncol = npix.re;
+#pragma unroll 1
+			for (int q = 0; q < 3; q++)
+			{
+				//selected, not indexed from an array, so that nothing goes to local memory
+				const Edge<P> e = q == 0 ? e0 : (q == 1 ? e1 : e2);
+				if (e.sgn == 0) continue;
+				int r0 = static_cast<int>(floor(e.ya)), r1 = static_cast<int>(ceil(e.yb)) - 1;
+				r0 = r0 < 0 ? 0 : r0;
+				r1 = r1 > iy1 - iy0 ? iy1 - iy0 : r1;
+				for (int r = r0; r <= r1; r++)
+				{
+					const P row_lo = static_cast<P>(r), row_hi = row_lo + 1;
+					const P ra = fmax(e.ya, row_lo), rb = fmin(e.yb, row_hi);
+					const P L = rb - ra;
+					if (!(L > 0)) continue;
+					const P xra = e.xa + (ra - e.ya) * e.slope, xrb = xra + L * e.slope;
+					const P lo = fmin(xra, xrb), hi = fmax(xra, xrb);
+					const int gs = ix0 + static_cast<int>(floor(lo)); //first span column, map frame
+					const int ge = ix0 + static_cast<int>(floor(hi)); //last span column, map frame
+					const long long rowbase = 1LL * ncol * (iy0 + r);
+					const int cs = gs < 0 ? 0 : gs;
+					const int ce = ge > ncol - 1 ? ncol - 1 : ge;
+					if (gs < ncol) add_step(rowbase + cs, -e.sgn * L * scale);
+					for (int gi = cs; gi <= ce; gi++)
+					{
+						const P col = static_cast<P>(gi - ix0);
+						const P part = int_clamp01(xra - col, xrb - col, L, e.inv2s);
+						add_many(rowbase + gi, e.sgn * part * scale);
+					}
+				}
+			}
+			return;
+		}
+
 		for (int iy = iy0; iy <= iy1; iy++)
 		{
 			P row_lo = static_cast<P>(iy - iy0);
@@ -219,15 +288,5 @@ namespace tri_cov
 				add_many(1LL * npix.re * iy + ix, to_add);
 			}
 		}
-	}
-
-	/******************************************************************************
-	convenience overload with a single callback
-	******************************************************************************/
-	template <typename P, typename T, typename AddFn>
-	__host__ __device__ __forceinline__ void allocate_triangle(Complex<T> p0, Complex<T> p1, Complex<T> p2,
-		T whole_area, P factor, Complex<int> npix, AddFn&& add)
-	{
-		allocate_triangle<P, T>(p0, p1, p2, whole_area, factor, npix, add, add);
 	}
 }
