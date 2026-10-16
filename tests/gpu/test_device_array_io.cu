@@ -4,6 +4,9 @@
 #include "device_array_io.cuh"
 
 #include <cstdio>
+#include <cstdlib>
+#include <unistd.h>
+#include <utility>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -54,6 +57,50 @@ static void run(const char* tname, const std::string& dir)
 	bool good = write_device_array<T>(d, 4, 4, dir + "/c.bin", 64) && slurp(dir + "/c.bin").size() == 8 + 16 * sizeof(T);
 	report(std::string("unwritable_path_fails_cleanly_") + tname, !bad && good, bad ? "returned true" : "later call failed");
 	cudaFree(d);
+
+	// header-only arrays
+	for (auto& sh : {std::pair<int, int>(0, 7), std::pair<int, int>(7, 0)})
+	{
+		std::string fa = dir + "/a.bin", fb = dir + "/b.bin";
+		bool ok1 = write_array<T>(nullptr, sh.first, sh.second, fa);
+		bool ok2 = write_device_array<T>(nullptr, sh.first, sh.second, fb);
+		report(std::string("empty_array_header_only_") + tname + "_" + std::to_string(sh.first) + "x" + std::to_string(sh.second),
+			ok1 && ok2 && slurp(fa) == slurp(fb) && slurp(fb).size() == 8, "mismatch or false");
+	}
+
+	// failure after buffers exist: /dev/full opens fine and fails on write
+	{
+		std::string full = dir + "/full.bin";
+		std::remove(full.c_str());
+		bool linked = symlink("/dev/full", full.c_str()) == 0;
+		size_t n = 1 << 20;
+		T* dd = nullptr;
+		cudaMalloc(&dd, n * sizeof(T));
+		cudaMemset(dd, 0, n * sizeof(T));
+		bool multi = write_device_array<T>(dd, 1024, 1024, full, 4096);     // many chunks, fails mid-stream
+		bool single = write_device_array<T>(dd, 4, 4, full, 64);            // fails at flush/close
+		bool after = write_device_array<T>(dd, 1024, 1024, dir + "/d.bin", 4096)
+			&& slurp(dir + "/d.bin").size() == 8 + n * sizeof(T);
+		bool cuda_clean = cudaGetLastError() == cudaSuccess;
+		std::remove(full.c_str());
+		report(std::string("dev_full_fails_cleanly_") + tname, linked && !multi && !single && after && cuda_clean,
+			!linked ? "symlink failed" : multi ? "mid-stream returned true" : single ? "small returned true" : !after ? "later call failed" : "stale CUDA error");
+		cudaFree(dd);
+	}
+
+	// pending error is reported, nothing is written
+	{
+		T* dd = nullptr;
+		cudaMalloc(&dd, 16 * sizeof(T));
+		std::string f = dir + "/pending.bin";
+		std::remove(f.c_str());
+		cudaMemcpy(dd, dd, 16 * sizeof(T), (cudaMemcpyKind)12345); // invalid, non-sticky error
+		bool r = write_device_array<T>(dd, 4, 4, f);
+		bool exists = std::filesystem::exists(f);
+		bool again = write_device_array<T>(dd, 4, 4, f); // error was consumed
+		report(std::string("pending_error_is_reported_") + tname, !r && !exists && again, r ? "returned true" : exists ? "file written" : "retry failed");
+		cudaFree(dd);
+	}
 }
 
 int main()

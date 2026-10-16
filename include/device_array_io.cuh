@@ -21,11 +21,23 @@ buffers so the copy of chunk k+1 overlaps the write of chunk k
 \param chunk_bytes -- size in bytes of each pinned buffer (capped at the size
                       of the array)
 
-\return bool -- true if file is successfully written, false if not
+\return bool -- true if file is successfully written, false if not (including
+         when a CUDA error was already pending on entry, in which case nothing
+         is written and the pending error is consumed after being reported)
 ******************************************************************************/
 template <typename T>
 bool write_device_array(const T* d_vals, int nrows, int ncols, const std::string& fname, size_t chunk_bytes = 64ULL << 20)
 {
+	//a pending CUDA error means the caller's device data cannot be trusted, and
+	//cuda_error below reads the same last-error state, so report it and stop
+	cudaError_t pending = cudaGetLastError();
+	if (pending != cudaSuccess)
+	{
+		std::cerr << "Error. A CUDA error was pending before writing " << fname << ": "
+			<< static_cast<int>(pending) << " (" << cudaGetErrorString(pending) << ")\n";
+		return false;
+	}
+
 	std::filesystem::path fpath = fname;
 
 	if (fpath.extension() != ".bin")
@@ -55,8 +67,6 @@ bool write_device_array(const T* d_vals, int nrows, int ncols, const std::string
 		cudaStream_t stream = nullptr;
 		bool stream_made = false;
 		bool ok = true;
-
-		cudaGetLastError(); //clear any stale error so cuda_error reports only ours
 
 		cudaMallocHost(&bufs[0], chunk * sizeof(T));
 		if (cuda_error("cudaMallocHost(bufs[0])", false, __FILE__, __LINE__)) ok = false;
