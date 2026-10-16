@@ -107,7 +107,7 @@ def main(argv=None):
     s5 = (bl.read_json(r5_path).get("summary") or summarize(bl.read_json(r5_path)["records"])) if r5_path.exists() else {}
     parts += ["## Full matrix R0 vs R5: median shooting time", "", matrix_table(s0, s5, "median_t_shoot_cells"), ""]
     parts += ["## Full matrix R0 vs R5: median end-to-end wall time", "", matrix_table(s0, s5, "median_wall_s"), ""]
-    parts += ["## Python wrapper: run() including get_pixels()", "", python_table(root), ""]
+    parts += ["## Python wrapper: run() including the copy into numpy", "", python_table(root), ""]
     parts += ["## Peak device memory", "", memory_table(root), ""]
     parts += ["## Regression results", "", regression_table(root, rungs), ""]
     Path(a.out).write_text("\n".join(parts))

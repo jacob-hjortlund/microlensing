@@ -239,7 +239,7 @@ def render(root):
               "Kernel:", "", rung_table(ctx, "Fallback kernel", fk, frungs, fnames, fk.get("base", {})), "",
               "Wall:", "", rung_table(ctx, "Fallback wall", fw, frungs, fnames, fw.get("base", {})), ""]
 
-    parts += ["## Python wrapper: run() including get_pixels()", "",
+    parts += ["## Python wrapper: run() including the copy into numpy", "",
               "All rungs from their python.json of this job; slowdowns are judged against base/python.json, and base-repeat shows the noise.", "",
               python_section(ctx), ""]
     parts += ["## Peak memory", "",

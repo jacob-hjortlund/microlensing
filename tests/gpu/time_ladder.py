@@ -17,7 +17,7 @@ def main(argv=None):
     ap.add_argument("--builds-root", help="default: $IPM_BENCH_ROOT/builds")
     ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--ref-root", help="default: $IPM_BENCH_ROOT/ref")
-    ap.add_argument("--out", help="default: $IPM_BENCH_ROOT/results/ladder_interleaved.json")
+    ap.add_argument("--out", required=True, help="result file; resumed if it exists (round 1's is results/ladder_interleaved.json)")
     ap.add_argument("--scratch", default=str(bl.SCRATCH / "ladder"))
     ap.add_argument("--set", default="ladder", choices=["ladder", "full", "memory", "fallback"])
     ap.add_argument("--no-warmup", action="store_true")
@@ -28,7 +28,6 @@ def main(argv=None):
         return 2
     a.builds_root = a.builds_root or str(bl.bench_path("builds"))
     a.ref_root = a.ref_root or str(bl.bench_path("ref"))
-    a.out = a.out or str(bl.bench_path("results", "ladder_interleaved.json"))
     builds = {r: Path(a.builds_root) / r for r in a.rungs}
     missing = [str(b) for b in builds.values() if not (b / "ipm_gpu").exists()]
     if missing:
@@ -37,8 +36,11 @@ def main(argv=None):
     out_path = Path(a.out)
     if out_path.exists():
         out = bl.read_json(out_path)
+        if out.setdefault("set", a.set) != a.set:
+            print(f"{out_path} holds the {out['set']} set, not {a.set}; choose another --out", file=sys.stderr)
+            return 2
     else:
-        out = {"rungs": a.rungs, "repeats": a.repeats, "env": bl.environment_info(),
+        out = {"rungs": a.rungs, "set": a.set, "repeats": a.repeats, "env": bl.environment_info(),
                "builds": {r: bl.build_meta(b) for r, b in builds.items()}, "records": []}
     # position of each (rung, config, repeat) record; only successful records count as done, and a
     # configuration measured again replaces its failed record in place
