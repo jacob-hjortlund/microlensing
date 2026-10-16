@@ -2,6 +2,7 @@
 
 #include "array_functions.cuh"
 #include "complex.cuh"
+#include "device_array_io.cuh"
 #include "ipm_functions_fast.cuh"
 #include "ipm_leaf.cuh"
 #include "microlensing.cuh"
@@ -21,8 +22,10 @@
 #include <fstream> //for writing files
 #include <iostream>
 #include <limits> //for std::numeric_limits
+#include <new> //for std::nothrow
 #include <numbers>
 #include <string>
+#include <vector>
 
 
 template <typename T>
@@ -121,18 +124,23 @@ private:
 
 	/******************************************************************************
 	dynamic memory
-	the maps live in plain device memory (cudaMalloc) while they are being built
-	and are copied once into pinned host memory afterwards. the host copies are
-	what get_pixels() returns and what the file writers read. this replaces the
-	fault-driven migrations of cudaMallocManaged, which for large maps cost more
-	than the shooting itself.
+	the maps live in plain device memory (cudaMalloc) for the life of the object;
+	run() does not copy them to the host. save() streams each map to its file
+	through two small pinned buffers (write_device_array), and copy_pixels*()
+	copy a map straight into a caller's buffer (the Python wrapper passes its
+	numpy arrays). get_pixels*() fill a host copy (new T[]) on their first call
+	and return it afterwards; clear_memory() frees the copies, and run() calls
+	clear_memory() first, so a copy never outlives the map it was made from.
+	this replaces cudaMallocManaged, whose fault-driven migrations cost more than
+	the shooting for large maps, and the pinned host copy of every map that
+	replaced it in turn
 	******************************************************************************/
-	T* pixels = nullptr;          //host (pinned)
-	T* pixels_minima = nullptr;   //host (pinned)
-	T* pixels_saddles = nullptr;  //host (pinned)
 	T* d_pixels = nullptr;        //device
 	T* d_pixels_minima = nullptr; //device
 	T* d_pixels_saddles = nullptr; //device
+	T* h_pixels = nullptr;         //host copy for get_pixels(), made on its first call
+	T* h_pixels_minima = nullptr;  //host copy for get_pixels_minima(), made on its first call
+	T* h_pixels_saddles = nullptr; //host copy for get_pixels_saddles(), made on its first call
 
 	/******************************************************************************
 	step buffer of the perimeter deposit and the clamp statistics of its row sums
@@ -152,6 +160,9 @@ private:
 	int num_leaves = 0;
 	int num_direct = 0;
 
+	/******************************************************************************
+	histograms (device; copied to the host by write_files)
+	******************************************************************************/
 	int min_mag;
 	int max_mag;
 	int histogram_length;
@@ -192,21 +203,18 @@ private:
 		
 		/******************************************************************************
 		free memory and set variables to nullptr
+		the host copies go first: freeing them cannot fail, so even a run() whose
+		clear_memory() fails leaves no stale copy for get_pixels*() to return
 		******************************************************************************/
 
-		if (!Microlensing<T>::clear_memory(verbose, return_on_error)) return false;
+		delete[] h_pixels;
+		h_pixels = nullptr;
+		delete[] h_pixels_minima;
+		h_pixels_minima = nullptr;
+		delete[] h_pixels_saddles;
+		h_pixels_saddles = nullptr;
 
-		cudaFreeHost(pixels);
-		if (return_on_error && cuda_error("cudaFreeHost(*pixels)", false, __FILE__, __LINE__)) return false;
-		pixels = nullptr;
-		
-		cudaFreeHost(pixels_minima);
-		if (return_on_error && cuda_error("cudaFreeHost(*pixels_minima)", false, __FILE__, __LINE__)) return false;
-		pixels_minima = nullptr;
-		
-		cudaFreeHost(pixels_saddles);
-		if (return_on_error && cuda_error("cudaFreeHost(*pixels_saddles)", false, __FILE__, __LINE__)) return false;
-		pixels_saddles = nullptr;
+		if (!Microlensing<T>::clear_memory(verbose, return_on_error)) return false;
 
 		cudaFree(d_pixels);
 		if (return_on_error && cuda_error("cudaFree(*d_pixels)", false, __FILE__, __LINE__)) return false;
@@ -466,24 +474,17 @@ private:
 		if (!Microlensing<T>::allocate_initialize_memory(verbose)) return false;
 
 		/******************************************************************************
-		allocate memory for pixels: device arrays for accumulation, pinned host
-		arrays for the results
+		allocate memory for pixels (device only, see dynamic memory above)
 		******************************************************************************/
 		const size_t pixel_bytes = (1ULL * num_pixels_y.re * num_pixels_y.im) * sizeof(T);
 		cudaMalloc(&d_pixels, pixel_bytes);
 		if (cuda_error("cudaMalloc(*d_pixels)", false, __FILE__, __LINE__)) return false;
-		cudaMallocHost(&pixels, pixel_bytes);
-		if (cuda_error("cudaMallocHost(*pixels)", false, __FILE__, __LINE__)) return false;
 		if (write_parities)
 		{
 			cudaMalloc(&d_pixels_minima, pixel_bytes);
 			if (cuda_error("cudaMalloc(*d_pixels_minima)", false, __FILE__, __LINE__)) return false;
 			cudaMalloc(&d_pixels_saddles, pixel_bytes);
 			if (cuda_error("cudaMalloc(*d_pixels_saddles)", false, __FILE__, __LINE__)) return false;
-			cudaMallocHost(&pixels_minima, pixel_bytes);
-			if (cuda_error("cudaMallocHost(*pixels_minima)", false, __FILE__, __LINE__)) return false;
-			cudaMallocHost(&pixels_saddles, pixel_bytes);
-			if (cuda_error("cudaMallocHost(*pixels_saddles)", false, __FILE__, __LINE__)) return false;
 		}
 
 		t_elapsed = stopwatch.stop();
@@ -544,9 +545,11 @@ private:
 			<< " blocks (" << blocks_per_sm << " resident blocks per SM)\n", verbose, 2);
 
 		unsigned long long int* percentage = nullptr;
-		cudaMallocManaged(&percentage, sizeof(unsigned long long int));
-		if (cuda_error("cudaMallocManaged(*percentage)", false, __FILE__, __LINE__)) return false;
-		*percentage = 1;
+		const unsigned long long int percentage_start = 1;
+		cudaMalloc(&percentage, sizeof(unsigned long long int));
+		if (cuda_error("cudaMalloc(*percentage)", false, __FILE__, __LINE__)) return false;
+		cudaMemcpy(percentage, &percentage_start, sizeof(unsigned long long int), cudaMemcpyHostToDevice);
+		if (cuda_error("cudaMemcpy(*percentage)", false, __FILE__, __LINE__)) return false;
 
 		ipm_fast::SmoothConst<T> smooth_const = ipm_fast::make_smooth_const<T>(corner);
 
@@ -779,14 +782,14 @@ private:
 
 			histogram_length = max_mag - min_mag + 1;
 
-			cudaMallocManaged(&histogram, histogram_length * sizeof(int));
-			if (cuda_error("cudaMallocManaged(*histogram)", false, __FILE__, __LINE__)) return false;
+			cudaMalloc(&histogram, histogram_length * sizeof(int));
+			if (cuda_error("cudaMalloc(*histogram)", false, __FILE__, __LINE__)) return false;
 			if (write_parities)
 			{
-				cudaMallocManaged(&histogram_minima, histogram_length * sizeof(int));
-				if (cuda_error("cudaMallocManaged(*histogram_minima)", false, __FILE__, __LINE__)) return false;
-				cudaMallocManaged(&histogram_saddles, histogram_length * sizeof(int));
-				if (cuda_error("cudaMallocManaged(*histogram_saddles)", false, __FILE__, __LINE__)) return false;
+				cudaMalloc(&histogram_minima, histogram_length * sizeof(int));
+				if (cuda_error("cudaMalloc(*histogram_minima)", false, __FILE__, __LINE__)) return false;
+				cudaMalloc(&histogram_saddles, histogram_length * sizeof(int));
+				if (cuda_error("cudaMalloc(*histogram_saddles)", false, __FILE__, __LINE__)) return false;
 			}
 
 
@@ -817,14 +820,14 @@ private:
 
 			log_histogram_length = max_log_mag - min_log_mag + 1;
 
-			cudaMallocManaged(&log_histogram, log_histogram_length * sizeof(int));
-			if (cuda_error("cudaMallocManaged(*log_histogram)", false, __FILE__, __LINE__)) return false;
+			cudaMalloc(&log_histogram, log_histogram_length * sizeof(int));
+			if (cuda_error("cudaMalloc(*log_histogram)", false, __FILE__, __LINE__)) return false;
 			if (write_parities)
 			{
-				cudaMallocManaged(&log_histogram_minima, log_histogram_length * sizeof(int));
-				if (cuda_error("cudaMallocManaged(*log_histogram_minima)", false, __FILE__, __LINE__)) return false;
-				cudaMallocManaged(&log_histogram_saddles, log_histogram_length * sizeof(int));
-				if (cuda_error("cudaMallocManaged(*log_histogram_saddles)", false, __FILE__, __LINE__)) return false;
+				cudaMalloc(&log_histogram_minima, log_histogram_length * sizeof(int));
+				if (cuda_error("cudaMalloc(*log_histogram_minima)", false, __FILE__, __LINE__)) return false;
+				cudaMalloc(&log_histogram_saddles, log_histogram_length * sizeof(int));
+				if (cuda_error("cudaMalloc(*log_histogram_saddles)", false, __FILE__, __LINE__)) return false;
 			}
 
 
@@ -910,8 +913,18 @@ private:
 		{
 			print_verbose("Writing magnification histograms...\n", verbose, 2);
 
+			//the histograms are in device memory: each one is copied into h_hist before it is written
+			std::vector<int> h_hist;
+			auto copy_histogram = [&](const int* d_hist, int n)
+			{
+				if (d_hist == nullptr || n < 1) return false;
+				h_hist.resize(n);
+				cudaMemcpy(h_hist.data(), d_hist, n * sizeof(int), cudaMemcpyDeviceToHost);
+				return !cuda_error("cudaMemcpy(*h_hist)", false, __FILE__, __LINE__);
+			};
+
 			fname = outfile_prefix + "ipm_mags_numpixels.txt";
-			if (!write_histogram<int>(histogram, histogram_length, min_mag, fname))
+			if (!copy_histogram(histogram, histogram_length) || !write_histogram<int>(h_hist.data(), histogram_length, min_mag, fname))
 			{
 				std::cerr << "Error. Unable to write magnification histogram to file " << fname << "\n";
 				return false;
@@ -919,7 +932,7 @@ private:
 			print_verbose("Done writing magnification histogram to file " << fname << "\n", verbose, 1);
 
 			fname = outfile_prefix + "ipm_log_mags_numpixels.txt";
-			if (!write_histogram<int>(log_histogram, log_histogram_length, min_log_mag, fname))
+			if (!copy_histogram(log_histogram, log_histogram_length) || !write_histogram<int>(h_hist.data(), log_histogram_length, min_log_mag, fname))
 			{
 				std::cerr << "Error. Unable to write magnification histogram to file " << fname << "\n";
 				return false;
@@ -929,7 +942,7 @@ private:
 			if (write_parities)
 			{
 				fname = outfile_prefix + "ipm_mags_numpixels_minima.txt";
-				if (!write_histogram<int>(histogram_minima, histogram_length, min_mag, fname))
+				if (!copy_histogram(histogram_minima, histogram_length) || !write_histogram<int>(h_hist.data(), histogram_length, min_mag, fname))
 				{
 					std::cerr << "Error. Unable to write magnification histogram to file " << fname << "\n";
 					return false;
@@ -937,7 +950,7 @@ private:
 				print_verbose("Done writing magnification histogram to file " << fname << "\n", verbose, 1);
 
 				fname = outfile_prefix + "ipm_log_mags_numpixels_minima.txt";
-				if (!write_histogram<int>(log_histogram_minima, log_histogram_length, min_log_mag, fname))
+				if (!copy_histogram(log_histogram_minima, log_histogram_length) || !write_histogram<int>(h_hist.data(), log_histogram_length, min_log_mag, fname))
 				{
 					std::cerr << "Error. Unable to write magnification histogram to file " << fname << "\n";
 					return false;
@@ -945,7 +958,7 @@ private:
 				print_verbose("Done writing magnification histogram to file " << fname << "\n", verbose, 1);
 
 				fname = outfile_prefix + "ipm_mags_numpixels_saddles.txt";
-				if (!write_histogram<int>(histogram_saddles, histogram_length, min_mag, fname))
+				if (!copy_histogram(histogram_saddles, histogram_length) || !write_histogram<int>(h_hist.data(), histogram_length, min_mag, fname))
 				{
 					std::cerr << "Error. Unable to write magnification histogram to file " << fname << "\n";
 					return false;
@@ -953,7 +966,7 @@ private:
 				print_verbose("Done writing magnification histogram to file " << fname << "\n", verbose, 1);
 
 				fname = outfile_prefix + "ipm_log_mags_numpixels_saddles.txt";
-				if (!write_histogram<int>(log_histogram_saddles, log_histogram_length, min_log_mag, fname))
+				if (!copy_histogram(log_histogram_saddles, log_histogram_length) || !write_histogram<int>(h_hist.data(), log_histogram_length, min_log_mag, fname))
 				{
 					std::cerr << "Error. Unable to write magnification histogram to file " << fname << "\n";
 					return false;
@@ -964,14 +977,15 @@ private:
 
 
 		/******************************************************************************
-		write magnifications for minima, saddle, and combined maps
+		write magnifications for minima, saddle, and combined maps, streamed from
+		device memory
 		******************************************************************************/
 		if (write_maps)
 		{
 			print_verbose("Writing magnifications...\n", verbose, 2);
 
 			fname = outfile_prefix + "ipm_magnifications" + outfile_type;
-			if (!write_array<T>(pixels, num_pixels_y.im, num_pixels_y.re, fname))
+			if (!write_device_array<T>(d_pixels, num_pixels_y.im, num_pixels_y.re, fname))
 			{
 				std::cerr << "Error. Unable to write magnifications to file " << fname << "\n";
 				return false;
@@ -980,7 +994,7 @@ private:
 			if (write_parities)
 			{
 				fname = outfile_prefix + "ipm_magnifications_minima" + outfile_type;
-				if (!write_array<T>(pixels_minima, num_pixels_y.im, num_pixels_y.re, fname))
+				if (!write_device_array<T>(d_pixels_minima, num_pixels_y.im, num_pixels_y.re, fname))
 				{
 					std::cerr << "Error. Unable to write magnifications to file " << fname << "\n";
 					return false;
@@ -988,7 +1002,7 @@ private:
 				print_verbose("Done writing magnifications to file " << fname << "\n", verbose, 1);
 
 				fname = outfile_prefix + "ipm_magnifications_saddles" + outfile_type;
-				if (!write_array<T>(pixels_saddles, num_pixels_y.im, num_pixels_y.re, fname))
+				if (!write_device_array<T>(d_pixels_saddles, num_pixels_y.im, num_pixels_y.re, fname))
 				{
 					std::cerr << "Error. Unable to write magnifications to file " << fname << "\n";
 					return false;
@@ -998,6 +1012,33 @@ private:
 		}
 
 		return true;
+	}
+
+	bool copy_map(const T* d_map, T* dst, const char* name) const
+	{
+		if (d_map == nullptr || dst == nullptr) return false;
+		cudaMemcpy(dst, d_map, (1ULL * num_pixels_y.re * num_pixels_y.im) * sizeof(T), cudaMemcpyDeviceToHost);
+		return !cuda_error(name, false, __FILE__, __LINE__);
+	}
+
+	T* host_copy(const T* d_map, T*& h_map, const char* name)
+	{
+		if (h_map == nullptr && d_map != nullptr)
+		{
+			T* copy = new (std::nothrow) T[1ULL * num_pixels_y.re * num_pixels_y.im];
+			if (copy == nullptr)
+			{
+				std::cerr << "Error. Unable to allocate a host copy of a magnification map.\n";
+				return nullptr;
+			}
+			if (!copy_map(d_map, copy, name))
+			{
+				delete[] copy;
+				return nullptr;
+			}
+			h_map = copy;
+		}
+		return h_map;
 	}
 
 
@@ -1024,12 +1065,12 @@ public:
 	******************************************************************************/
 	IPM(const IPM& other) : Microlensing<T>(other)
 	{
-		pixels = nullptr;
-		pixels_minima = nullptr;
-		pixels_saddles = nullptr;
 		d_pixels = nullptr;
 		d_pixels_minima = nullptr;
 		d_pixels_saddles = nullptr;
+		h_pixels = nullptr;
+		h_pixels_minima = nullptr;
+		h_pixels_saddles = nullptr;
 		d_steps = nullptr;
 		d_clamp_count = nullptr;
 		d_clamp_total = nullptr;
@@ -1056,12 +1097,12 @@ public:
 
 		Microlensing<T>::operator=(other);
 
-		pixels = nullptr;
-		pixels_minima = nullptr;
-		pixels_saddles = nullptr;
 		d_pixels = nullptr;
 		d_pixels_minima = nullptr;
 		d_pixels_saddles = nullptr;
+		h_pixels = nullptr;
+		h_pixels_minima = nullptr;
+		h_pixels_saddles = nullptr;
 		d_steps = nullptr;
 		d_clamp_count = nullptr;
 		d_clamp_total = nullptr;
@@ -1081,25 +1122,6 @@ public:
 		return *this;
 	}
 
-	bool copy_maps_to_host(int verbose)
-	{
-		print_verbose("Copying magnification maps to host...\n", verbose, 2);
-		stopwatch.start();
-		const size_t pixel_bytes = (1ULL * num_pixels_y.re * num_pixels_y.im) * sizeof(T);
-		cudaMemcpy(pixels, d_pixels, pixel_bytes, cudaMemcpyDeviceToHost);
-		if (cuda_error("cudaMemcpy(*pixels)", false, __FILE__, __LINE__)) return false;
-		if (write_parities)
-		{
-			cudaMemcpy(pixels_minima, d_pixels_minima, pixel_bytes, cudaMemcpyDeviceToHost);
-			if (cuda_error("cudaMemcpy(*pixels_minima)", false, __FILE__, __LINE__)) return false;
-			cudaMemcpy(pixels_saddles, d_pixels_saddles, pixel_bytes, cudaMemcpyDeviceToHost);
-			if (cuda_error("cudaMemcpy(*pixels_saddles)", false, __FILE__, __LINE__)) return false;
-		}
-		t_elapsed = stopwatch.stop();
-		print_verbose("Done copying magnification maps to host. Elapsed time: " << t_elapsed << " seconds.\n", verbose, 2);
-		return true;
-	}
-
 	bool run(int verbose)
 	{
 		if (!Microlensing<T>::set_cuda_devices(verbose)) return false;
@@ -1112,7 +1134,6 @@ public:
 		if (!build_compact_tree(verbose)) return false;
 		if (!shoot_cells(verbose)) return false;
 		if (!create_histograms(verbose)) return false;
-		if (!copy_maps_to_host(verbose)) return false;
 
 		return true;
 	}
@@ -1124,9 +1145,23 @@ public:
 		return true;
 	}
 
-	T* get_pixels()				{return pixels;}
-	T* get_pixels_minima()		{return pixels_minima;}
-	T* get_pixels_saddles()		{return pixels_saddles;}
+	/******************************************************************************
+	copy a map (num_pixels_y.re * num_pixels_y.im values) from the device into
+	dst. false if the map does not exist (before run(), or the parity maps without
+	write_parities) or the copy fails
+	******************************************************************************/
+	bool copy_pixels(T* dst) const			{return copy_map(d_pixels, dst, "cudaMemcpy(*d_pixels)");}
+	bool copy_pixels_minima(T* dst) const	{return copy_map(d_pixels_minima, dst, "cudaMemcpy(*d_pixels_minima)");}
+	bool copy_pixels_saddles(T* dst) const	{return copy_map(d_pixels_saddles, dst, "cudaMemcpy(*d_pixels_saddles)");}
+
+	/******************************************************************************
+	a host copy of a map, made on the first call after run() and valid until the
+	next run() or the object's destruction. nullptr where copy_pixels*() would
+	return false, or if the host copy cannot be allocated
+	******************************************************************************/
+	T* get_pixels()				{return host_copy(d_pixels, h_pixels, "cudaMemcpy(*d_pixels)");}
+	T* get_pixels_minima()		{return host_copy(d_pixels_minima, h_pixels_minima, "cudaMemcpy(*d_pixels_minima)");}
+	T* get_pixels_saddles()		{return host_copy(d_pixels_saddles, h_pixels_saddles, "cudaMemcpy(*d_pixels_saddles)");}
 	double get_t_shoot_cells()	{return t_shoot_cells;}
 
 };
