@@ -125,8 +125,8 @@ private:
 	/******************************************************************************
 	dynamic memory
 	the maps live in plain device memory (cudaMalloc) for the life of the object;
-	run() does not copy them to the host. save() streams each map to its file
-	through two small pinned buffers (write_device_array), and copy_pixels*()
+	run() does not copy them to the host. save() streams the maps to their files
+	through one pair of small pinned buffers (a DeviceArrayWriter), and copy_pixels*()
 	copy a map straight into a caller's buffer (the Python wrapper passes its
 	numpy arrays). get_pixels*() fill a host copy (new T[]) on their first call
 	and return it afterwards; clear_memory() frees the copies, and run() calls
@@ -913,12 +913,21 @@ private:
 		{
 			print_verbose("Writing magnification histograms...\n", verbose, 2);
 
-			//the histograms are in device memory: each one is copied into h_hist before it is written
+			//the histograms are in device memory: each one is copied into h_hist before it is written.
+			//a failed allocation returns false: it must not throw through the C interface (save)
 			std::vector<int> h_hist;
 			auto copy_histogram = [&](const int* d_hist, int n)
 			{
 				if (d_hist == nullptr || n < 1) return false;
-				h_hist.resize(n);
+				try
+				{
+					h_hist.resize(n);
+				}
+				catch (const std::bad_alloc&)
+				{
+					std::cerr << "Error. Unable to allocate a host copy of a histogram.\n";
+					return false;
+				}
 				cudaMemcpy(h_hist.data(), d_hist, n * sizeof(int), cudaMemcpyDeviceToHost);
 				return !cuda_error("cudaMemcpy(*h_hist)", false, __FILE__, __LINE__);
 			};
@@ -978,14 +987,15 @@ private:
 
 		/******************************************************************************
 		write magnifications for minima, saddle, and combined maps, streamed from
-		device memory
+		device memory through one writer, so that they share its pinned buffers
 		******************************************************************************/
 		if (write_maps)
 		{
 			print_verbose("Writing magnifications...\n", verbose, 2);
+			DeviceArrayWriter<T> writer;
 
 			fname = outfile_prefix + "ipm_magnifications" + outfile_type;
-			if (!write_device_array<T>(d_pixels, num_pixels_y.im, num_pixels_y.re, fname))
+			if (!writer.write(d_pixels, num_pixels_y.im, num_pixels_y.re, fname))
 			{
 				std::cerr << "Error. Unable to write magnifications to file " << fname << "\n";
 				return false;
@@ -994,7 +1004,7 @@ private:
 			if (write_parities)
 			{
 				fname = outfile_prefix + "ipm_magnifications_minima" + outfile_type;
-				if (!write_device_array<T>(d_pixels_minima, num_pixels_y.im, num_pixels_y.re, fname))
+				if (!writer.write(d_pixels_minima, num_pixels_y.im, num_pixels_y.re, fname))
 				{
 					std::cerr << "Error. Unable to write magnifications to file " << fname << "\n";
 					return false;
@@ -1002,12 +1012,17 @@ private:
 				print_verbose("Done writing magnifications to file " << fname << "\n", verbose, 1);
 
 				fname = outfile_prefix + "ipm_magnifications_saddles" + outfile_type;
-				if (!write_device_array<T>(d_pixels_saddles, num_pixels_y.im, num_pixels_y.re, fname))
+				if (!writer.write(d_pixels_saddles, num_pixels_y.im, num_pixels_y.re, fname))
 				{
 					std::cerr << "Error. Unable to write magnifications to file " << fname << "\n";
 					return false;
 				}
 				print_verbose("Done writing magnifications to file " << fname << "\n", verbose, 1);
+			}
+			if (!writer.release())
+			{
+				std::cerr << "Error. CUDA error while releasing the buffers used to write the magnifications.\n";
+				return false;
 			}
 		}
 

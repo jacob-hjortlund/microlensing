@@ -14,10 +14,31 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <new>
 #include <sstream>
 #include <string>
 #include <unistd.h>
 #include <vector>
+
+// the global operator new, replaced so that a test can make large allocations fail: while fail_new_from is not 0,
+// an allocation of at least that many bytes throws std::bad_alloc and is counted in n_failed_new. host code only:
+// nvcc compiles an operator new for the device as well, hence the guard
+[[maybe_unused]] static size_t fail_new_from = 0;
+[[maybe_unused]] static long n_failed_new = 0;
+#ifndef __CUDA_ARCH__
+void* operator new(std::size_t n)
+{
+	if (fail_new_from != 0 && n >= fail_new_from)
+	{
+		n_failed_new++;
+		throw std::bad_alloc();
+	}
+	if (void* p = std::malloc(n ? n : 1)) return p;
+	throw std::bad_alloc();
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+#endif
 
 static int n_fail = 0;
 static void report(const std::string& name, bool ok, const std::string& detail = "")
@@ -273,6 +294,43 @@ static void save_streams_maps_and_histograms()
 	std::filesystem::remove_all(dir);
 }
 
+// a failed host allocation in save() (the copy of a histogram, the only allocation there above 64 KiB) makes it
+// return false rather than throw through the C interface, and a later save() works
+static void save_returns_false_on_a_failed_allocation()
+{
+	char tmpl[] = "/tmp/test_ipm_api_XXXXXX";
+	if (mkdtemp(tmpl) == nullptr)
+	{
+		report("save_returns_false_on_a_failed_allocation", false, "mkdtemp failed");
+		return;
+	}
+	const std::string dir = tmpl;
+	IPM<float> ipm;
+	configure(ipm, 1, 0);
+	ipm.write_histograms = 1;
+	ipm.outfile_prefix = dir + "/";
+	bool ran = ipm.run(0);
+	bool threw = false, saved = true;
+	n_failed_new = 0;
+	fail_new_from = 64 << 10;
+	try
+	{
+		saved = ipm.save(0);
+	}
+	catch (const std::bad_alloc&)
+	{
+		threw = true;
+	}
+	fail_new_from = 0;
+	bool again = ran && ipm.save(0);
+	bool opened;
+	read_histogram(dir + "/ipm_mags_numpixels.txt", opened);
+	report("save_returns_false_on_a_failed_allocation", ran && !threw && !saved && n_failed_new > 0 && again && opened,
+		!ran ? "run() returned false" : threw ? "std::bad_alloc escaped save()" : saved ? "save() returned true"
+		: n_failed_new == 0 ? "no allocation was made to fail" : !again ? "the later save() returned false" : "no histogram file");
+	std::filesystem::remove_all(dir);
+}
+
 int main()
 {
 	no_map_before_run();
@@ -285,6 +343,7 @@ int main()
 	copies_do_not_share_maps(ipm);
 	minima_without_parities_is_false(ipm);
 	save_streams_maps_and_histograms();
+	save_returns_false_on_a_failed_allocation();
 
 	std::printf("%s: %d failed\n", n_fail ? "FAILED" : "OK", n_fail);
 	return n_fail ? 1 : 0;

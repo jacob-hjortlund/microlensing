@@ -1,4 +1,4 @@
-// Tests for write_device_array (include/device_array_io.cuh).
+// Tests for DeviceArrayWriter and write_device_array (include/device_array_io.cuh).
 // Prints one "PASS <name>" or "FAIL <name>: <detail>" line per case.
 #include "array_functions.cuh"
 #include "device_array_io.cuh"
@@ -85,6 +85,102 @@ static void run(const char* tname, const std::string& dir)
 		std::remove(full.c_str());
 		report(std::string("dev_full_fails_cleanly_") + tname, linked && !multi && !single && after && cuda_clean,
 			!linked ? "symlink failed" : multi ? "mid-stream returned true" : single ? "small returned true" : !after ? "later call failed" : "stale CUDA error");
+		cudaFree(dd);
+	}
+
+	// several arrays through one writer: each file is byte-identical to write_array's. starting with the largest
+	// array, its two buffers serve all the later ones; starting with a small one, they are grown once
+	{
+		const std::vector<std::pair<int, int>> big_first = {{1000, 1001}, {3, 5}, {200, 300}, {1, 1}, {0, 7}, {1000, 1001}};
+		const std::vector<std::pair<int, int>> small_first = {{3, 5}, {1000, 1001}, {1, 1}, {200, 300}};
+		for (int seq = 0; seq < 2; seq++)
+		{
+			const auto& shapes = seq == 0 ? big_first : small_first;
+			DeviceArrayWriter<T> w(4096); // 4096-byte chunks: the large arrays take many
+			bool ok = true;
+			std::string detail;
+			for (size_t i = 0; i < shapes.size(); i++)
+			{
+				int nr = shapes[i].first, nc = shapes[i].second;
+				size_t n = static_cast<size_t>(nr) * nc;
+				std::vector<T> h(n);
+				for (size_t j = 0; j < n; j++) h[j] = static_cast<T>(j * 0.37 + i + 1.0);
+				T* d = nullptr;
+				if (n > 0)
+				{
+					cudaMalloc(&d, n * sizeof(T));
+					cudaMemcpy(d, h.data(), n * sizeof(T), cudaMemcpyHostToDevice);
+				}
+				std::string fa = dir + "/seq_a.bin", fb = dir + "/seq_b.bin";
+				bool ok1 = write_array<T>(h.data(), nr, nc, fa);
+				bool ok2 = w.write(d, nr, nc, fb);
+				if (!(ok1 && ok2 && slurp(fa) == slurp(fb)))
+				{
+					ok = false;
+					detail += "array " + std::to_string(i) + " (" + std::to_string(nr) + "x" + std::to_string(nc) + ")"
+						+ (ok2 ? " bytes differ; " : " write returned false; ");
+				}
+				cudaFree(d);
+			}
+			const int want = seq == 0 ? 2 : 3; // two buffers, plus the single one of the 3x5 array that was outgrown
+			if (w.allocations() != want)
+			{
+				ok = false;
+				detail += std::to_string(w.allocations()) + " pinned allocations, want " + std::to_string(want) + "; ";
+			}
+			bool released = w.release();
+			report(std::string("writer_sequence_matches_write_array_") + (seq == 0 ? "big_first_" : "small_first_") + tname,
+				ok && released && cudaGetLastError() == cudaSuccess, released ? detail : detail + "release failed");
+		}
+	}
+
+	// a failed file in the middle of a sequence leaves the writer usable, with the same buffers
+	{
+		std::string full = dir + "/full_seq.bin";
+		std::remove(full.c_str());
+		bool linked = symlink("/dev/full", full.c_str()) == 0;
+		const int nr = 1024, nc = 1024;
+		size_t n = static_cast<size_t>(nr) * nc;
+		std::vector<T> h(n);
+		for (size_t j = 0; j < n; j++) h[j] = static_cast<T>(j * 0.11 + 2.0);
+		T* dd = nullptr;
+		cudaMalloc(&dd, n * sizeof(T));
+		cudaMemcpy(dd, h.data(), n * sizeof(T), cudaMemcpyHostToDevice);
+		DeviceArrayWriter<T> w(4096);
+		std::string fa = dir + "/seq_ref.bin", f1 = dir + "/seq_1.bin", f2 = dir + "/seq_2.bin", f3 = dir + "/seq_3.bin";
+		bool ref = write_array<T>(h.data(), nr, nc, fa);
+		bool first = w.write(dd, nr, nc, f1);
+		bool multi = w.write(dd, nr, nc, full);   // many chunks, fails mid-stream
+		bool second = w.write(dd, nr, nc, f2);
+		bool single = w.write(dd, 4, 4, full);    // fails at flush/close
+		bool third = w.write(dd, nr, nc, f3);
+		bool same = ref && slurp(f1) == slurp(fa) && slurp(f2) == slurp(fa) && slurp(f3) == slurp(fa);
+		bool cuda_clean = cudaGetLastError() == cudaSuccess;
+		int allocs = w.allocations();
+		std::remove(full.c_str());
+		report(std::string("writer_survives_a_failed_file_") + tname,
+			linked && first && !multi && second && !single && third && same && cuda_clean && allocs == 2,
+			!linked ? "symlink failed" : multi ? "mid-stream returned true" : single ? "small returned true"
+			: !(first && second && third) ? "a good write returned false" : !same ? "bytes differ"
+			: !cuda_clean ? "stale CUDA error" : std::to_string(allocs) + " pinned allocations, want 2");
+		cudaFree(dd);
+	}
+
+	// a pending error fails one write of a writer, and the next write works
+	{
+		T* dd = nullptr;
+		cudaMalloc(&dd, 16 * sizeof(T));
+		cudaMemset(dd, 0, 16 * sizeof(T));
+		DeviceArrayWriter<T> w(64);
+		std::string f = dir + "/pending_w.bin";
+		bool before = w.write(dd, 4, 4, f);
+		std::remove(f.c_str());
+		cudaMemcpy(dd, dd, 16 * sizeof(T), (cudaMemcpyKind)12345); // invalid, non-sticky error
+		bool r = w.write(dd, 4, 4, f);
+		bool exists = std::filesystem::exists(f);
+		bool again = w.write(dd, 4, 4, f) && slurp(f).size() == 8 + 16 * sizeof(T);
+		report(std::string("writer_pending_error_fails_one_write_") + tname, before && !r && !exists && again,
+			!before ? "first write failed" : r ? "returned true" : exists ? "file written" : "retry failed");
 		cudaFree(dd);
 	}
 
