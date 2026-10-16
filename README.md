@@ -59,7 +59,7 @@ I'll note that this repository contains the libraries precompiled and placed in 
 
 ## python
 
-In addition to command line programs, we also provide wrappers for our code that allow them to be used with python once the relevant libraries are [compiled](#compiling). This eases the need to save output from the executables to disk and then read them from disk; the maps stay in device memory, and we copy each one from device memory directly into a numpy array once it is created (the executables stream maps to files through two small pinned host buffers). 
+In addition to command line programs, we also provide wrappers for our code that allow them to be used with python once the relevant libraries are [compiled](#compiling). This eases the need to save output from the executables to disk and then read them from disk: for IPM the magnification maps stay in device memory and each one is copied directly into a numpy array once it is created (the IPM executable streams them to files through two small pinned host buffers), while CCF, NCC and MIF, and IPM with the Windows libraries included here, copy from managed memory to a numpy array. 
 
 If you just want the python capabilities (as I suspect is the case for most people currently) and do not wish to use the executables or contribute to the code, then instead of cloning this repository you can `pip install microlensing` (PyPI page  located [here](https://pypi.org/project/microlensing/)). The python package includes precompiled libraries as mentioned [above](#compiling), which may or may not work for you. We hope to expand to cover more architectures in the future. If the included libraries do not work, you will have to clone this repository, compile them yourself, and do a local `pip install` instead.
 
