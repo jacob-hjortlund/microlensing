@@ -59,6 +59,13 @@ public:
 	int write_parities = 0;
 	int write_histograms = 1;
 
+	/******************************************************************************
+	test-only hook: when set, every triangle takes the direct deposit, as when the
+	step buffers of the perimeter deposit do not fit. not reachable from the
+	command line or the Python wrapper; tests/gpu/ipm_force_direct.cu sets it
+	******************************************************************************/
+	static inline bool testing_force_direct_deposit = false;
+
 
 private:
 	//must include microlensing variables to put them into scope since class is a template
@@ -128,6 +135,14 @@ private:
 	T* d_pixels_saddles = nullptr; //device
 
 	/******************************************************************************
+	step buffer of the perimeter deposit and the clamp statistics of its row sums
+	(device; allocated and freed within shoot_cells)
+	******************************************************************************/
+	T* d_steps = nullptr;
+	unsigned long long* d_clamp_count = nullptr;
+	double* d_clamp_total = nullptr;
+
+	/******************************************************************************
 	compact tree for the shooting kernel (device)
 	******************************************************************************/
 	ipm_leaf::LeafRecord<T>* leaves = nullptr;
@@ -152,6 +167,23 @@ private:
 	int* log_histogram_saddles = nullptr;
 
 
+
+	bool free_step_buffers(bool return_on_error = true)
+	{
+		cudaFree(d_steps);
+		if (return_on_error && cuda_error("cudaFree(*d_steps)", false, __FILE__, __LINE__)) return false;
+		d_steps = nullptr;
+
+		cudaFree(d_clamp_count);
+		if (return_on_error && cuda_error("cudaFree(*d_clamp_count)", false, __FILE__, __LINE__)) return false;
+		d_clamp_count = nullptr;
+
+		cudaFree(d_clamp_total);
+		if (return_on_error && cuda_error("cudaFree(*d_clamp_total)", false, __FILE__, __LINE__)) return false;
+		d_clamp_total = nullptr;
+
+		return true;
+	}
 
 	//optional return or not, so memory can be cleared in destructor without error checking
 	bool clear_memory(int verbose, bool return_on_error = true)
@@ -187,6 +219,8 @@ private:
 		cudaFree(d_pixels_saddles);
 		if (return_on_error && cuda_error("cudaFree(*d_pixels_saddles)", false, __FILE__, __LINE__)) return false;
 		d_pixels_saddles = nullptr;
+
+		if (!free_step_buffers(return_on_error)) return false;
 
 		cudaFree(leaves);
 		if (return_on_error && cuda_error("cudaFree(*leaves)", false, __FILE__, __LINE__)) return false;
@@ -517,7 +551,87 @@ private:
 		ipm_fast::SmoothConst<T> smooth_const = ipm_fast::make_smooth_const<T>(corner);
 
 		/******************************************************************************
-		shoot rays and calculate time taken in seconds
+		step buffers of the perimeter deposit (see tri_cov::allocate_triangle):
+		triangles whose clamped bounding box has more than EDGE_MIN_BBOX pixels
+		deposit values along their edges into the map and steps into a step buffer
+		of the map's size; after the kernel the row-wise prefix sum of the steps is
+		added to the map. the steps follow the triangle's parity. with parities the
+		total map d_pixels is not written before minima + saddles are summed below,
+		and that sum overwrites it, so d_pixels holds the minima's steps and one
+		extra buffer suffices with or without parities.
+
+		if the buffer does not fit into free device memory with a margin, every
+		triangle takes the direct deposit. both deposits are exact, so the map is
+		the same up to rounding either way
+		******************************************************************************/
+		constexpr size_t MiB = 1ULL << 20;
+		const size_t pixel_bytes = (1ULL * num_pixels_y.re * num_pixels_y.im) * sizeof(T);
+		const int num_step_buffers = 1; //with parities, d_pixels is the second
+		long long edge_min_bbox = LLONG_MAX;
+		T* steps_min = nullptr;
+		T* steps_sad = nullptr;
+		T* steps = nullptr;
+		if (testing_force_direct_deposit)
+		{
+			print_verbose("Perimeter deposit disabled for testing.\n", verbose, 2);
+		}
+		else
+		{
+			size_t free_bytes = 0;
+			size_t total_bytes = 0;
+			cudaMemGetInfo(&free_bytes, &total_bytes);
+			if (cuda_error("cudaMemGetInfo", false, __FILE__, __LINE__)) return false;
+			const size_t need = num_step_buffers * pixel_bytes + 64 * MiB;
+			bool fits = need <= free_bytes;
+			if (fits)
+			{
+				//another process can take the memory after the check: a failed allocation also falls back
+				if (cudaMalloc(&d_steps, pixel_bytes) == cudaErrorMemoryAllocation)
+				{
+					cudaGetLastError(); //clears the (not sticky) allocation error
+					d_steps = nullptr;
+					fits = false;
+				}
+				else if (cuda_error("cudaMalloc(*d_steps)", false, __FILE__, __LINE__)) return false;
+			}
+			if (!fits)
+			{
+				print_verbose("Perimeter deposit disabled: step buffers need " << (need + MiB - 1) / MiB << " MiB, "
+					<< free_bytes / MiB << " MiB free.\n", verbose, 2);
+			}
+			else
+			{
+				cudaMalloc(&d_clamp_count, sizeof(unsigned long long));
+				if (cuda_error("cudaMalloc(*d_clamp_count)", false, __FILE__, __LINE__)) return false;
+				cudaMalloc(&d_clamp_total, sizeof(double));
+				if (cuda_error("cudaMalloc(*d_clamp_total)", false, __FILE__, __LINE__)) return false;
+				cudaMemset(d_clamp_count, 0, sizeof(unsigned long long));
+				if (cuda_error("cudaMemset(*d_clamp_count)", false, __FILE__, __LINE__)) return false;
+				cudaMemset(d_clamp_total, 0, sizeof(double));
+				if (cuda_error("cudaMemset(*d_clamp_total)", false, __FILE__, __LINE__)) return false;
+				cudaMemset(d_steps, 0, pixel_bytes);
+				if (cuda_error("cudaMemset(*d_steps)", false, __FILE__, __LINE__)) return false;
+				if (write_parities)
+				{
+					cudaMemset(d_pixels, 0, pixel_bytes);
+					if (cuda_error("cudaMemset(*d_pixels)", false, __FILE__, __LINE__)) return false;
+					steps_min = d_pixels;
+					steps_sad = d_steps;
+				}
+				else
+				{
+					steps = d_steps;
+				}
+				//the memsets must not run into the timed region
+				if (cuda_error("cudaDeviceSynchronize", true, __FILE__, __LINE__)) return false;
+				edge_min_bbox = ipm_fast::EDGE_MIN_BBOX;
+				print_verbose("Perimeter deposit for bounding boxes above " << ipm_fast::EDGE_MIN_BBOX << " pixels.\n", verbose, 2);
+			}
+		}
+
+		/******************************************************************************
+		shoot rays and calculate time taken in seconds (including the row sums of
+		the perimeter deposit)
 		******************************************************************************/
 		print_verbose("Shooting cells...\n", verbose, 1);
 		stopwatch.start();
@@ -526,10 +640,39 @@ private:
 			leaves, leaf_coef_re, leaf_coef_im, expansion_order + 1, direct_stars,
 			rectangular, corner, approx, taylor_smooth, smooth_const,
 			ray_half_sep, num_ray_threads, center_x, half_length_x,
-			center_y, half_length_y, d_pixels_minima, d_pixels_saddles, d_pixels, num_pixels_y, percentage, verbose);
+			center_y, half_length_y, d_pixels_minima, d_pixels_saddles, d_pixels, num_pixels_y,
+			steps_min, steps_sad, steps, edge_min_bbox, percentage, verbose);
 		if (cuda_error("shoot_cells_tiled_kernel", true, __FILE__, __LINE__)) return false;
+		if (d_steps != nullptr)
+		{
+			const unsigned int row_blocks = static_cast<unsigned int>(
+				(1LL * num_pixels_y.im * 32 + ipm_fast::ROW_PREFIX_BLOCK - 1) / ipm_fast::ROW_PREFIX_BLOCK); //one warp per row
+			if (write_parities)
+			{
+				ipm_fast::add_row_prefix_kernel<T> <<<row_blocks, ipm_fast::ROW_PREFIX_BLOCK>>> (d_pixels_minima, steps_min, num_pixels_y, d_clamp_count, d_clamp_total);
+				if (cuda_error("add_row_prefix_kernel", false, __FILE__, __LINE__)) return false;
+				ipm_fast::add_row_prefix_kernel<T> <<<row_blocks, ipm_fast::ROW_PREFIX_BLOCK>>> (d_pixels_saddles, steps_sad, num_pixels_y, d_clamp_count, d_clamp_total);
+			}
+			else
+			{
+				ipm_fast::add_row_prefix_kernel<T> <<<row_blocks, ipm_fast::ROW_PREFIX_BLOCK>>> (d_pixels, steps, num_pixels_y, d_clamp_count, d_clamp_total);
+			}
+			if (cuda_error("add_row_prefix_kernel", true, __FILE__, __LINE__)) return false;
+		}
 		t_shoot_cells = stopwatch.stop();
 		print_verbose("\nDone shooting cells. Elapsed time: " << t_shoot_cells << " seconds.\n", verbose, 1);
+
+		if (d_steps != nullptr)
+		{
+			unsigned long long n_clamped = 0;
+			double clamped_total = 0;
+			cudaMemcpy(&n_clamped, d_clamp_count, sizeof(unsigned long long), cudaMemcpyDeviceToHost);
+			if (cuda_error("cudaMemcpy(*d_clamp_count)", false, __FILE__, __LINE__)) return false;
+			cudaMemcpy(&clamped_total, d_clamp_total, sizeof(double), cudaMemcpyDeviceToHost);
+			if (cuda_error("cudaMemcpy(*d_clamp_total)", false, __FILE__, __LINE__)) return false;
+			if (!free_step_buffers()) return false;
+			print_verbose("Row sums clamped " << n_clamped << " pixels, total " << clamped_total << ".\n", verbose, 2);
+		}
 
 		cudaFree(percentage);
 		if (cuda_error("cudaFree(*percentage)", false, __FILE__, __LINE__)) return false;
@@ -889,6 +1032,9 @@ public:
 		d_pixels = nullptr;
 		d_pixels_minima = nullptr;
 		d_pixels_saddles = nullptr;
+		d_steps = nullptr;
+		d_clamp_count = nullptr;
+		d_clamp_total = nullptr;
 		leaves = nullptr;
 		leaf_coef_re = nullptr;
 		leaf_coef_im = nullptr;
@@ -918,6 +1064,9 @@ public:
 		d_pixels = nullptr;
 		d_pixels_minima = nullptr;
 		d_pixels_saddles = nullptr;
+		d_steps = nullptr;
+		d_clamp_count = nullptr;
+		d_clamp_total = nullptr;
 		leaves = nullptr;
 		leaf_coef_re = nullptr;
 		leaf_coef_im = nullptr;

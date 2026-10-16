@@ -176,8 +176,9 @@ def _as_text(data):
 
 
 def run_ipm(exe, args, outdir, verbose=1, sample_gpu=False, expect_map=True, timeout=None, env=None,
-            sample_host=False):
-    """Run one IPM executable with `-v <verbose> -o <outdir>/`; wall time covers process start to exit."""
+            sample_host=False, keep_stdout=False):
+    """Run one IPM executable with `-v <verbose> -o <outdir>/`; wall time covers process start to exit.
+    keep_stdout=True adds the whole standard output as record["stdout"] (stdout_tail keeps only its last 2000 characters)."""
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     for old in outdir.glob("ipm_*"):
@@ -214,6 +215,8 @@ def run_ipm(exe, args, outdir, verbose=1, sample_gpu=False, expect_map=True, tim
               "returncode": returncode, "wall_s": wall, "t_shoot_cells": None, "param_info": {},
               "peak_gpu_mem_mib": peak, "peak_host_mem_mib": peak_host, "stdout_tail": stdout[-2000:], "stderr_tail": stderr[-2000:],
               "ok": False, "error": None}
+    if keep_stdout:
+        record["stdout"] = stdout
     param_path = outdir / "ipm_parameter_info.txt"
     if start_error is not None:
         record["error"] = start_error
