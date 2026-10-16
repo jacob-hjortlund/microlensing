@@ -4,7 +4,9 @@
 Run with PYTHONPATH=<build>/pyroot so that microlensing.IPM loads the rung's libraries:
     PYTHONPATH=$IPM_BENCH_ROOT/builds/R5/pyroot python tests/gpu/python_check.py --build $IPM_BENCH_ROOT/builds/R5 --rung R5
 A double configuration is judged by both parts of the double rule (see regress.py): a second run with the shifted centre
-against R0's shift1 reference, and the real run against run1. run() wall time includes the get_pixels() copies into numpy that the wrapper performs.
+against R0's shift1 reference, and the real run against run1. run() wall time includes the copy of each map into numpy that
+the wrapper performs. Each configuration gets one untimed warm-up run first (spec section 7); it is not in "runs", and the
+verdict is made on the first timed run.
 """
 import argparse
 import gc
@@ -92,6 +94,27 @@ def save_check(ipm, save_dir):
         shutil.rmtree(save_dir, ignore_errors=True)
 
 
+def load_wrapper(build):
+    """Import the Python wrapper; returns (IPM class, [float library, double library]), or (None, message) when the
+    libraries it loaded are not the build's."""
+    from microlensing.IPM.ipm import IPM
+    import microlensing.IPM.lib_ipm as lib_f
+    import microlensing.IPM.lib_ipm_double as lib_d
+    pyroot = str(Path(build).resolve() / "pyroot")
+    for lib in (lib_f.lib, lib_d.lib):
+        if not str(lib._name).startswith(pyroot):
+            return None, f"wrong library loaded: {lib._name}; run with PYTHONPATH={pyroot}"
+    return IPM, [str(lib_f.lib._name), str(lib_d.lib._name)]
+
+
+def warm_up(IPM, kw):
+    """One untimed run with the configuration's keywords, so that the first timed repeat is not a cold one."""
+    ipm = IPM(verbose=0, random_seed=int(cf.SEED), **kw)
+    ipm.run()
+    del ipm
+    gc.collect()
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--build", required=True)
@@ -107,22 +130,19 @@ def main(argv=None):
     if problem is not None:
         print(problem, file=sys.stderr)
         return 2
-    from microlensing.IPM.ipm import IPM
-    import microlensing.IPM.lib_ipm as lib_f
-    import microlensing.IPM.lib_ipm_double as lib_d
-    pyroot = str(Path(a.build).resolve() / "pyroot")
-    for lib in (lib_f.lib, lib_d.lib):
-        if not str(lib._name).startswith(pyroot):
-            print(f"wrong library loaded: {lib._name}; run with PYTHONPATH={pyroot}")
-            return 2
+    IPM, libraries = load_wrapper(a.build)
+    if IPM is None:
+        print(libraries)
+        return 2
     tol = cm.load_tolerances(a.tolerances)
     out = {"rung": a.rung, "env": bl.environment_info(), "build": bl.build_meta(a.build),
-           "libraries": [str(lib_f.lib._name), str(lib_d.lib._name)], "configs": {}, "pass": True}
+           "libraries": libraries, "warmup": True, "configs": {}, "pass": True}
     for name in names:
         kw = KW[name]
         cfg = cf.CONFIGS[name]
         runs = []
         entry = {}
+        warm_up(IPM, kw)
         for k in range(a.repeats):
             save_dir = tempfile.mkdtemp(prefix="python_check_") if (k == 0 and name == "nb_f") else None
             extra = dict(write_maps=True, outfile_prefix=save_dir + "/") if save_dir else {}

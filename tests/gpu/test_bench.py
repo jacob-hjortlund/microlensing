@@ -751,6 +751,18 @@ class MakeReferenceTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(make_reference.main(argv + ["--only", "nb_f"]), 2)   # float configurations have no shift run
 
+    def test_results_is_required(self):
+        with tempfile.TemporaryDirectory() as d:
+            build = fake_build_dir(Path(d) / "build")
+            for extra in ([], ["--shift"]):
+                with self.subTest(extra=extra):
+                    argv = ["--only", "nb_d", "--build", str(build), "--ref-root", f"{d}/ref", "--scratch", f"{d}/scratch"]
+                    with mock.patch.object(bench_lib, "run_ipm") as spy, contextlib.redirect_stderr(io.StringIO()) as err, \
+                            self.assertRaises(SystemExit):
+                        make_reference.main(argv + extra)
+                    self.assertIn("--results", err.getvalue())
+                    spy.assert_not_called()
+
     def test_failed_run_returns_nonzero(self):
         with tempfile.TemporaryDirectory() as d:
             build = fake_build_dir(Path(d) / "build")
@@ -959,6 +971,9 @@ class RegressTests(unittest.TestCase):
             self.assertEqual([("run_shift" in c) for c in out["configs"]], [False, True, False, False])
             nb_d = out["configs"][1]
             self.assertEqual(set(nb_d["run_shift"]), set(nb_d["run"]))
+            self.assertEqual(out["configs"][0]["run"]["exe"], str(build / "ipm_gpu"))
+            self.assertEqual(nb_d["run"]["exe"], str(build / "ipm_gpu_double"))
+            self.assertEqual(nb_d["run_shift"]["exe"], str(build / "ipm_gpu_double"))
             self.assertIn("vs_r0_shift", nb_d["maps"]["pixels"])
             self.assertIn("double_actual", out["tolerances"])
             self.assertFalse((Path(d) / "scratch" / "nb_d_shift").exists())
@@ -1565,6 +1580,7 @@ class TimingTests(unittest.TestCase):
             order = [(r["repeat"], r["rung"], r["config"]) for r in out["records"]]
             self.assertEqual(order[:5], [(1, "R0", "nb_f"), (1, "R0", "nb_d"), (1, "R0", "rect_f"), (1, "R0", "hm100_f"), (1, "R2p", "nb_d")])
             self.assertEqual(len(out["records"]), 2 * (4 + 1 + 4))
+            self.assertEqual(out["set"], "ladder")
             self.assertEqual(out["summary"]["R2p"]["nb_d"]["n"], 2)
             self.assertNotIn("nb_f", out["summary"]["R2p"])
             # resume: drop the last record and rerun; only that record is re-measured (one run_ipm call)
@@ -1587,9 +1603,28 @@ class TimingTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(time_ladder.main(argv), 0)
             out = bench_lib.read_json(out_path)
+            self.assertEqual(out["set"], "full")
             full = {c.name for c in configs.configs_in("full")}
             for rung in ("R0", "R2p"):
                 self.assertEqual({r["config"] for r in out["records"] if r["rung"] == rung}, full)
+            # a file of another set is not resumed into
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                self.assertEqual(time_ladder.main([x if x != "full" else "ladder" for x in argv]), 2)
+            self.assertIn("holds the full set", err.getvalue())
+            self.assertEqual(bench_lib.read_json(out_path), out)
+
+    def test_time_ladder_requires_out(self):
+        with tempfile.TemporaryDirectory() as d:
+            builds = Path(d) / "builds"
+            fake_build_dir(builds / "R0")
+            argv = ["--rungs", "R0", "--builds-root", str(builds), "--repeats", "1",
+                    "--ref-root", f"{d}/ref", "--scratch", f"{d}/scratch", "--no-warmup"]
+            with mock.patch.object(bench_lib, "run_ipm") as spy, contextlib.redirect_stderr(io.StringIO()) as err, \
+                    self.assertRaises(SystemExit):
+                time_ladder.main(argv)
+            self.assertIn("--out", err.getvalue())
+            spy.assert_not_called()
 
     def test_time_ladder_replaces_a_failed_record(self):
         with tempfile.TemporaryDirectory() as d:
@@ -1725,6 +1760,55 @@ class PythonCheckDoubleTests(unittest.TestCase):
             self.assertTrue(any(f.startswith("vs_r0: max=") for f in v["flags"]), v["flags"])
             with self.assertRaises(FileNotFoundError):
                 python_check.judge_double(good, good, f"{d}/ref", "rect_d", tol)
+
+
+class PythonCheckWarmupTests(unittest.TestCase):
+    def test_each_configuration_gets_one_untimed_warm_up_that_is_not_in_runs_or_judged(self):
+        with tempfile.TemporaryDirectory() as d:
+            ref = f"{d}/ref"
+            calibration_tree(ref)
+            good = {name: bench_lib.read_map(map_path(ref, name, 1, "pixels")) for name in ("hm100_f", "nb_d")}
+            tol = compare_maps.default_tolerances()
+            truth = bench_lib.read_map(map_path(ref, "hm100_d", 1, "pixels"))
+            tol["float_truth_error"]["hm100_f"] = {"pixels": compare_maps.map_metrics(good["hm100_f"], truth)}
+            bench_lib.write_json(Path(d) / "tolerances.json", tol)
+            calls = []   # (keywords, map) of every run(), in order
+
+            class FakeIPM:
+                """Counts run() calls. The first run of each configuration (the warm-up) returns a map that fails the
+                check, so a verdict that passes was made on a later run."""
+
+                def __init__(self, **kw):
+                    self.kw = kw
+
+                def run(self):
+                    name = "nb_d" if self.kw.get("is_double") else "hm100_f"
+                    warm = not any(c[1] == name for c in calls)
+                    calls.append((self.kw, name))
+                    self.t_shoot_cells = float(len(calls))
+                    self.magnifications = good[name] * (100.0 if warm else 1.0)
+
+            argv = ["--build", f"{d}/build", "--rung", "A4", "--only", "hm100_f", "nb_d", "--repeats", "2",
+                    "--ref-root", ref, "--tolerances", f"{d}/tolerances.json", "--results", f"{d}/results"]
+            with mock.patch.object(python_check, "load_wrapper", return_value=(FakeIPM, ["f.so", "d.so"])), \
+                    mock.patch.object(bench_lib, "check_gpu_allocation", return_value=None), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                rc = python_check.main(argv)
+            out = bench_lib.read_json(Path(d) / "results" / "python.json")
+            self.assertEqual(rc, 0, out["configs"])
+            self.assertIs(out["warmup"], True)
+            seed = int(configs.SEED)
+            hm, nb = python_check.KW["hm100_f"], python_check.KW["nb_d"]
+            # hm100_f: warm-up, two timed runs; nb_d: warm-up, the first timed run and its shifted run, the second timed run
+            self.assertEqual([c[1] for c in calls], ["hm100_f"] * 3 + ["nb_d"] * 4)
+            self.assertEqual(calls[0][0], {"verbose": 0, "random_seed": seed, **hm})
+            self.assertEqual(calls[3][0], {"verbose": 0, "random_seed": seed, **nb})
+            self.assertEqual([c[0] for c in calls[:3]], [calls[0][0]] * 3)
+            self.assertEqual([r["t_shoot_cells"] for r in out["configs"]["hm100_f"]["runs"]], [2.0, 3.0])
+            self.assertEqual([r["t_shoot_cells"] for r in out["configs"]["nb_d"]["runs"]], [5.0, 7.0])
+            self.assertEqual(out["configs"]["nb_d"]["shift_run"]["t_shoot_cells"], 6.0)
+            for name in ("hm100_f", "nb_d"):
+                self.assertTrue(out["configs"][name]["verdict"]["pass"], out["configs"][name]["verdict"])
 
 
 import a2_checks  # noqa: E402
@@ -1949,6 +2033,8 @@ class ReportTests(unittest.TestCase):
             text = out.read_text()
             self.assertIn("| R5 | 2.000 | 5.00 | 5.00 |", text)
             self.assertIn("A100", text)
+            self.assertIn("## Python wrapper: run() including the copy into numpy\n", text)
+            self.assertNotIn("get_pixels", text)
 
 
 import report_round2  # noqa: E402
@@ -1978,6 +2064,13 @@ class ReportRound2Tests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(report_round2.main(["--results", str(root), "--out", str(out)]), 0)
         return out.read_text()
+
+    def test_python_heading_names_the_copy_into_numpy(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.write_inputs(Path(d))
+            text = self.render(d)
+        self.assertIn("## Python wrapper: run() including the copy into numpy\n", text)
+        self.assertNotIn("get_pixels", text)
 
     def test_flags_a_slowdown_over_three_percent(self):
         self.assertTrue(report_round2.is_slow(1.00, 1.031))

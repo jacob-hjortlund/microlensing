@@ -154,9 +154,9 @@ def main(argv=None):
             except Exception as exc:   # recorded as a failure so the remaining configurations still run
                 res = {"config": cfg.name, "build": cfg.build, "rung": a.rung, "pass": False,
                        "failures": [f"check failed: {type(exc).__name__}: {exc}"], "flags": [], "maps": {}}
-        res["run"] = {k: rec[k] for k in ("wall_s", "t_shoot_cells", "returncode", "stderr_tail")}
+        res["run"] = {k: rec[k] for k in ("exe", "wall_s", "t_shoot_cells", "returncode", "stderr_tail")}
         if rec_shift is not None:
-            res["run_shift"] = {k: rec_shift[k] for k in ("wall_s", "t_shoot_cells", "returncode", "stderr_tail")}
+            res["run_shift"] = {k: rec_shift[k] for k in ("exe", "wall_s", "t_shoot_cells", "returncode", "stderr_tail")}
         out["configs"].append(res)
         out["pass"] = out["pass"] and res["pass"]
         print(f"{'PASS' if res['pass'] else 'FAIL':4s} {cfg.name:12s} {summarize(res)}", flush=True)

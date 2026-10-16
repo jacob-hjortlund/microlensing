@@ -92,7 +92,8 @@ def main(argv=None):
     ap.add_argument("--build", default=str(bl.BENCH_ROOT / "builds" / "R0"))
     ap.add_argument("--ref-root", default=str(bl.BENCH_ROOT / "ref"))
     ap.add_argument("--scratch", default=str(bl.SCRATCH / "ref"))
-    ap.add_argument("--results", default=str(bl.BENCH_ROOT / "results" / "R0"))
+    ap.add_argument("--results", required=True,
+                    help="directory for timing_full.json or shift_runs.json (round 1's references: results/R0)")
     ap.add_argument("--only", nargs="*", help="configuration names (default: every full and truth configuration)")
     ap.add_argument("--shift", action="store_true",
                     help="instead of the matrix, run the double regression configurations with the shifted centre into ref/<config>/shift1")
