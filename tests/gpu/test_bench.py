@@ -1951,6 +1951,63 @@ class ReportTests(unittest.TestCase):
             self.assertIn("A100", text)
 
 
+import report_round2  # noqa: E402
+
+
+class ReportRound2Tests(unittest.TestCase):
+    ENV = {"gpu": "A100", "hostname": "h", "nvcc": "x"}
+
+    @staticmethod
+    def rec(rung, cfg, t, w):
+        return {"rung": rung, "config": cfg, "repeat": 1, "ok": True, "t_shoot_cells": t, "wall_s": w}
+
+    def write_inputs(self, root, a1_wall=1.0):
+        rec, env = self.rec, self.ENV
+        r1 = lambda gpu, job: {**env, "cuda_visible_devices": gpu, "slurm_job_id": job}
+        bench_lib.write_json(root / "final" / "timing_ladder.json", {
+            "env": r1("4", "906277"), "records": [rec("final", "nb_f", 0.200, 0.9)]})
+        bench_lib.write_json(root / "R5" / "timing_full.json", {
+            "env": r1("4", "906277"), "records": [rec("R5", "nb_f", 0.200, 0.9)]})
+        recs = [rec("base", "nb_f", 0.300, 1.00), rec("A1", "nb_f", 0.150, a1_wall)]
+        bench_lib.write_json(root / "round2" / "ladder_interleaved.json", {
+            "env": r1("0", "906674"), "rungs": ["base", "A1"], "records": recs,
+            "summary": {"base": time_rung.summarize(recs[:1]), "A1": time_rung.summarize(recs[1:])}})
+
+    def render(self, root):
+        out = Path(root) / "tables.md"
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(report_round2.main(["--results", str(root), "--out", str(out)]), 0)
+        return out.read_text()
+
+    def test_flags_a_slowdown_over_three_percent(self):
+        self.assertTrue(report_round2.is_slow(1.00, 1.031))
+        self.assertFalse(report_round2.is_slow(1.00, 1.029))
+        for wall, flagged in ((1.031, True), (1.029, False)):
+            with tempfile.TemporaryDirectory() as d:
+                self.write_inputs(Path(d), a1_wall=wall)
+                text = self.render(d)
+                self.assertEqual(f"{wall:.3f} ⚠" in text, flagged, text)
+                self.assertEqual("Ladder wall, A1, nb_f" in text, flagged)
+
+    def test_kernel_base_comes_from_round1_and_wall_from_round2(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.write_inputs(Path(d))
+            text = self.render(d)
+            kernel, wall = text.split("median end-to-end wall time")[0], text.split("median end-to-end wall time")[1]
+            self.assertIn("| base | 0.200 |", kernel)       # round 1's value, not round 2's 0.300
+            self.assertNotIn("| base | 0.300 |", kernel)
+            self.assertIn("| base | 1.000 |", wall)         # round 2's value, not round 1's 0.9
+            self.assertIn("GPU 4, job 906277", kernel)
+            self.assertIn("GPU 0, job 906674", kernel)
+
+    def test_missing_inputs_are_dashes_with_a_note(self):
+        with tempfile.TemporaryDirectory() as d:
+            text = self.render(d)
+            self.assertIn("## Missing inputs", text)
+            self.assertIn("- round2/full_interleaved.json", text)
+            self.assertIn("| base | – |", text)
+
+
 import ctypes  # noqa: E402
 import importlib  # noqa: E402
 import types  # noqa: E402
