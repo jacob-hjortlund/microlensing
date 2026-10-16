@@ -1677,6 +1677,15 @@ class PythonCheckTests(unittest.TestCase):
             self.assertEqual(kw["half_length_y2"], float(args["-hly2"]), name)
             self.assertEqual(kw.get("is_double", False), cfg.build == "double", name)
             self.assertEqual(kw.get("rectangular", False), args.get("-r", "0") == "1", name)
+            self.assertEqual(kw.get("write_parities", False), cfg.parities, name)
+        self.assertIn("par_f", python_check.KW)
+        self.assertIn("px40k_f", python_check.KW)
+
+    def test_only_selects_configurations(self):
+        self.assertEqual(python_check.select(["par_f"]), ["par_f"])
+        self.assertEqual(python_check.select(None), list(python_check.KW))
+        with self.assertRaises(SystemExit):
+            python_check.select(["no_such_config"])
 
 
 class PythonCheckDoubleTests(unittest.TestCase):

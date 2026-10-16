@@ -8,7 +8,9 @@ against R0's shift1 reference, and the real run against run1. run() wall time in
 """
 import argparse
 import gc
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -25,9 +27,23 @@ KW = {
                  num_pixels_y1=5000, num_pixels_y2=5000),
     "nb_d": dict(kappa_tot=0.4, shear=0.4, kappa_star=0.2, half_length_y1=25.0, half_length_y2=25.0,
                  num_pixels_y1=5000, num_pixels_y2=5000, is_double=True),
+    "par_f": dict(kappa_tot=0.4, shear=0.4, kappa_star=0.2, half_length_y1=25.0, half_length_y2=25.0,
+                  num_pixels_y1=5000, num_pixels_y2=5000, write_parities=True),
+    "px40k_f": dict(kappa_tot=0.4, shear=0.4, kappa_star=0.2, half_length_y1=25.0, half_length_y2=25.0,
+                    num_pixels_y1=40000, num_pixels_y2=40000),
     "hm100_f": dict(kappa_tot=0.5, shear=0.49, kappa_star=0.1, rectangular=True, approx=True,
                     half_length_y1=12.5, half_length_y2=12.5, num_pixels_y1=1000, num_pixels_y2=1000),
 }
+
+
+def select(names):
+    """The configurations to run: all of KW when names is empty, else the named ones (unknown name: SystemExit)."""
+    if not names:
+        return list(KW)
+    unknown = [n for n in names if n not in KW]
+    if unknown:
+        raise SystemExit(f"unknown configuration(s) {unknown}; choose from {list(KW)}")
+    return list(names)
 
 
 def judge_double(cand, cand_shift, ref_root, name, tol):
@@ -43,15 +59,50 @@ def judge_double(cand, cand_shift, ref_root, name, tol):
     return m_r0, m_shift, verdict
 
 
+def judge_parities(cands, ref_root, cfg, tol):
+    """Float rule for each of the three maps, plus pixels == minima + saddles; returns (verdict, maps, consistency)."""
+    maps = {}
+    verdict = {"pass": True, "failures": [], "flags": []}
+    for which, cand in cands.items():
+        m_r0 = cm.map_metrics(cand, reference_map(ref_root, cfg.name, 1, which), tol["floor_frac"])
+        m_truth = cm.map_metrics(cand, reference_map(ref_root, cfg.truth, 1, which), tol["floor_frac"])
+        v = cm.evaluate_float(m_truth, tol["float_truth_error"][cfg.name][which], m_r0, tol)
+        maps[which] = {"vs_r0": m_r0, "vs_truth": m_truth, "verdict": v}
+        verdict["pass"] = verdict["pass"] and v["pass"]
+        verdict["failures"] += [f"{which}: {f}" for f in v["failures"]]
+        verdict["flags"] += [f"{which}: {f}" for f in v["flags"]]
+    pc = cm.parity_consistency(cands["pixels"], cands["minima"], cands["saddles"])
+    if pc > tol["parity_consistency"]:
+        verdict["pass"] = False
+        verdict["failures"].append(f"pixels != minima + saddles: {pc:.3e} > {tol['parity_consistency']:.1e}")
+    return verdict, maps, pc
+
+
+def save_check(ipm, save_dir):
+    """Call save() and compare the written map with the in-memory one; returns "pass" or the failure text. Removes save_dir."""
+    try:
+        ipm.save()
+        written = bl.read_map(Path(save_dir) / "ipm_magnifications.bin")
+        if np.array_equal(written, ipm.magnifications.astype(np.float64)):
+            return "pass"
+        return "ipm_magnifications.bin differs from ipm.magnifications"
+    except Exception as e:  # noqa: BLE001 - reported in the result
+        return f"{type(e).__name__}: {e}"
+    finally:
+        shutil.rmtree(save_dir, ignore_errors=True)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--build", required=True)
     ap.add_argument("--rung", required=True)
+    ap.add_argument("--only", nargs="+", default=None, metavar="NAME", help="run only these configurations")
     ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--ref-root", default=str(bl.BENCH_ROOT / "ref"))
     ap.add_argument("--tolerances", default=str(bl.BENCH_ROOT / "results" / "tolerances.json"))
     ap.add_argument("--results", default=None)
     a = ap.parse_args(argv)
+    names = select(a.only)
     problem = bl.check_gpu_allocation()
     if problem is not None:
         print(problem, file=sys.stderr)
@@ -67,12 +118,15 @@ def main(argv=None):
     tol = cm.load_tolerances(a.tolerances)
     out = {"rung": a.rung, "env": bl.environment_info(), "build": bl.build_meta(a.build),
            "libraries": [str(lib_f.lib._name), str(lib_d.lib._name)], "configs": {}, "pass": True}
-    for name, kw in KW.items():
+    for name in names:
+        kw = KW[name]
         cfg = cf.CONFIGS[name]
         runs = []
         entry = {}
         for k in range(a.repeats):
-            ipm = IPM(verbose=0, random_seed=int(cf.SEED), **kw)
+            save_dir = tempfile.mkdtemp(prefix="python_check_") if (k == 0 and name == "nb_f") else None
+            extra = dict(write_maps=True, outfile_prefix=save_dir + "/") if save_dir else {}
+            ipm = IPM(verbose=0, random_seed=int(cf.SEED), **kw, **extra)
             t0 = time.perf_counter()
             ipm.run()
             wall = time.perf_counter() - t0
@@ -80,6 +134,8 @@ def main(argv=None):
             if k == 0:
                 cand = np.asarray(ipm.magnifications, dtype=np.float64)
                 entry = {"shape": list(cand.shape)}
+                if save_dir:
+                    entry["save_check"] = save_check(ipm, save_dir)
                 if cfg.build == "double":
                     cy1, cy2 = cf.shift_center()
                     ipm_shift = IPM(verbose=0, random_seed=int(cf.SEED), center_y1=cy1, center_y2=cy2, **kw)
@@ -92,12 +148,21 @@ def main(argv=None):
                     m_r0, m_shift, verdict = judge_double(cand, cand_shift, a.ref_root, name, tol)
                     entry["vs_r0_shift"] = m_shift
                     entry["vs_r0"] = m_r0
+                elif cfg.parities:
+                    cands = {"pixels": cand, "minima": np.asarray(ipm.magnifications_minima, dtype=np.float64),
+                             "saddles": np.asarray(ipm.magnifications_saddles, dtype=np.float64)}
+                    verdict, entry["maps"], entry["parity_consistency"] = judge_parities(cands, a.ref_root, cfg, tol)
+                    entry["vs_r0"] = entry["maps"]["pixels"]["vs_r0"]
+                    entry["vs_truth"] = entry["maps"]["pixels"]["vs_truth"]
                 else:
                     m_r0 = cm.map_metrics(cand, reference_map(a.ref_root, name, 1), tol["floor_frac"])
                     entry["vs_r0"] = m_r0
                     m_truth = cm.map_metrics(cand, reference_map(a.ref_root, cfg.truth, 1), tol["floor_frac"])
                     entry["vs_truth"] = m_truth
                     verdict = cm.evaluate_float(m_truth, tol["float_truth_error"][name]["pixels"], m_r0, tol)
+                if save_dir:
+                    if entry["save_check"] != "pass":
+                        verdict = {**verdict, "pass": False, "failures": verdict["failures"] + [f"save(): {entry['save_check']}"]}
                 entry["verdict"] = verdict
             del ipm
             gc.collect()
