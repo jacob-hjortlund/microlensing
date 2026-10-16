@@ -6,6 +6,7 @@ import json
 import os
 import re
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -472,6 +473,20 @@ class RunIpmTests(unittest.TestCase):
         self.assertGreaterEqual(rec["peak_host_mem_mib"], 200)
         rec, _ = self.run_fake({"FAKE_IPM_ALLOC_MB": "200"}, sample_host=False)
         self.assertIsNone(rec["peak_host_mem_mib"])
+
+    def test_interrupt_kills_child(self):
+        seen = []
+
+        def interrupted(proc, *args, **kwargs):
+            seen.append(proc)
+            raise KeyboardInterrupt
+
+        with mock.patch.object(subprocess.Popen, "communicate", interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_fake({"FAKE_IPM_SLEEP": "30"})
+        self.assertEqual(len(seen), 1)
+        self.assertIsNotNone(seen[0].returncode)   # killed and reaped, not left running
+        self.assertNotEqual(seen[0].returncode, 0)
 
     def test_failure_exit_code(self):
         rec, _ = self.run_fake({"FAKE_IPM_FAIL": "1"})
