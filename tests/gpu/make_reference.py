@@ -56,7 +56,7 @@ def shift_main(a):
         print(f"--shift covers only {', '.join(sorted(names))}; unknown: {', '.join(unknown) or 'none selected'}", file=sys.stderr)
         return 2
     path = Path(a.results) / "shift_runs.json"
-    out = bl.read_json(path) if path.exists() else {"rung": "R0", "shift": list(cf.SHIFT), "env": bl.environment_info(),
+    out = bl.read_json(path) if path.exists() else {"rung": a.rung, "shift": list(cf.SHIFT), "env": bl.environment_info(),
                                                     "build": bl.build_meta(a.build), "records": []}
     failures = []
     for cfg in wanted:
@@ -67,7 +67,7 @@ def shift_main(a):
         scratch = Path(a.scratch) / cfg.name / "shift1"
         print(f"run  {cfg.name} shift1", flush=True)
         rec = bl.run_ipm(cf.exe_for(a.build, cfg.build), cf.shifted_args(cfg, a.ref_root), scratch, timeout=3600)
-        rec.update({"config": cfg.name, "repeat": "shift1", "rung": "R0", "outdir": str(dest)})
+        rec.update({"config": cfg.name, "repeat": "shift1", "rung": a.rung, "outdir": str(dest)})
         if not rec["ok"]:
             failures.append(f"{cfg.name} shift1: {rec['error']}\n{rec['stderr_tail']}")
             print(failures[-1], flush=True)
@@ -96,6 +96,7 @@ def main(argv=None):
     ap.add_argument("--only", nargs="*", help="configuration names (default: every full and truth configuration)")
     ap.add_argument("--shift", action="store_true",
                     help="instead of the matrix, run the double regression configurations with the shifted centre into ref/<config>/shift1")
+    ap.add_argument("--rung", default="R0", help="label recorded for the build that makes the references")
     ap.add_argument("--force", action="store_true", help="re-run even if the reference exists")
     a = ap.parse_args(argv)
     a.build = a.build or str(bl.bench_path("builds", "R0"))
@@ -108,7 +109,7 @@ def main(argv=None):
     if timing_path.exists():
         timing = bl.read_json(timing_path)
     else:
-        timing = {"rung": "R0", "set": "full", "env": bl.environment_info(), "build": bl.build_meta(a.build), "records": []}
+        timing = {"rung": a.rung, "set": "full", "env": bl.environment_info(), "build": bl.build_meta(a.build), "records": []}
     done = {(r["config"], r["repeat"]): i for i, r in enumerate(timing["records"])}
     failures = []
     for cfg in cf.ordered(wanted):
@@ -121,7 +122,7 @@ def main(argv=None):
             scratch = Path(a.scratch) / cfg.name / f"run{k}"
             print(f"run  {cfg.name} run{k}", flush=True)
             rec = bl.run_ipm(exe, cf.full_args(cfg, a.ref_root), scratch, timeout=3600)
-            rec.update({"config": cfg.name, "repeat": k, "rung": "R0", "outdir": str(dest)})
+            rec.update({"config": cfg.name, "repeat": k, "rung": a.rung, "outdir": str(dest)})
             if not rec["ok"]:
                 failures.append(f"{cfg.name} run{k}: {rec['error']}\n{rec['stderr_tail']}")
                 print(failures[-1], flush=True)

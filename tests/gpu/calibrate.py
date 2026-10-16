@@ -115,7 +115,8 @@ def calibrate(ref_root, tol):
         worst = {key: max(s[key] for s in sens.values()) for key in ("mean", "p999", "p9999", "max")}
         tol["double_actual"] = {name: derive_double_actual(s, tol["double"]) for name, s in sens.items()}
         tol["double_actual"]["default"] = derive_double_actual(worst, tol["double"])
-        tol["double_actual_note"] = "calibrated from R0 shift sensitivity; pending user sign-off"
+        tol["double_actual_note"] = ("calibrated from the shift sensitivity of each configuration's reference build (R0; e3168bc for the round-2 "
+                                     "configurations); signed off by the user 2026-10-16")
         for name, actual in tol["double_actual"].items():
             line = f"double_actual {name:9s} " + " ".join(f"{k} {v:.2e}" for k, v in actual.items())
             lines.append(line)

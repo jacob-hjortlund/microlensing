@@ -104,6 +104,7 @@ def main(argv=None):
     ap.add_argument("--build", required=True)
     ap.add_argument("--rung", required=True)
     ap.add_argument("--set", default="ladder", choices=["ladder", "full"])
+    ap.add_argument("--exe-suffix", default="", help="executable name suffix: ipm_gpu<s> / ipm_gpu_double<s>")
     ap.add_argument("--ref-root", help="default: $IPM_BENCH_ROOT/ref")
     ap.add_argument("--tolerances", help="default: $IPM_BENCH_ROOT/results/tolerances.json")
     ap.add_argument("--results", default=None)
@@ -137,7 +138,7 @@ def main(argv=None):
     bl.write_json(results_dir / f"regression_{a.set}.json", out)   # an earlier result file must not outlive an abort
     for cfg in cf.ordered(cfgs):
         outdir = scratch / cfg.name
-        exe = cf.exe_for(a.build, cfg.build)
+        exe = cf.exe_for(a.build, cfg.build, a.exe_suffix)
         rec = bl.run_ipm(exe, cf.full_args(cfg, a.ref_root), outdir, timeout=3600)
         outdir_shift, rec_shift = None, None
         if cfg.build == "double":

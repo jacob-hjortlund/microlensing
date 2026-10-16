@@ -48,7 +48,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--build", required=True)
     ap.add_argument("--rung", required=True)
-    ap.add_argument("--set", default="ladder", choices=["ladder", "full", "memory"])
+    ap.add_argument("--set", default="ladder", choices=["ladder", "full", "memory", "fallback"])
     ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--ref-root", help="default: $IPM_BENCH_ROOT/ref")
     ap.add_argument("--results", default=None)

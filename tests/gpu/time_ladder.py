@@ -19,6 +19,7 @@ def main(argv=None):
     ap.add_argument("--ref-root", help="default: $IPM_BENCH_ROOT/ref")
     ap.add_argument("--out", help="default: $IPM_BENCH_ROOT/results/ladder_interleaved.json")
     ap.add_argument("--scratch", default=str(bl.SCRATCH / "ladder"))
+    ap.add_argument("--set", default="ladder", choices=["ladder", "full", "memory", "fallback"])
     ap.add_argument("--no-warmup", action="store_true")
     a = ap.parse_args(argv)
     problem = bl.check_gpu_allocation()
@@ -47,7 +48,7 @@ def main(argv=None):
         warm_up(builds[a.rungs[0]], a.ref_root, a.scratch)
     for k in range(1, a.repeats + 1):
         for rung in a.rungs:
-            for cfg in cf.ladder_configs(rung):
+            for cfg in (cf.ladder_configs(rung) if a.set == "ladder" else cf.configs_in(a.set)):
                 key = (rung, cfg.name, k)
                 if key in done:
                     continue
