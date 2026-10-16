@@ -19,7 +19,7 @@ SLOW_LIMIT = 1.03
 ROUND2_RUNGS = ["A1", "A2", "A4"]
 PYTHON_RUNGS = ["base", "base-repeat", "A1", "A2", "A4"]
 HM100_NOTE = ("¹ Round 1's full-matrix median for hm100_f was disturbed (0.339 s; two of its three repeats were slow, "
-              "the ladder gives {ladder} s for the same binary). Slowdowns of this row are judged against the ladder value.")
+              "the ladder gives {ladder} s for the same binary). The speedup and the slowdown flag for this row use the ladder value.")
 
 
 def is_slow(base, value):
@@ -116,7 +116,7 @@ def full_table(ctx, key, title, base_values, inter, extra_note=""):
     for n in names:
         b = base_values.get(n)
         ref = base_values.get(f"_ref_{n}", b)
-        cells = [fmt(b) + (" ¹" if f"_ref_{n}" in base_values else "")]
+        cells = [fmt(b) + (f" (ladder {fmt(ref)}) ¹" if f"_ref_{n}" in base_values else "")]
         for r in rungs:
             v = summ.get(r, {}).get(n, {}).get(key)
             cells.append(f"{ctx.cell(f'{title}, {r}, {n}', ref, v)} | {fmt(speedup(ref, v), 2)}")
@@ -245,6 +245,10 @@ def render(root):
     parts += ["## Peak memory", "",
               "Device: base from round 1 (R5/timing_memory.json, GPU 4, job 906277) for round 1's configurations and base/timing_memory.json for the rest; "
               "A2 and A4 from their own timing_memory.json. Host: peak_host_mem_mib of each rung's timing_memory.json.", "", memory_section(ctx), ""]
+    for rung in ("A1", "A2", "A2-direct", "A4"):
+        for set_name in ("ladder", "full"):
+            if not (ctx.root / rung / f"regression_{set_name}.json").exists():
+                ctx.missing.append(f"{rung}/regression_{set_name}.json")
     parts += ["## Regression results", "", regression_table(ctx.root, ["A1", "A2", "A2-direct", "A4"]), ""]
     parts += ["## A2 checks (clamp counts, small and non-square maps, natural fallback)", "", a2_checks_section(ctx), ""]
     parts += ["## A2 threshold sweep (kernel median)", "", sweep_section(ctx), ""]
