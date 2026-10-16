@@ -113,6 +113,61 @@ class GpuMemorySampler:
         return max(self.samples) if self.samples else None
 
 
+class HostMemorySampler:
+    """Polls VmHWM (MiB) of a process from /proc/<pid>/status in a thread; stop() returns the last peak seen,
+    or None if it was never readable. A vanished process ends the loop."""
+
+    def __init__(self, pid, interval=0.05):
+        self.pid = pid
+        self.interval = interval
+        self.peak_mib = None
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def _read(self):
+        with open(f"/proc/{self.pid}/status") as f:
+            for line in f:
+                if line.startswith("VmHWM:"):
+                    return int(line.split()[1]) // 1024
+        return None
+
+    def _loop(self):
+        while not self._stop.is_set():
+            try:
+                mib = self._read()
+            except (OSError, ValueError):
+                return
+            if mib is not None and (self.peak_mib is None or mib > self.peak_mib):
+                self.peak_mib = mib
+            self._stop.wait(self.interval)
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        return self.peak_mib
+
+
+def check_gpu_allocation():
+    """Error message if the first CUDA_VISIBLE_DEVICES entry differs from the Slurm-allocated GPU, else None."""
+    allocated = os.environ.get("SLURM_STEP_GPUS")
+    if allocated is None:
+        allocated = os.environ.get("SLURM_JOB_GPUS")
+    if not allocated:
+        return None
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")[0].strip()
+    want = allocated.split(",")[0].strip()
+    if visible != want:
+        return (f"CUDA_VISIBLE_DEVICES={visible!r} does not match the Slurm-allocated GPU {want!r} "
+                f"(SLURM_STEP_GPUS/SLURM_JOB_GPUS={allocated!r}); only the allocated GPU may be used")
+    return None
+
+
 def _as_text(data):
     """Decode the raw bytes that TimeoutExpired carries even with text=True; None becomes ''."""
     if isinstance(data, bytes):
@@ -120,7 +175,8 @@ def _as_text(data):
     return data or ""
 
 
-def run_ipm(exe, args, outdir, verbose=1, sample_gpu=False, expect_map=True, timeout=None, env=None):
+def run_ipm(exe, args, outdir, verbose=1, sample_gpu=False, expect_map=True, timeout=None, env=None,
+            sample_host=False):
     """Run one IPM executable with `-v <verbose> -o <outdir>/`; wall time covers process start to exit."""
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -130,21 +186,29 @@ def run_ipm(exe, args, outdir, verbose=1, sample_gpu=False, expect_map=True, tim
     sampler = GpuMemorySampler().start() if sample_gpu else None
     t0 = time.perf_counter()
     timed_out, start_error = False, None
+    host_sampler = None
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
-        returncode, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
-    except subprocess.TimeoutExpired as exc:
-        timed_out = True
-        returncode, stdout, stderr = -1, _as_text(exc.stdout), _as_text(exc.stderr)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+        if sample_host:
+            host_sampler = HostMemorySampler(proc.pid).start()
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            returncode = proc.returncode
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+            timed_out = True
+            returncode, stdout, stderr = -1, _as_text(stdout), _as_text(stderr)
     except OSError as exc:
         start_error = f"cannot start {exe}: {exc}"
         returncode, stdout, stderr = None, "", ""
     finally:
         wall = time.perf_counter() - t0
         peak = sampler.stop() if sampler else None
+        peak_host = host_sampler.stop() if host_sampler else None
     record = {"exe": str(exe), "args": [str(a) for a in args], "outdir": str(outdir),
               "returncode": returncode, "wall_s": wall, "t_shoot_cells": None, "param_info": {},
-              "peak_gpu_mem_mib": peak, "stdout_tail": stdout[-2000:], "stderr_tail": stderr[-2000:],
+              "peak_gpu_mem_mib": peak, "peak_host_mem_mib": peak_host, "stdout_tail": stdout[-2000:], "stderr_tail": stderr[-2000:],
               "ok": False, "error": None}
     param_path = outdir / "ipm_parameter_info.txt"
     if start_error is not None:
@@ -176,6 +240,10 @@ def environment_info():
         nvcc = ""
     return {"hostname": socket.gethostname(), "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"), "gpu": smi, "nvcc": nvcc,
+            "gpu_pci_bus_id": nvidia_smi("pci.bus_id", gpu_index()),
+            "cpu_affinity": sorted(os.sched_getaffinity(0)),
+            "slurm_step_gpus": os.environ.get("SLURM_STEP_GPUS"),
+            "cuda_device_order": os.environ.get("CUDA_DEVICE_ORDER"),
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")}
 
 

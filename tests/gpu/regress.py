@@ -111,6 +111,10 @@ def main(argv=None):
     ap.add_argument("--only", nargs="*")
     ap.add_argument("--keep-outputs", action="store_true")
     a = ap.parse_args(argv)
+    problem = bl.check_gpu_allocation()
+    if problem is not None:
+        print(problem, file=sys.stderr)
+        return 2
     tol = cm.load_tolerances(a.tolerances)
     results_dir = Path(a.results or bl.BENCH_ROOT / "results" / a.rung)
     scratch = Path(a.scratch or bl.SCRATCH / a.rung / "regress")

@@ -21,6 +21,10 @@ def main(argv=None):
     ap.add_argument("--scratch", default=str(bl.SCRATCH / "ladder"))
     ap.add_argument("--no-warmup", action="store_true")
     a = ap.parse_args(argv)
+    problem = bl.check_gpu_allocation()
+    if problem is not None:
+        print(problem, file=sys.stderr)
+        return 2
     builds = {r: Path(a.builds_root) / r for r in a.rungs}
     missing = [str(b) for b in builds.values() if not (b / "ipm_gpu").exists()]
     if missing:

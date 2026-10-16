@@ -52,6 +52,10 @@ def main(argv=None):
     ap.add_argument("--tolerances", default=str(bl.BENCH_ROOT / "results" / "tolerances.json"))
     ap.add_argument("--results", default=None)
     a = ap.parse_args(argv)
+    problem = bl.check_gpu_allocation()
+    if problem is not None:
+        print(problem, file=sys.stderr)
+        return 2
     from microlensing.IPM.ipm import IPM
     import microlensing.IPM.lib_ipm as lib_f
     import microlensing.IPM.lib_ipm_double as lib_d

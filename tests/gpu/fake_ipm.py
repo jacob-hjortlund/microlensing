@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Stand-in for ipm_gpu in unit tests: writes the output files a real run writes.
 Environment switches: FAKE_IPM_FAIL=1 (exit 3), FAKE_IPM_NO_PARAM=1 (no parameter file),
-FAKE_IPM_NO_MAP=1 (no map), FAKE_IPM_VALUE (pixel value, default 2.0), FAKE_IPM_SLEEP (seconds),
+FAKE_IPM_NO_MAP=1 (no map), FAKE_IPM_VALUE (pixel value, default 2.0), FAKE_IPM_SLEEP (seconds), FAKE_IPM_ALLOC_MB (allocate and touch that many MB before sleeping),
 FAKE_IPM_SHAPE (rows x cols of the written maps, default 3x4; the -npy arguments are ignored)."""
 import os
 import struct
@@ -19,6 +19,9 @@ def opt(name, default):
 
 prefix = opt("-o", "./")
 npy2, npy1 = (int(v) for v in os.environ.get("FAKE_IPM_SHAPE", "3x4").split("x"))
+ballast = bytearray(int(os.environ.get("FAKE_IPM_ALLOC_MB", "0")) * 2**20)
+for i in range(0, len(ballast), 4096):
+    ballast[i] = 1
 time.sleep(float(os.environ.get("FAKE_IPM_SLEEP", "0.02")))
 if os.environ.get("FAKE_IPM_FAIL"):
     print("fake failure", file=sys.stderr)
