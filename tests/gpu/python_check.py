@@ -52,6 +52,10 @@ def main(argv=None):
     ap.add_argument("--tolerances", help="default: $IPM_BENCH_ROOT/results/tolerances.json")
     ap.add_argument("--results", help="default: $IPM_BENCH_ROOT/results/<rung>")
     a = ap.parse_args(argv)
+    problem = bl.check_gpu_allocation()
+    if problem is not None:
+        print(problem, file=sys.stderr)
+        return 2
     a.ref_root = a.ref_root or str(bl.bench_path("ref"))
     a.tolerances = a.tolerances or str(bl.bench_path("results", "tolerances.json"))
     a.results = a.results or str(bl.bench_path("results", a.rung))

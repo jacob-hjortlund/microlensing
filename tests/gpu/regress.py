@@ -111,6 +111,10 @@ def main(argv=None):
     ap.add_argument("--only", nargs="*")
     ap.add_argument("--keep-outputs", action="store_true")
     a = ap.parse_args(argv)
+    problem = bl.check_gpu_allocation()
+    if problem is not None:
+        print(problem, file=sys.stderr)
+        return 2
     a.ref_root = a.ref_root or str(bl.bench_path("ref"))
     a.tolerances = a.tolerances or str(bl.bench_path("results", "tolerances.json"))
     tol = cm.load_tolerances(a.tolerances)

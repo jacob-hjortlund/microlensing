@@ -21,6 +21,10 @@ def main(argv=None):
     ap.add_argument("--scratch", default=str(bl.SCRATCH / "ladder"))
     ap.add_argument("--no-warmup", action="store_true")
     a = ap.parse_args(argv)
+    problem = bl.check_gpu_allocation()
+    if problem is not None:
+        print(problem, file=sys.stderr)
+        return 2
     a.builds_root = a.builds_root or str(bl.bench_path("builds"))
     a.ref_root = a.ref_root or str(bl.bench_path("ref"))
     a.out = a.out or str(bl.bench_path("results", "ladder_interleaved.json"))

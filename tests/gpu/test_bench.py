@@ -426,6 +426,26 @@ class ConfigTests(unittest.TestCase):
 FAKE = str(HERE / "fake_ipm.py")
 
 
+class EnvironmentGuardTests(unittest.TestCase):
+    def test_environment_info_records_bus_id_affinity_and_slurm_gpus(self):
+        info = bench_lib.environment_info()
+        for key in ("gpu_pci_bus_id", "cpu_affinity", "slurm_step_gpus", "cuda_device_order"):
+            self.assertIn(key, info)
+        self.assertEqual(info["cpu_affinity"], sorted(os.sched_getaffinity(0)))
+
+    def test_check_gpu_allocation(self):
+        with mock.patch.dict(os.environ, {"SLURM_STEP_GPUS": "0", "CUDA_VISIBLE_DEVICES": "0"}):
+            self.assertIsNone(bench_lib.check_gpu_allocation())
+        with mock.patch.dict(os.environ, {"SLURM_STEP_GPUS": "0", "CUDA_VISIBLE_DEVICES": "4"}):
+            msg = bench_lib.check_gpu_allocation()
+            self.assertIn("4", msg)
+            self.assertIn("0", msg)
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "4"}):
+            os.environ.pop("SLURM_STEP_GPUS", None)
+            os.environ.pop("SLURM_JOB_GPUS", None)
+            self.assertIsNone(bench_lib.check_gpu_allocation())
+
+
 class RunIpmTests(unittest.TestCase):
     def run_fake(self, env_over=None, **kw):
         env = dict(os.environ)
@@ -446,6 +466,12 @@ class RunIpmTests(unittest.TestCase):
         self.assertIn("ipm_magnifications.bin", files)
         self.assertIn("fake run done", rec["stdout_tail"])
         self.assertEqual(rec["args"][-2:], ["-npy2", "3"])   # -v and -o are not part of args
+
+    def test_run_ipm_samples_host_memory(self):
+        rec, _ = self.run_fake({"FAKE_IPM_ALLOC_MB": "200", "FAKE_IPM_SLEEP": "0.5"}, sample_host=True)
+        self.assertGreaterEqual(rec["peak_host_mem_mib"], 200)
+        rec, _ = self.run_fake({"FAKE_IPM_ALLOC_MB": "200"}, sample_host=False)
+        self.assertIsNone(rec["peak_host_mem_mib"])
 
     def test_failure_exit_code(self):
         rec, _ = self.run_fake({"FAKE_IPM_FAIL": "1"})
