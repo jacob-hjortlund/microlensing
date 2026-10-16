@@ -19,6 +19,8 @@ NRY10 = ("-k", "0.4", "-y", "0.4", "-ks", "0.2", "-hly1", "10", "-hly2", "10",
          "-npy1", "2000", "-npy2", "2000", "-nry", "10")
 BIG = ("-k", "0.4", "-y", "0.4", "-ks", "0.2", "-hly1", "40", "-hly2", "40", "-npy1", "8000", "-npy2", "8000")
 STARS1E6 = ("-k", "0.3", "-y", "0.3", "-ks", "0.27", "-hly1", "505", "-hly2", "505", "-npy1", "5000", "-npy2", "5000")
+PX40K = NOTEBOOK[:-4] + ("-npy1", "40000", "-npy2", "40000")
+FALLBACK = NOTEBOOK[:-4] + ("-npy1", "54000", "-npy2", "54000", "-wp", "1")
 SF = ("-k", "0.4", "-y", "0.4", "-hly1", "25", "-hly2", "25", "-npy1", "5000", "-npy2", "5000")
 
 
@@ -27,7 +29,7 @@ class Config:
     name: str
     build: str                 # "float" or "double"
     args: tuple                # arguments beyond COMMON, -v and -o
-    sets: frozenset            # subset of {"ladder", "full", "truth", "memory"}
+    sets: frozenset            # subset of {"ladder", "full", "truth", "memory", "fallback"}
     truth: str = None          # double configuration with identical arguments (float configs only)
     starfile_from: str = None  # configuration whose run1 star file is passed with -sf
     parities: bool = False     # writes minima/saddles maps
@@ -53,6 +55,8 @@ CONFIGS = {c.name: c for c in [
     _c("hm100_d", "double", HM100, {"full"}),
     _c("sf_f", "float", SF, {"full"}, truth="sf_d", starfile_from="nb_f"),
     _c("stars1e6_f", "float", STARS1E6, {"full", "memory"}, truth="stars1e6_d"),
+    _c("px40k_f", "float", PX40K, {"full", "memory"}, truth="px40k_d"),
+    _c("px40k_d", "double", PX40K, {"full", "memory"}),
     # double-truth references for float configurations without a double twin in the matrix
     _c("circ_a0_d", "double", NOTEBOOK + ("-a", "0"), {"truth"}),
     _c("par_d", "double", NOTEBOOK + ("-wp", "1"), {"truth"}, parities=True),
@@ -61,6 +65,7 @@ CONFIGS = {c.name: c for c in [
     _c("hm1000_d", "double", HM1000, {"truth"}),
     _c("sf_d", "double", SF, {"truth"}, starfile_from="nb_f"),
     _c("stars1e6_d", "double", STARS1E6, {"truth"}),
+    _c("fallback_f", "float", FALLBACK, {"fallback"}, parities=True),
 ]}
 
 # The quadtree root and the default image plane are centred on (0, 0), so lattice corners on x1 = 0 or x2 = 0 evaluate to exactly
@@ -88,8 +93,8 @@ def regression_configs(rung, set_name):
     return ladder_configs(rung) if set_name == "ladder" else configs_in("full")
 
 
-def exe_for(build_dir, build):
-    return Path(build_dir) / ("ipm_gpu" if build == "float" else "ipm_gpu_double")
+def exe_for(build_dir, build, suffix=""):
+    return Path(build_dir) / (("ipm_gpu" if build == "float" else "ipm_gpu_double") + suffix)
 
 
 def full_args(cfg, ref_root):

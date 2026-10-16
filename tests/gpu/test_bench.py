@@ -340,6 +340,8 @@ class ConfigTests(unittest.TestCase):
     def test_every_float_config_has_a_double_truth_with_identical_args(self):
         for cfg in configs.CONFIGS.values():
             self.assertIn(cfg.build, ("float", "double"), cfg.name)
+            if cfg.sets == {"fallback"}:
+                continue
             if cfg.build == "float":
                 truth = configs.CONFIGS[cfg.truth]
                 self.assertEqual(truth.build, "double", cfg.name)
@@ -352,11 +354,10 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(names, configs.LADDER)
         self.assertEqual([c.name for c in configs.ladder_configs("R2p")], ["nb_d"])
         full = {c.name for c in configs.configs_in("full")}
-        self.assertEqual(len(full), 15)
+        self.assertEqual(len(full), 17)
         self.assertEqual({c.name for c in configs.regression_configs("R2p", "ladder")},
-                         {"nb_d", "rect_d", "rect_a0_d", "hm100_d"})
+                         {"nb_d", "rect_d", "rect_a0_d", "hm100_d", "px40k_d"})
         self.assertEqual({c.name for c in configs.regression_configs("R3", "full")}, full)
-        self.assertEqual({c.name for c in configs.configs_in("memory")}, {"big_f", "hm1000_f", "stars1e6_f"})
 
     def test_full_args_and_starfile(self):
         cfg = configs.CONFIGS["sf_f"]
@@ -381,10 +382,28 @@ class ConfigTests(unittest.TestCase):
     def test_exact_membership_of_each_set(self):
         self.assertEqual({c.name for c in configs.configs_in("full")}, {
             "nb_f", "nb_d", "rect_f", "hm100_f", "circ_a0_f", "rect_a0_f", "rect_d", "rect_a0_d",
-            "par_f", "nry10_f", "big_f", "hm1000_f", "hm100_d", "sf_f", "stars1e6_f"})
+            "par_f", "nry10_f", "big_f", "hm1000_f", "hm100_d", "sf_f", "stars1e6_f", "px40k_f", "px40k_d"})
         self.assertEqual({c.name for c in configs.configs_in("truth")}, {
             "circ_a0_d", "par_d", "nry10_d", "big_d", "hm1000_d", "sf_d", "stars1e6_d"})
         self.assertEqual({c.name for c in configs.configs_in("ladder")}, {"nb_f", "nb_d", "rect_f", "hm100_f"})
+        self.assertEqual({c.name for c in configs.configs_in("memory")},
+                         {"big_f", "hm1000_f", "stars1e6_f", "px40k_f", "px40k_d"})
+        self.assertEqual({c.name for c in configs.configs_in("fallback")}, {"fallback_f"})
+
+    def test_px40k_and_fallback_arguments(self):
+        nb = configs.CONFIGS["nb_f"].args
+        px = configs.CONFIGS["px40k_f"]
+        self.assertEqual(px.args, configs.NOTEBOOK[:-4] + ("-npy1", "40000", "-npy2", "40000"))
+        self.assertEqual(px.args[:-4], nb[:-4])
+        self.assertEqual(px.truth, "px40k_d")
+        self.assertEqual(configs.CONFIGS["px40k_d"].args, px.args)
+        fb = configs.CONFIGS["fallback_f"]
+        self.assertEqual(fb.args, configs.NOTEBOOK[:-4] + ("-npy1", "54000", "-npy2", "54000", "-wp", "1"))
+        self.assertEqual(fb.sets, {"fallback"})
+        self.assertTrue(fb.parities)
+        self.assertIsNone(fb.truth)
+        self.assertNotIn(fb, configs.regression_configs("R3", "full"))
+        self.assertNotIn(fb, configs.double_regression_configs())
 
     def test_binding_constraints_hold_for_every_configuration(self):
         for cfg in configs.CONFIGS.values():
@@ -415,13 +434,15 @@ class ConfigTests(unittest.TestCase):
     def test_shifted_args_and_double_regression_configs(self):
         cfg = configs.CONFIGS["nb_d"]
         self.assertEqual(configs.shifted_args(cfg, "/ref"), configs.full_args(cfg, "/ref") + ["-cy1", "1e-7", "-cy2", "1e-7"])
-        self.assertEqual([c.name for c in configs.double_regression_configs()], ["nb_d", "rect_d", "rect_a0_d", "hm100_d"])
+        self.assertEqual([c.name for c in configs.double_regression_configs()], ["nb_d", "rect_d", "rect_a0_d", "hm100_d", "px40k_d"])
         for c in configs.CONFIGS.values():   # the shift must not collide with a centre already in a configuration
             self.assertFalse({"-cy1", "-cy2"} & set(c.args), c.name)
 
     def test_exe_for(self):
         self.assertEqual(configs.exe_for("/b", "float").name, "ipm_gpu")
         self.assertEqual(configs.exe_for("/b", "double").name, "ipm_gpu_double")
+        self.assertEqual(configs.exe_for("/b", "float", "_direct").name, "ipm_gpu_direct")
+        self.assertEqual(configs.exe_for("/b", "double", "_direct").name, "ipm_gpu_double_direct")
 
 
 FAKE = str(HERE / "fake_ipm.py")
@@ -676,6 +697,17 @@ class MakeReferenceTests(unittest.TestCase):
             self.assertFalse((Path(d) / "scratch" / "nb_f" / "run2").exists())
             self.assertEqual(len(bench_lib.read_json(Path(d) / "results" / "timing_full.json")["records"]), 3)
 
+    def test_rung_label_is_recorded(self):
+        with tempfile.TemporaryDirectory() as d:
+            build = fake_build_dir(Path(d) / "build")
+            argv = ["--only", "nb_f", "--build", str(build), "--ref-root", f"{d}/ref",
+                    "--scratch", f"{d}/scratch", "--results", f"{d}/results", "--rung", "base"]
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(make_reference.main(argv), 0)
+            timing = bench_lib.read_json(Path(d) / "results" / "timing_full.json")
+            self.assertEqual(timing["rung"], "base")
+            self.assertEqual({r["rung"] for r in timing["records"]}, {"base"})
+
     def test_shift_creates_shift1_and_records_and_honours_force_and_only(self):
         with tempfile.TemporaryDirectory() as d:
             build = fake_build_dir(Path(d) / "build")
@@ -694,15 +726,15 @@ class MakeReferenceTests(unittest.TestCase):
             self.assertEqual(runs["shift"], list(configs.SHIFT))
             stamp = (ref / "nb_d" / "shift1" / "ipm_parameter_info.txt").stat().st_mtime_ns
             with contextlib.redirect_stdout(io.StringIO()) as out:
-                self.assertEqual(make_reference.main(argv), 0)      # all four; two exist and are skipped
+                self.assertEqual(make_reference.main(argv), 0)      # all five; two exist and are skipped
             self.assertEqual(out.getvalue().count("skip "), 2)
             self.assertEqual((ref / "nb_d" / "shift1" / "ipm_parameter_info.txt").stat().st_mtime_ns, stamp)
             runs = bench_lib.read_json(Path(d) / "results" / "shift_runs.json")
-            self.assertEqual(sorted(r["config"] for r in runs["records"]), ["hm100_d", "nb_d", "rect_a0_d", "rect_d"])
+            self.assertEqual(sorted(r["config"] for r in runs["records"]), ["hm100_d", "nb_d", "px40k_d", "rect_a0_d", "rect_d"])
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(make_reference.main(argv + ["--only", "nb_d", "--force"]), 0)
             self.assertGreater((ref / "nb_d" / "shift1" / "ipm_parameter_info.txt").stat().st_mtime_ns, stamp)
-            self.assertEqual(len(bench_lib.read_json(Path(d) / "results" / "shift_runs.json")["records"]), 4)   # replaced
+            self.assertEqual(len(bench_lib.read_json(Path(d) / "results" / "shift_runs.json")["records"]), 5)   # replaced
             self.assertFalse((Path(d) / "scratch" / "nb_d" / "shift1").exists())
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(make_reference.main(argv + ["--only", "nb_f"]), 2)   # float configurations have no shift run
@@ -1091,7 +1123,8 @@ import calibrate  # noqa: E402
 # lines print) and are known in closed form.
 SPREAD = np.append(np.linspace(0.5, 1.5, 599), 20.0).reshape(30, 20)
 FLOAT_AMPLITUDE = {"nb_f": 4e-6, "rect_f": 5e-6, "hm100_f": 6e-6, "circ_a0_f": 7e-6, "rect_a0_f": 8e-6,
-                   "nry10_f": 9e-6, "big_f": 1.0e-5, "hm1000_f": 1.1e-5, "sf_f": 1.2e-5, "stars1e6_f": 1.3e-5}
+                   "nry10_f": 9e-6, "big_f": 1.0e-5, "hm1000_f": 1.1e-5, "sf_f": 1.2e-5, "stars1e6_f": 1.3e-5,
+                   "px40k_f": 1.4e-5}
 PARITY_AMPLITUDE = {"minima": 2e-6, "saddles": 3e-6}   # par_f; its pixels are minima + saddles
 
 
@@ -1108,12 +1141,12 @@ SHIFT_AMPLITUDE = 4e-10   # shift1 = run1 times (1 + SHIFT_AMPLITUDE * SPREAD) f
 
 
 def calibration_tree(ref, shift=True):
-    """Write synthetic references for all 22 configurations; returns {(float configuration, map): amplitude}.
+    """Write synthetic references for all 24 configurations; returns {(float configuration, map): amplitude}.
 
     A double configuration has a map level of its own. A float configuration is its double twin times
     (1 + amplitude * SPREAD), with a different amplitude for every configuration and map, and the pixels of a parity
     configuration are minima + saddles. The configurations with three runs get run2 and run3 as run1 times
-    (1 + 2e-9 * SPREAD) and (1 + 3e-9 * SPREAD). With shift, the four double regression configurations also get a
+    (1 + 2e-9 * SPREAD) and (1 + 3e-9 * SPREAD). With shift, the five double regression configurations also get a
     shift1 directory (see SHIFT_AMPLITUDE).
     """
     texture = np.random.default_rng(7).random(SPREAD.shape)
@@ -1125,7 +1158,7 @@ def calibration_tree(ref, shift=True):
             maps[cfg.name].update(minima=0.4 * pixels, saddles=0.6 * pixels)
     amplitude = {}
     for cfg in configs.CONFIGS.values():
-        if cfg.build == "float":
+        if cfg.build == "float" and cfg.truth is not None:
             twin = maps[cfg.truth]
             if cfg.parities:
                 run = {which: twin[which] * (1 + a * SPREAD) for which, a in PARITY_AMPLITUDE.items()}
@@ -1175,7 +1208,7 @@ class CalibrateTests(unittest.TestCase):
             ref = f"{d}/ref"
             for name in ("nb_f", "nb_d", "rect_f", "rect_d", "hm100_f", "hm100_d", "circ_a0_f", "circ_a0_d",
                          "rect_a0_f", "rect_a0_d", "par_f", "par_d", "nry10_f", "nry10_d", "big_f", "big_d",
-                         "hm1000_f", "hm1000_d", "sf_f", "sf_d", "stars1e6_f", "stars1e6_d"):
+                         "hm1000_f", "hm1000_d", "sf_f", "sf_d", "stars1e6_f", "stars1e6_d", "px40k_f", "px40k_d"):
                 parities = name.startswith("par_")
                 base = synthetic_reference(ref, name, 5.0, parities=parities, k=1)
                 if "full" in configs.CONFIGS[name].sets:
@@ -1218,10 +1251,11 @@ class CalibrateTests(unittest.TestCase):
         self.assertEqual((act["hm100_d"]["offmask_max"], act["hm100_d"]["sum_ratio"]), (dbl["offmask_max"], dbl["sum_ratio"]))
         self.assertEqual(act["default"], act["hm100_d"])      # hm100_d has the largest sensitivity everywhere
         self.assertLess(act["nb_d"]["mean"], act["default"]["mean"])
-        self.assertEqual(tol["double_actual_note"], "calibrated from R0 shift sensitivity; pending user sign-off")
+        self.assertEqual(tol["double_actual_note"], "calibrated from the shift sensitivity of each configuration's reference build (R0; e3168bc for the round-2 configurations); signed off by the user 2026-10-16")
+        self.assertNotIn("pending", tol["double_actual_note"])
         self.assertEqual(tol["double"], compare_maps.default_tolerances()["double"])   # the signed-off thresholds are untouched
-        self.assertEqual(sum("shift sensitivity" in line for line in lines), 4)
-        self.assertEqual(sum(line.startswith("double_actual") for line in lines), 5)   # four configurations and the default
+        self.assertEqual(sum("shift sensitivity" in line for line in lines), 5)
+        self.assertEqual(sum(line.startswith("double_actual") for line in lines), 6)   # five configurations and the default
         # the signed-off mean (1e-7) is below the sensitivity of hm100_d (3e-5): a warning for each of the three keys
         self.assertEqual(sum("is below R0's own shift sensitivity" in w for w in warnings), 3, warnings)
         self.assertTrue(all(("WARNING " + w) in printed.splitlines() for w in warnings))
@@ -1231,7 +1265,7 @@ class CalibrateTests(unittest.TestCase):
             calibration_tree(f"{d}/ref")
             shutil.rmtree(Path(d) / "ref" / "rect_d" / "shift1")
             (tol, _, warnings), _ = run_quietly(calibrate.calibrate, f"{d}/ref", compare_maps.default_tolerances())
-        self.assertEqual(sorted(tol["double_shift_sensitivity"]), ["hm100_d", "nb_d", "rect_a0_d"])
+        self.assertEqual(sorted(tol["double_shift_sensitivity"]), ["hm100_d", "nb_d", "px40k_d", "rect_a0_d"])
         missing = [w for w in warnings if "no shift1 reference" in w]
         self.assertEqual(len(missing), 1)
         self.assertTrue(missing[0].startswith("rect_d:"))
@@ -1285,12 +1319,12 @@ class CalibrateTests(unittest.TestCase):
             (tol, lines, _), printed = run_quietly(calibrate.calibrate, f"{d}/ref", compare_maps.default_tolerances())
         self.assertEqual(printed.splitlines(), lines)
         extra = [line for line in lines if "shift sensitivity" in line or line.startswith("double_actual")]
-        for line in extra[:4]:   # one line per double regression configuration, then one per double_actual entry
+        for line in extra[:5]:   # one line per double regression configuration, then one per double_actual entry
             name = line.split()[0]
             sens = tol["double_shift_sensitivity"][name]
             self.assertEqual(numbers_in(line), [float(f"{sens[k]:.2e}") for k in ("mean", "p999", "p9999", "max")], line)
-        self.assertEqual(len(extra), 9)
-        for line, (name, actual) in zip(extra[4:], tol["double_actual"].items()):
+        self.assertEqual(len(extra), 11)
+        for line, (name, actual) in zip(extra[5:], tol["double_actual"].items()):
             self.assertEqual(line.split()[:2], ["double_actual", name])
             self.assertEqual(numbers_in(line), [float(f"{v:.2e}") for v in actual.values()], line)
         lines = [line for line in lines if line not in extra]
@@ -1316,7 +1350,7 @@ class CalibrateTests(unittest.TestCase):
             (tol, _, _), _ = run_quietly(calibrate.calibrate, f"{d}/ref", tol)
         stored = [m for per_map in tol["floors"].values() for floors in per_map.values() for m in floors]
         stored += [m for per_map in tol["float_truth_error"].values() for m in per_map.values()]
-        self.assertEqual(len(stored), 2 * 17 + 13)   # two floors for each of 17 maps, a truth error for each of 13 float maps
+        self.assertEqual(len(stored), 2 * 19 + 14)   # two floors for each of 19 maps, a truth error for each of 14 float maps
         for m in stored:
             self.assertTrue(0 < m["n_mask"] < m["n_total"], m)
 
@@ -1459,9 +1493,9 @@ class CalibrateTests(unittest.TestCase):
             self.assertEqual(tol["float"], {**default["float"], "ratio": 1.2})
             for key in ("floors", "float_truth_error", "parity_floor"):
                 self.assertNotIn("stale", tol[key])
-            self.assertEqual(len(tol["floors"]), 15)
-            # the edited threshold is the one the sanity check uses: the four double configurations are now too close
-            self.assertEqual(sorted(w.split(" pixels")[0] for w in tol["warnings"]), ["hm100_d", "nb_d", "rect_a0_d", "rect_d"])
+            self.assertEqual(len(tol["floors"]), 17)
+            # the edited threshold is the one the sanity check uses: the five double configurations are now too close
+            self.assertEqual(sorted(w.split(" pixels")[0] for w in tol["warnings"]), ["hm100_d", "nb_d", "px40k_d", "rect_a0_d", "rect_d"])
             self.assertTrue(all(" mean=" in w for w in tol["warnings"]), tol["warnings"])
             body = out.with_name("tolerances_summary.md").read_text().splitlines()[1:-1]   # inside the fences
             n = len(tol["warnings"])
@@ -1529,6 +1563,21 @@ class TimingTests(unittest.TestCase):
                 self.assertEqual(time_ladder.main(argv), 0)
             self.assertEqual(spy.call_count, 1)
             self.assertEqual(len(bench_lib.read_json(out_path)["records"]), 18)
+
+    def test_time_ladder_full_set_interleaves_the_full_configurations(self):
+        with tempfile.TemporaryDirectory() as d:
+            builds = Path(d) / "builds"
+            for rung in ("R0", "R2p"):
+                fake_build_dir(builds / rung)
+            out_path = Path(d) / "ladder.json"
+            argv = ["--rungs", "R0", "R2p", "--builds-root", str(builds), "--repeats", "1", "--set", "full",
+                    "--ref-root", f"{d}/ref", "--out", str(out_path), "--scratch", f"{d}/scratch", "--no-warmup"]
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(time_ladder.main(argv), 0)
+            out = bench_lib.read_json(out_path)
+            full = {c.name for c in configs.configs_in("full")}
+            for rung in ("R0", "R2p"):
+                self.assertEqual({r["config"] for r in out["records"] if r["rung"] == rung}, full)
 
     def test_time_ladder_replaces_a_failed_record(self):
         with tempfile.TemporaryDirectory() as d:
