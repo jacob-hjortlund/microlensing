@@ -1,6 +1,7 @@
 """Tests of the batch description expansion:
 python -m unittest tests.batch.test_batch_params -v"""
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -92,6 +93,19 @@ class ExpandTests(unittest.TestCase):
         self.assertEqual(expand({})[0]["outfile_prefix"], "./0_")
         with self.assertRaises(ValueError):
             expand({"outfile_prefix": ["a/", "a/"]})
+
+    def test_duplicate_prefixes_are_listed_once_each(self):
+        with self.assertRaises(ValueError) as cm:
+            expand({"outfile_prefix": ["b/", "a/", "b/", "c/", "a/", "b/"]})
+        self.assertEqual(str(cm.exception), "duplicate outfile_prefix values: ['a/', 'b/']")
+
+    def test_many_maps_expand_quickly(self):
+        # the duplicate-prefix check is linear: counting each prefix in the whole list took 10 s for 30,000 maps
+        t0 = time.perf_counter()
+        maps = expand({"kappa_tot": 0.4, "outfile_prefix": "run/"}, num_maps=30000)
+        elapsed = time.perf_counter() - t0
+        self.assertEqual(len({m["outfile_prefix"] for m in maps}), 30000)
+        self.assertLess(elapsed, 1.0)
 
     def test_bad_seed_entries_raise(self):
         for bad in (None, 0, -1, 2**31, 3.5, True):
