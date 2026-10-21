@@ -146,6 +146,71 @@ protected:
 	int* tree_counters = nullptr;
 	size_t tree_counters_cap = 0;
 
+	/******************************************************************************
+	host copy of the stars, held by a snapshot (see IPM<T>::snapshot), which has no
+	device memory. empty for every other object
+	******************************************************************************/
+	std::vector<star<T>> host_stars;
+
+	/******************************************************************************
+	the stars write_files writes: the host copy when there is one, else the device
+	array
+	******************************************************************************/
+	const star<T>* output_stars() const
+	{
+		return host_stars.empty() ? stars : host_stars.data();
+	}
+
+	/******************************************************************************
+	copy the input parameters of another object. the device, reuse_memory, the
+	stream and every buffer stay as they are
+	******************************************************************************/
+	void copy_inputs_from(const Microlensing<T>& o)
+	{
+		kappa_tot = o.kappa_tot;
+		shear = o.shear;
+		kappa_star = o.kappa_star;
+		theta_star = o.theta_star;
+		mass_function_str = o.mass_function_str;
+		m_solar = o.m_solar;
+		m_lower = o.m_lower;
+		m_upper = o.m_upper;
+		rectangular = o.rectangular;
+		approx = o.approx;
+		safety_scale = o.safety_scale;
+		starfile = o.starfile;
+		random_seed = o.random_seed;
+		write_stars = o.write_stars;
+		outfile_prefix = o.outfile_prefix;
+	}
+
+	/******************************************************************************
+	copy the values derived from the input parameters of another object's run,
+	the ones write_files and the getters consult
+	******************************************************************************/
+	void copy_derived_from(const Microlensing<T>& o)
+	{
+		num_stars = o.num_stars;
+		mass_function = o.mass_function;
+		mean_mass = o.mean_mass;
+		mean_mass2 = o.mean_mass2;
+		mean_mass2_ln_mass = o.mean_mass2_ln_mass;
+		kappa_star_actual = o.kappa_star_actual;
+		m_lower_actual = o.m_lower_actual;
+		m_upper_actual = o.m_upper_actual;
+		mean_mass_actual = o.mean_mass_actual;
+		mean_mass2_actual = o.mean_mass2_actual;
+		mean_mass2_ln_mass_actual = o.mean_mass2_ln_mass_actual;
+		mu_ave = o.mu_ave;
+		corner = o.corner;
+		taylor_smooth = o.taylor_smooth;
+		alpha_error = o.alpha_error;
+		expansion_order = o.expansion_order;
+		root_half_length = o.root_half_length;
+		tree_levels = o.tree_levels;
+		num_nodes = o.num_nodes;
+	}
+
 
 
     bool set_cuda_devices(int verbose)
@@ -231,6 +296,8 @@ protected:
 			has_memory = has_memory || level;
 		}
 		if (!use_device_to_free(has_memory, return_on_error)) return false;
+		host_stars.clear();
+		host_stars.shrink_to_fit();
 		
 		/******************************************************************************
 		free memory and set variables to nullptr and capacities to 0
@@ -820,7 +887,7 @@ protected:
 		{
 			print_verbose("Writing Microlensing<T> star info...\n", verbose, 2);
 			fname = outfile_prefix + class_name + "_stars" + outfile_type;
-			if (!write_star_file<T>(num_stars, rectangular, corner, theta_star, stars, fname))
+			if (!write_star_file<T>(num_stars, rectangular, corner, theta_star, const_cast<star<T>*>(output_stars()), fname)) //write_star_file only reads the stars
 			{
 				std::cerr << "Error. Unable to write star info to file " << fname << "\n";
 				return false;
@@ -961,6 +1028,6 @@ public:
 
 	int get_num_stars()			{return num_stars;}
 	Complex<T> get_corner()		{if (rectangular) {return corner;} else {return Complex<T>(corner.abs(), 0);}}
-	star<T>* get_stars()		{return stars;}
+	star<T>* get_stars()		{return host_stars.empty() ? stars : host_stars.data();}
 
 };

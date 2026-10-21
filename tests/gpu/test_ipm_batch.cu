@@ -30,6 +30,8 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <unistd.h> //for mkdtemp
 #include <utility>
@@ -543,6 +545,222 @@ static void thrust_minmax_scratch_allocations()
 	report(name, ok, detail);
 }
 
+// a worker with every write_* flag set, running the 600x600 map; w.device is the last visible device
+template <typename T>
+static bool make_snapshot_worker(IPM<T>& w)
+{
+	int n_devices = 0;
+	cudaGetDeviceCount(&n_devices);
+	w.device = n_devices - 1;
+	w.reuse_memory = 1;
+	if (!w.create_stream()) return false;
+	set_default_inputs(w);
+	configure(w);
+	w.write_stars = 1;
+	w.write_maps = 1;
+	w.write_parities = 1;
+	w.write_histograms = 1;
+	return w.run(0);
+}
+
+static std::string slurp(const std::filesystem::path& p)
+{
+	std::ifstream f(p, std::ios::binary);
+	return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
+// the three maps of a worker, copied for save_host
+template <typename T>
+static bool copy_three_maps(const IPM<T>& w, std::vector<T> maps[3])
+{
+	for (int m = 0; m < 3; m++)
+	{
+		if (!copy_map(w, m, maps[m])) return false;
+	}
+	return true;
+}
+
+// save() of a worker and save_host() of its snapshot write the same files, byte for byte (one run's data against
+// itself, so the star order is the same). 11 files: the parameter info (one file), the stars, three maps, six histograms
+template <typename T>
+static void snapshot_save_host_matches_save()
+{
+	const std::string name = case_name<T>("snapshot_save_host_matches_save");
+	IPM<T> w;
+	if (!make_snapshot_worker(w)) { report(name, false, "worker run failed"); return; }
+	char tmpl[] = "/tmp/ipm_snapshot_XXXXXX";
+	if (mkdtemp(tmpl) == nullptr) { report(name, false, "mkdtemp failed"); return; }
+	const std::string dir = tmpl;
+	std::filesystem::create_directory(dir + "/a");
+	std::filesystem::create_directory(dir + "/b");
+	w.outfile_prefix = dir + "/a/";
+	bool ok = w.save(0);
+	std::string detail = ok ? "" : "save failed";
+	IPM<T>* s = ok ? w.snapshot() : nullptr;
+	std::vector<T> maps[3];
+	if (ok && (s == nullptr || !copy_three_maps(w, maps))) { ok = false; detail = "snapshot or map copy failed"; }
+	if (ok)
+	{
+		s->outfile_prefix = dir + "/b/";
+		ok = s->save_host(maps[0].data(), maps[1].data(), maps[2].data(), 0);
+		if (!ok) detail = "save_host failed";
+	}
+	if (ok)
+	{
+		int n_a = 0, n_b = 0;
+		for (const auto& e : std::filesystem::directory_iterator(dir + "/b")) { n_b++; (void)e; }
+		for (const auto& e : std::filesystem::directory_iterator(dir + "/a"))
+		{
+			n_a++;
+			const auto twin = std::filesystem::path(dir + "/b") / e.path().filename();
+			if (!std::filesystem::exists(twin) || slurp(e.path()) != slurp(twin))
+			{
+				ok = false;
+				detail = "file " + e.path().filename().string() + " differs or is missing";
+				break;
+			}
+		}
+		if (ok && (n_a != n_b || n_a != 11)) { ok = false; detail = "file counts " + std::to_string(n_a) + " and " + std::to_string(n_b); }
+	}
+	delete s;
+	std::filesystem::remove_all(dir);
+	report(name, ok, detail);
+}
+
+// creating a snapshot and saving from it must not wait for the spin kernel on the legacy stream of device 0
+template <typename T>
+static void snapshot_and_save_host_make_no_device_sync()
+{
+	const std::string name = case_name<T>("snapshot_and_save_host_make_no_device_sync");
+	IPM<T> w;
+	if (!make_snapshot_worker(w)) { report(name, false, "worker run failed"); return; }
+	std::vector<T> maps[3];
+	if (!copy_three_maps(w, maps)) { report(name, false, "map copy failed"); return; }
+	char tmpl[] = "/tmp/ipm_snapshot_XXXXXX";
+	if (mkdtemp(tmpl) == nullptr) { report(name, false, "mkdtemp failed"); return; }
+	const std::string dir = tmpl;
+	//the first snapshot, outside the timed region, loads whatever the copies need
+	{
+		IPM<T>* warm = w.snapshot();
+		delete warm;
+	}
+	warm_up_spin();
+	launch_spin(1.5, 0);
+	const auto start = std::chrono::steady_clock::now();
+	IPM<T>* s2 = w.snapshot();
+	bool ok = s2 != nullptr;
+	if (ok)
+	{
+		s2->outfile_prefix = dir + "/";
+		ok = s2->save_host(maps[0].data(), maps[1].data(), maps[2].data(), 0);
+	}
+	delete s2;
+	const double t = seconds_since(start);
+	cudaDeviceSynchronize();
+	std::filesystem::remove_all(dir);
+	std::printf("INFO %s: snapshot + save_host + delete %.3f s while the spin kernel ran\n", name.c_str(), t);
+	report(name, ok && t < 0.5, !ok ? "snapshot or save_host failed" : "took " + std::to_string(t) + " s");
+}
+
+template <typename T>
+static void snapshot_getters_match()
+{
+	const std::string name = case_name<T>("snapshot_getters_match");
+	IPM<T> w;
+	if (!make_snapshot_worker(w)) { report(name, false, "worker run failed"); return; }
+	w.mass_function_str = "salpeter";
+	w.m_lower = static_cast<T>(0.1);
+	w.m_solar = static_cast<T>(0.5);
+	if (!w.run(0)) { report(name, false, "second run failed"); return; }
+	IPM<T>* s = w.snapshot();
+	if (s == nullptr) { report(name, false, "snapshot failed"); return; }
+	const Complex<T> cw = w.get_corner(), cs = s->get_corner();
+	const star<T>* sw = w.get_stars();
+	const star<T>* ss = s->get_stars();
+	const bool stars_ok = sw != nullptr && ss != nullptr && ss != sw
+		&& std::memcmp(sw, ss, 1ULL * w.get_num_stars() * sizeof(star<T>)) == 0;
+	const bool ok = s->get_num_stars() == w.get_num_stars() && cw.re == cs.re && cw.im == cs.im
+		&& s->get_t_shoot_cells() == w.get_t_shoot_cells() && s->random_seed == w.random_seed
+		&& s->kappa_star == w.kappa_star && s->m_lower == w.m_lower && s->device == w.device
+		&& s->get_perimeter_deposit_used() == w.get_perimeter_deposit_used();
+	delete s;
+	report(name, ok && stars_ok, !stars_ok ? "the snapshot's stars differ from the worker's" : "a getter or input differs");
+}
+
+template <typename T>
+static void reset_inputs_restores_defaults()
+{
+	const std::string name = case_name<T>("reset_inputs_restores_defaults");
+	IPM<T> w;
+	w.reuse_memory = 1;
+	w.device = 0;
+	w.kappa_tot = 0.9; w.shear = 0.1; w.kappa_star = 0.5; w.theta_star = 2;
+	w.mass_function_str = "kroupa"; w.m_solar = 3; w.m_lower = 0.2; w.m_upper = 20;
+	w.rectangular = 1; w.approx = 0; w.safety_scale = 2; w.starfile = "x.bin"; w.random_seed = 99;
+	w.write_stars = 0; w.outfile_prefix = "/nowhere/";
+	w.light_loss = 0.005; w.center_y = Complex<T>(1, 2); w.half_length_y = Complex<T>(3, 4);
+	w.num_pixels_y = Complex<int>(7, 9); w.num_rays_y = 5;
+	w.write_maps = 0; w.write_parities = 1; w.write_histograms = 0;
+	w.reset_inputs();
+	const IPM<T> d;
+	const bool ok = w.kappa_tot == d.kappa_tot && w.shear == d.shear && w.kappa_star == d.kappa_star
+		&& w.theta_star == d.theta_star && w.mass_function_str == d.mass_function_str && w.m_solar == d.m_solar
+		&& w.m_lower == d.m_lower && w.m_upper == d.m_upper && w.rectangular == d.rectangular && w.approx == d.approx
+		&& w.safety_scale == d.safety_scale && w.starfile == d.starfile && w.random_seed == d.random_seed
+		&& w.write_stars == d.write_stars && w.outfile_prefix == d.outfile_prefix && w.light_loss == d.light_loss
+		&& w.center_y.re == d.center_y.re && w.center_y.im == d.center_y.im
+		&& w.half_length_y.re == d.half_length_y.re && w.half_length_y.im == d.half_length_y.im
+		&& w.num_pixels_y.re == d.num_pixels_y.re && w.num_pixels_y.im == d.num_pixels_y.im
+		&& w.num_rays_y == d.num_rays_y && w.write_maps == d.write_maps && w.write_parities == d.write_parities
+		&& w.write_histograms == d.write_histograms;
+	report(name, ok && w.reuse_memory == 1 && w.device == 0, ok ? "reuse_memory or device changed" : "an input is not the default");
+}
+
+template <typename T>
+static void save_host_refuses_non_snapshot()
+{
+	const std::string name = case_name<T>("save_host_refuses_non_snapshot");
+	IPM<T> w;
+	if (!make_snapshot_worker(w)) { report(name, false, "worker run failed"); return; }
+	std::vector<T> maps[3];
+	if (!copy_three_maps(w, maps)) { report(name, false, "map copy failed"); return; }
+	char tmpl[] = "/tmp/ipm_snapshot_XXXXXX";
+	if (mkdtemp(tmpl) == nullptr) { report(name, false, "mkdtemp failed"); return; }
+	const std::string dir = tmpl;
+	w.outfile_prefix = dir + "/";
+	const bool refused = !w.save_host(maps[0].data(), nullptr, nullptr, 0);
+	//a snapshot refuses a missing map too
+	IPM<T>* s = w.snapshot();
+	bool refused_null = false;
+	if (s != nullptr)
+	{
+		s->outfile_prefix = dir + "/";
+		refused_null = !s->save_host(maps[0].data(), nullptr, maps[2].data(), 0);
+	}
+	delete s;
+	std::filesystem::remove_all(dir);
+	report(name, refused && refused_null, refused ? "a snapshot accepted a null map" : "a non-snapshot saved");
+}
+
+// shoot_cells sets the flag: the perimeter deposit is used by default and not when forced to the direct deposit
+template <typename T>
+static void perimeter_flag()
+{
+	const std::string name = case_name<T>("perimeter_flag");
+	IPM<T> w;
+	w.reuse_memory = 1;
+	if (!w.create_stream()) { report(name, false, "create_stream failed"); return; }
+	configure(w);
+	bool ok = w.run(0);
+	const bool normal = ok && w.get_perimeter_deposit_used();
+	IPM<T>::testing_force_direct_deposit = true;
+	configure(w);
+	ok = ok && w.run(0);
+	const bool forced_off = ok && !w.get_perimeter_deposit_used();
+	IPM<T>::testing_force_direct_deposit = false;
+	report(name, normal && forced_off, !ok ? "a run failed" : !normal ? "flag not set by a normal run" : "flag set by a forced direct deposit run");
+}
+
 template <typename T>
 static void run_cases()
 {
@@ -555,6 +773,13 @@ static void run_cases()
 	warm_worker_run_makes_no_device_sync<T>(false);
 	warm_worker_run_makes_no_device_sync<T>(true);
 	default_object_makes_no_cuda_call<T>();
+	snapshot_save_host_matches_save<T>();
+	snapshot_getters_match<T>();
+	reset_inputs_restores_defaults<T>();
+	save_host_refuses_non_snapshot<T>();
+	perimeter_flag<T>();
+	warm_up_spin();
+	snapshot_and_save_host_make_no_device_sync<T>();
 }
 
 int main()
