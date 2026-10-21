@@ -231,7 +231,7 @@ write array of values to disk
 \return bool -- true if file is successfully written, false if not
 ******************************************************************************/
 template <typename T>
-bool write_array(T* vals, int nrows, int ncols, const std::string& fname)
+bool write_array(const T* vals, int nrows, int ncols, const std::string& fname)
 {
 	std::filesystem::path fpath = fname;
 

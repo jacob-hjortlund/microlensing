@@ -167,6 +167,17 @@ private:
 	bool have_histograms = false;
 
 	/******************************************************************************
+	a snapshot holds host copies of the histograms (and of the stars, see
+	Microlensing<T>::host_stars) instead of device memory, and saves with save_host
+	******************************************************************************/
+	bool is_snapshot = false;
+	std::vector<int> h_histogram, h_histogram_minima, h_histogram_saddles;
+	std::vector<int> h_log_histogram, h_log_histogram_minima, h_log_histogram_saddles;
+
+	//whether the last shoot_cells used the step buffer of the perimeter deposit
+	bool perimeter_deposit_used = false;
+
+	/******************************************************************************
 	step buffer of the perimeter deposit and the clamp statistics of its row sums
 	(device; allocated within shoot_cells, and freed there unless reuse_memory)
 	******************************************************************************/
@@ -306,6 +317,48 @@ private:
 		have_histograms = false;
 		if (starfile != "" && !release_buffer(stars, stars_cap, true, "cudaFree(*stars)")) return false;
 		return true;
+	}
+
+	/******************************************************************************
+	copy the input parameters of another object (see Microlensing<T>::copy_inputs_from)
+	******************************************************************************/
+	void copy_inputs_from(const IPM<T>& o)
+	{
+		Microlensing<T>::copy_inputs_from(o);
+		light_loss = o.light_loss;
+		center_y = o.center_y;
+		half_length_y = o.half_length_y;
+		num_pixels_y = o.num_pixels_y;
+		num_rays_y = o.num_rays_y;
+		write_maps = o.write_maps;
+		write_parities = o.write_parities;
+		write_histograms = o.write_histograms;
+	}
+
+	/******************************************************************************
+	copy the values derived from the input parameters of another object's run, and
+	whether its parity maps and histograms are those of the run
+	******************************************************************************/
+	void copy_derived_from(const IPM<T>& o)
+	{
+		Microlensing<T>::copy_derived_from(o);
+		t_shoot_cells = o.t_shoot_cells;
+		num_rays_x = o.num_rays_x;
+		ray_half_sep = o.ray_half_sep;
+		center_x = o.center_x;
+		half_length_x = o.half_length_x;
+		num_ray_threads = o.num_ray_threads;
+		num_leaves = o.num_leaves;
+		num_direct = o.num_direct;
+		min_mag = o.min_mag;
+		max_mag = o.max_mag;
+		histogram_length = o.histogram_length;
+		min_log_mag = o.min_log_mag;
+		max_log_mag = o.max_log_mag;
+		log_histogram_length = o.log_histogram_length;
+		perimeter_deposit_used = o.perimeter_deposit_used;
+		have_parity_maps = o.have_parity_maps;
+		have_histograms = o.have_histograms;
 	}
 
 	bool check_input_params(int verbose)
@@ -563,6 +616,7 @@ private:
 
 	bool shoot_cells(int verbose)
 	{
+		perimeter_deposit_used = false;
 		/******************************************************************************
 		one block per TILE x TILE tile of cells; launch as many blocks as the device
 		can keep resident (occupancy API), not one per SM as get_blocks() does, so
@@ -675,6 +729,8 @@ private:
 				print_verbose("Perimeter deposit for bounding boxes above " << ipm_fast::EDGE_MIN_BBOX << " pixels.\n", verbose, 2);
 			}
 		}
+
+		perimeter_deposit_used = perimeter;
 
 		/******************************************************************************
 		shoot rays and calculate time taken in seconds (including the row sums of
@@ -939,7 +995,13 @@ private:
 		return true;
 	}
 
-	bool write_files(int verbose)
+	/******************************************************************************
+	write the output files. With host_maps (a snapshot: the total, minima and
+	saddle maps in host memory), the histograms come from the host copies and the
+	maps are written from host memory, with no CUDA call. Otherwise they are
+	copied from the device
+	******************************************************************************/
+	bool write_files(int verbose, const T* const* host_maps = nullptr)
 	{
 		/******************************************************************************
 		stream for writing output files
@@ -949,7 +1011,7 @@ private:
 		outfile.precision(9);
 		std::string fname;
 
-		if (!use_device()) return false;
+		if (host_maps == nullptr && !use_device()) return false;
 
 		if (!Microlensing<T>::write_files(verbose, "ipm")) return false;
 
@@ -992,9 +1054,16 @@ private:
 
 			//the histograms are in device memory: each one is copied into h_hist before it is written.
 			//a failed allocation returns false: it must not throw through the C interface (save)
+			//a snapshot has host copies of them (h_vec) and copies nothing
 			std::vector<int> h_hist;
-			auto copy_histogram = [&](const int* d_hist, int n)
+			auto copy_histogram = [&](const int* d_hist, std::vector<int>& h_vec, int n)
 			{
+				if (host_maps != nullptr)
+				{
+					if (!have_histograms || n < 1 || h_vec.size() != static_cast<size_t>(n)) return false;
+					h_hist = h_vec;
+					return true;
+				}
 				if (!have_histograms || d_hist == nullptr || n < 1) return false;
 				try
 				{
@@ -1012,7 +1081,7 @@ private:
 			};
 
 			fname = outfile_prefix + "ipm_mags_numpixels.txt";
-			if (!copy_histogram(histogram, histogram_length) || !write_histogram<int>(h_hist.data(), histogram_length, min_mag, fname))
+			if (!copy_histogram(histogram, h_histogram, histogram_length) || !write_histogram<int>(h_hist.data(), histogram_length, min_mag, fname))
 			{
 				std::cerr << "Error. Unable to write magnification histogram to file " << fname << "\n";
 				return false;
@@ -1020,7 +1089,7 @@ private:
 			print_verbose("Done writing magnification histogram to file " << fname << "\n", verbose, 1);
 
 			fname = outfile_prefix + "ipm_log_mags_numpixels.txt";
-			if (!copy_histogram(log_histogram, log_histogram_length) || !write_histogram<int>(h_hist.data(), log_histogram_length, min_log_mag, fname))
+			if (!copy_histogram(log_histogram, h_log_histogram, log_histogram_length) || !write_histogram<int>(h_hist.data(), log_histogram_length, min_log_mag, fname))
 			{
 				std::cerr << "Error. Unable to write magnification histogram to file " << fname << "\n";
 				return false;
@@ -1030,7 +1099,7 @@ private:
 			if (write_parities)
 			{
 				fname = outfile_prefix + "ipm_mags_numpixels_minima.txt";
-				if (!copy_histogram(have_parity_maps ? histogram_minima : nullptr, histogram_length) || !write_histogram<int>(h_hist.data(), histogram_length, min_mag, fname))
+				if (!copy_histogram(have_parity_maps ? histogram_minima : nullptr, h_histogram_minima, histogram_length) || !write_histogram<int>(h_hist.data(), histogram_length, min_mag, fname))
 				{
 					std::cerr << "Error. Unable to write magnification histogram to file " << fname << "\n";
 					return false;
@@ -1038,7 +1107,7 @@ private:
 				print_verbose("Done writing magnification histogram to file " << fname << "\n", verbose, 1);
 
 				fname = outfile_prefix + "ipm_log_mags_numpixels_minima.txt";
-				if (!copy_histogram(have_parity_maps ? log_histogram_minima : nullptr, log_histogram_length) || !write_histogram<int>(h_hist.data(), log_histogram_length, min_log_mag, fname))
+				if (!copy_histogram(have_parity_maps ? log_histogram_minima : nullptr, h_log_histogram_minima, log_histogram_length) || !write_histogram<int>(h_hist.data(), log_histogram_length, min_log_mag, fname))
 				{
 					std::cerr << "Error. Unable to write magnification histogram to file " << fname << "\n";
 					return false;
@@ -1046,7 +1115,7 @@ private:
 				print_verbose("Done writing magnification histogram to file " << fname << "\n", verbose, 1);
 
 				fname = outfile_prefix + "ipm_mags_numpixels_saddles.txt";
-				if (!copy_histogram(have_parity_maps ? histogram_saddles : nullptr, histogram_length) || !write_histogram<int>(h_hist.data(), histogram_length, min_mag, fname))
+				if (!copy_histogram(have_parity_maps ? histogram_saddles : nullptr, h_histogram_saddles, histogram_length) || !write_histogram<int>(h_hist.data(), histogram_length, min_mag, fname))
 				{
 					std::cerr << "Error. Unable to write magnification histogram to file " << fname << "\n";
 					return false;
@@ -1054,7 +1123,7 @@ private:
 				print_verbose("Done writing magnification histogram to file " << fname << "\n", verbose, 1);
 
 				fname = outfile_prefix + "ipm_log_mags_numpixels_saddles.txt";
-				if (!copy_histogram(have_parity_maps ? log_histogram_saddles : nullptr, log_histogram_length) || !write_histogram<int>(h_hist.data(), log_histogram_length, min_log_mag, fname))
+				if (!copy_histogram(have_parity_maps ? log_histogram_saddles : nullptr, h_log_histogram_saddles, log_histogram_length) || !write_histogram<int>(h_hist.data(), log_histogram_length, min_log_mag, fname))
 				{
 					std::cerr << "Error. Unable to write magnification histogram to file " << fname << "\n";
 					return false;
@@ -1066,15 +1135,24 @@ private:
 
 		/******************************************************************************
 		write magnifications for minima, saddle, and combined maps, streamed from
-		device memory through one writer, so that they share its pinned buffers
+		device memory through one writer, so that they share its pinned buffers.
+		a snapshot writes them from the host maps
 		******************************************************************************/
 		if (write_maps)
 		{
 			print_verbose("Writing magnifications...\n", verbose, 2);
-			DeviceArrayWriter<T> writer;
+			//a snapshot makes no CUDA call, not even the one of the writer's release
+			std::unique_ptr<DeviceArrayWriter<T>> writer;
+			if (host_maps == nullptr) writer.reset(new DeviceArrayWriter<T>());
+			//the maps of this run: the device maps, or the host maps of a snapshot
+			auto write_map = [&](const T* device_map, int which, const std::string& file)
+			{
+				if (host_maps != nullptr) return host_maps[which] != nullptr && write_array<T>(host_maps[which], num_pixels_y.im, num_pixels_y.re, file);
+				return writer->write(device_map, num_pixels_y.im, num_pixels_y.re, file);
+			};
 
 			fname = outfile_prefix + "ipm_magnifications" + outfile_type;
-			if (!writer.write(d_pixels, num_pixels_y.im, num_pixels_y.re, fname))
+			if (!write_map(d_pixels, 0, fname))
 			{
 				std::cerr << "Error. Unable to write magnifications to file " << fname << "\n";
 				return false;
@@ -1083,7 +1161,7 @@ private:
 			if (write_parities)
 			{
 				fname = outfile_prefix + "ipm_magnifications_minima" + outfile_type;
-				if (!writer.write(pixels_minima(), num_pixels_y.im, num_pixels_y.re, fname))
+				if (!write_map(pixels_minima(), 1, fname))
 				{
 					std::cerr << "Error. Unable to write magnifications to file " << fname << "\n";
 					return false;
@@ -1091,14 +1169,14 @@ private:
 				print_verbose("Done writing magnifications to file " << fname << "\n", verbose, 1);
 
 				fname = outfile_prefix + "ipm_magnifications_saddles" + outfile_type;
-				if (!writer.write(pixels_saddles(), num_pixels_y.im, num_pixels_y.re, fname))
+				if (!write_map(pixels_saddles(), 2, fname))
 				{
 					std::cerr << "Error. Unable to write magnifications to file " << fname << "\n";
 					return false;
 				}
 				print_verbose("Done writing magnifications to file " << fname << "\n", verbose, 1);
 			}
-			if (!writer.release())
+			if (writer && !writer->release())
 			{
 				std::cerr << "Error. CUDA error while releasing the buffers used to write the magnifications.\n";
 				return false;
@@ -1283,6 +1361,119 @@ public:
 
 		return true;
 	}
+
+	/******************************************************************************
+	set every input parameter to its default, as in a new object, to start the
+	next map of a reused object. device, reuse_memory, the stream and every buffer
+	stay as they are
+	******************************************************************************/
+	void reset_inputs()
+	{
+		const IPM<T> d;
+		copy_inputs_from(d);
+	}
+
+	/******************************************************************************
+	a new object that holds this object's last map: its input parameters, derived
+	values and device, a host copy of the stars and of the histograms, and no
+	device memory. save_host writes the files of save() from it, with the maps
+	the caller copied (copy_pixels*). the caller owns the object (delete)
+
+	\return IPM<T>* -- the snapshot, or nullptr if this object has not run or a
+	                   copy or allocation fails
+	******************************************************************************/
+	IPM<T>* snapshot() const
+	{
+		if (stars == nullptr || num_stars < 1 || is_snapshot) return nullptr;
+		IPM<T>* s = new (std::nothrow) IPM<T>();
+		if (s == nullptr) return nullptr;
+		s->copy_inputs_from(*this);
+		s->copy_derived_from(*this);
+		s->device = device;
+		s->is_snapshot = true;
+
+		bool ok = use_device();
+		try
+		{
+			s->host_stars.resize(num_stars);
+			if (write_histograms && have_histograms)
+			{
+				auto copy_histogram = [&](const int* d_hist, std::vector<int>& h_vec, int n)
+				{
+					if (d_hist == nullptr || n < 1) return false;
+					h_vec.resize(n);
+					cudaMemcpyAsync(h_vec.data(), d_hist, n * sizeof(int), cudaMemcpyDeviceToHost, stream);
+					return !cuda_error("cudaMemcpyAsync(*h_hist)", false, __FILE__, __LINE__);
+				};
+				ok = ok && copy_histogram(histogram, s->h_histogram, histogram_length)
+					&& copy_histogram(log_histogram, s->h_log_histogram, log_histogram_length);
+				if (write_parities && have_parity_maps)
+				{
+					ok = ok && copy_histogram(histogram_minima, s->h_histogram_minima, histogram_length)
+						&& copy_histogram(histogram_saddles, s->h_histogram_saddles, histogram_length)
+						&& copy_histogram(log_histogram_minima, s->h_log_histogram_minima, log_histogram_length)
+						&& copy_histogram(log_histogram_saddles, s->h_log_histogram_saddles, log_histogram_length);
+				}
+			}
+		}
+		catch (const std::bad_alloc&)
+		{
+			std::cerr << "Error. Unable to allocate the host copies of a snapshot.\n";
+			ok = false;
+		}
+		if (ok)
+		{
+			cudaMemcpyAsync(s->host_stars.data(), stars, 1ULL * num_stars * sizeof(star<T>), cudaMemcpyDeviceToHost, stream);
+			ok = !cuda_error("cudaMemcpyAsync(*host_stars)", false, __FILE__, __LINE__);
+		}
+		if (ok)
+		{
+			//the copies are pageable and the stream is not the legacy stream: wait for them
+			cudaStreamSynchronize(stream);
+			ok = !cuda_error("cudaStreamSynchronize", false, __FILE__, __LINE__);
+		}
+		if (!ok)
+		{
+			delete s;
+			return nullptr;
+		}
+		return s;
+	}
+
+	/******************************************************************************
+	write the files of save() from host data, with no CUDA call. only for a
+	snapshot
+
+	\param pixels, minima, saddles -- host copies of the total, minima and saddle
+	                                  maps (num_pixels_y.re * num_pixels_y.im values
+	                                  each). the parity maps are needed with write_parities
+	\param verbose -- verbosity level
+
+	\return bool -- false (with an error message) for an object that is not a
+	                snapshot or a needed map that is null, or a file that cannot
+	                be written
+	******************************************************************************/
+	bool save_host(const T* pixels, const T* minima, const T* saddles, int verbose)
+	{
+		if (!is_snapshot)
+		{
+			std::cerr << "Error. save_host is only available for a snapshot.\n";
+			return false;
+		}
+		if (write_maps && (pixels == nullptr || (write_parities && (minima == nullptr || saddles == nullptr))))
+		{
+			std::cerr << "Error. save_host needs every map that is to be written.\n";
+			return false;
+		}
+		const T* const host_maps[3] = {pixels, minima, saddles};
+		return write_files(verbose, host_maps);
+	}
+
+	/******************************************************************************
+	whether the last run's shoot_cells used the step buffer of the perimeter
+	deposit (false when every triangle took the direct deposit)
+	******************************************************************************/
+	bool get_perimeter_deposit_used() const	{return perimeter_deposit_used;}
 
 	/******************************************************************************
 	copy a map (num_pixels_y.re * num_pixels_y.im values) from the device into
