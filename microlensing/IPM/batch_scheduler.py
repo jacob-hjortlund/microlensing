@@ -2,8 +2,9 @@
 
 Each slot runs one map at a time and keeps its GPU memory between maps. During results(), one thread per
 slot drives it. A map is admitted to a GPU when the extra memory its slot needs, on top of what that GPU's
-slots already hold, fits the GPU's budget. A map that does not fit runs alone once nothing else runs on the
-GPU. A slot that keeps more memory than its next map needs gives it back while another slot waits for memory,
+slots already hold, fits the GPU's budget. A map goes to a GPU that runs fewer maps when that GPU can start it
+at once, so that a batch spreads over every GPU. A map that does not fit runs alone once nothing else runs on
+the GPU. A slot that keeps more memory than its next map needs gives it back while another slot waits for memory,
 and no map is admitted on a GPU while memory is being freed on it. Finished results wait in a queue bounded in
 bytes until the consumer releases them. A failing map becomes a BatchMapError result and the batch carries on.
 
@@ -18,6 +19,7 @@ maps fail. No map is admitted on a GPU while its memory is being freed or the GP
 
 The scheduler knows nothing of IPM. A backend estimates the maps, describes the GPUs and opens the slots,
 and the parameter dicts pass through untouched."""
+import itertools
 import operator
 import threading
 import warnings
@@ -142,6 +144,11 @@ def _map_error(index, exc):
     error = BatchMapError(index, _describe(exc), _cuda_error(exc))
     error.__cause__ = exc
     return error
+
+
+def _growth(held, e):
+    """The device bytes a slot that holds `held` adds to run a map of estimate e (its buffers only grow)."""
+    return held.cmax(e).device_bytes() - held.device_bytes()
 
 
 def _empty_stats(devices, dead):
@@ -362,8 +369,11 @@ class Scheduler:
                 dev = run.stats["devices"][d]
                 dev["budget"] = run.budget[d]
                 dev["peak_committed"] = held
-                for st in states[:n]:
-                    if not st.broken:
+            # slot 0 of every GPU first, then slot 1, and so on, so that the first maps find a thread on every GPU
+            for k in range(max(run.n_slots.values(), default=0)):
+                for d in devices:
+                    st = self._slots[d][k] if k < run.n_slots[d] else None
+                    if st is not None and not st.broken:
                         run.threads.append(threading.Thread(target=self._slot_thread, args=(run, st),
                                                             name=f"ipm-batch-{d}-{st.number}", daemon=True))
             self._cond.notify_all()
@@ -465,7 +475,8 @@ class Scheduler:
 
     def _try_admit(self, run, st):
         """The admission rules (lock held) for the first map in pending that this slot's device may run (maps
-        pinned to another GPU are skipped). Returns a _Job, or None to wait. A slot that waits because its map
+        pinned to another GPU are skipped). Returns a _Job, or None to wait. A slot leaves the map to another GPU
+        that runs fewer maps and would start it at once (_taken_elsewhere). A slot that waits because its map
         does not fit next to the maps running on its device is added to mem_waiters."""
         d = st.device
         if run.releases[d] > 0 or run.checks[d] > 0:
@@ -479,10 +490,11 @@ class Scheduler:
             return None
         if run.running[d] >= run.slot_limit[d]:
             return None
+        if self._taken_elsewhere(run, d, pos):
+            return None    # a GPU that runs fewer maps starts this one at once: leave it to that GPU
         need = st.held.cmax(e)
-        growth = need.device_bytes() - st.held.device_bytes()
         victims = []
-        if run.committed[d] + growth > run.budget[d]:
+        if run.committed[d] + _growth(st.held, e) > run.budget[d]:
             if run.running[d] > 0:
                 run.mem_waiters[d].add(st)
                 return None
@@ -724,6 +736,25 @@ class Scheduler:
         self._cond.notify_all()
 
     # ---- helpers (lock held)
+
+    def _taken_elsewhere(self, run, d, pos):
+        """Whether another GPU that runs fewer maps than d would start pending[pos], d's next map, at once: the map
+        is not pinned to d, no map ahead of it is pinned to that GPU, the GPU is below its slot limit, no memory
+        is being freed on it and it is not being checked, and one of its idle slots fits the map in its budget.
+        Each GPU on the way to the one that starts the map runs fewer maps than the one before, so it is found."""
+        i = run.pending[pos]
+        e = run.estimates[i]
+        for d2, running in run.running.items():
+            if d2 == d or d2 in self._dead or running >= run.running[d] or running >= run.slot_limit[d2] or \
+                    run.releases[d2] > 0 or run.checks[d2] > 0 or run.pinned.get(i, d2) != d2:
+                continue
+            if any(run.pinned.get(j) == d2 for j in itertools.islice(run.pending, pos)):
+                continue    # d2 would start a retry pinned to it first
+            room = run.budget[d2] - run.committed[d2]
+            if any(not x.broken and x not in run.active[d2] and _growth(x.held, e) <= room
+                   for x in self._slots[d2][:run.n_slots[d2]]):
+                return True
+        return False
 
     def _usable(self, run, d):
         """Whether d can still run maps in this call: it is not dead and one of its slots is not broken."""
