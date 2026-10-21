@@ -65,3 +65,33 @@ If you just want the python capabilities (as I suspect is the case for most peop
 
 The `examples` directory contains *very* brief examples of the python packages I've written to create microlensing magnification maps, calculate critical curves and caustics, calculate number of caustic crossings maps, and locate microimages. There are additional examples showing how to generate lightcurves, and a note on units for the magnification maps. The `view_output.ipynb` example shows how to read the output of the IPM executable.
 
+
+### Batches of IPM maps
+
+`microlensing.IPM.batch.BatchedIPM` generates many IPM maps from one description, on one or more GPUs, and hands them back as they finish. It takes the arguments of `IPM`, plus `num_maps`. Each argument is either a single value shared by every map or a sequence with one value per map; sequences are paired element by element (use `itertools.product` for a grid). The number of maps is `num_maps` if given, otherwise the common length of the sequences (which must all agree, and must match `num_maps`), otherwise one. A string argument (`mass_function`, `starfile`, `outfile_prefix`) counts as a single value. Mismatches raise in the constructor, before any GPU work. `params(i)` returns the resolved inputs of map `i`.
+
+Seeds are fixed before any GPU work and are reported on each result as `random_seed`. A sequence of seeds is used as given. A single seed is a *starting* seed, even for one map: it gives each map a distinct seed in `1 ... 2**31 - 1` through `numpy.random.default_rng(start)`, map `i`'s seed does not depend on `num_maps`, and `random_seed=[s]` reproduces an `IPM` run with seed `s`. With no seed, distinct seeds are drawn. Seed and prefix sequences must not contain `None`, and given seeds must lie in `1 ... 2**31 - 1`. Maps with a `starfile` get seed 0, as with `IPM`. A single `outfile_prefix` (or none, meaning `"./"`) gives map `i` the prefix `prefix + f"{i}_"`; a sequence is used as given, and duplicate prefixes raise `ValueError`.
+
+```python
+from microlensing.IPM.batch import BatchedIPM
+
+# N maps, same lens, different seeds
+with BatchedIPM(kappa_tot=0.4, shear=0.4, smooth_fraction=0.5,
+                random_seed=range(1, 1001),                # or random_seed=42 and num_maps=1000
+                half_length_y1=25, half_length_y2=25,
+                num_pixels_y1=5000, num_pixels_y2=5000,
+                outfile_prefix="run1/") as batch:           # files: run1/0_ipm_..., run1/1_ipm_...
+    for index, ipm in batch.run():                         # as maps finish, in any order
+        if isinstance(ipm, Exception):                     # a BatchMapError: this map failed, the rest go on
+            print(index, ipm); continue
+        ...                                                # ipm is an ordinary IPM holding its map
+
+# sweep: one value per map; write each map to disk as it finishes and keep nothing in RAM
+batch = BatchedIPM(kappa_tot=[0.3, 0.4, 0.5], shear=[0.2, 0.4, 0.4], smooth_fraction=[0.0, 0.5, 0.9],
+                   random_seed=[11, 12, 13], write_maps=True, write_stars=True, ...)
+records = batch.run(save=True)    # a list of SavedMap(index, outfile_prefix, random_seed, error)
+```
+
+`run()` yields `(index, ipm)` in completion order. `ipm` is an ordinary `IPM` in the state `IPM.run()` leaves it (`save()` works on it and writes the same files), with its star arrays sorted by the tree, as with `IPM`. Results hold no GPU memory, so the GPUs' buffers are reused for the next map; `close()`, or leaving the `with` block, frees the workers' GPU memory. Finished maps wait in a queue capped at `max_result_bytes` (default 8 GiB, always room for one map), and workers stop starting maps while it is full. `run(save=True)` blocks, writes each map as it finishes with the files selected by `write_stars`, `write_maps`, `write_parities` and `write_histograms` (with none set, only parameter files are written, with a warning), and returns one `SavedMap` per map in batch order; `writers` sets the number of writer threads. By default `devices=None` uses every visible GPU, and `maps_per_gpu=None` runs at most 8 maps per GPU, fewer if memory is short; an explicit `maps_per_gpu` is only an upper limit. `last_run_stats` describes the last run.
+
+A failing map does not stop the batch: it comes back as `(index, BatchMapError)` (or as the `error` of its `SavedMap`). A map that runs out of device memory is retried with fewer maps on its GPU, and fails only if it cannot run alone. A GPU whose CUDA context breaks leaves the batch with a warning and its maps move to the other GPUs. Breaking out of the loop, an exception or Ctrl-C stops new maps from starting, lets running ones finish and joins the workers. `t_shoot_cells` of a batched map is wall time and can include time shared with other maps on the GPU. Batching needs the Linux libraries; with others (for example the Windows ones) the maps run one at a time, with a warning.
