@@ -160,6 +160,54 @@ class TestBenchBatch(unittest.TestCase):
         with mock.patch.object(bench_batch, "_smi", lambda *a: None):
             self.assertIsNone(bench_batch.foreign_processes())
 
+    WARMUP = dict(kappa_tot=0.4, shear=0.4, kappa_star=0.2, half_length_y1=25, half_length_y2=25,
+                  num_pixels_y1=1000, num_pixels_y2=1000)
+
+    def test_warm_up_is_the_same_for_every_configuration(self):
+        # the warm-up only creates the CUDA contexts and loads the kernels: a 1000^2 map of the nb lens whatever the
+        # configuration (a 200^2 map of the stars1e6_f lens fails with "Expansion order needs to be >= 3")
+        for cfg in bench_batch.CONFIGS:
+            self.assertEqual(bench_batch.warmup_params(cfg), self.WARMUP, cfg)
+
+    def test_measure_warms_up_with_the_nb_lens(self):
+        calls = []
+
+        class Fake:
+            last_run_stats = {}
+
+            def __init__(self, **kw):
+                calls.append((type(self).__name__, kw))
+
+            def run(self, save=False):
+                return iter(())
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self.close()
+
+            def close(self):
+                pass
+
+        class FakeIPM(Fake):
+            pass
+
+        class FakeBatch(Fake):
+            pass
+
+        with mock.patch("microlensing.IPM.ipm.IPM", FakeIPM), \
+                mock.patch("microlensing.IPM.batch.BatchedIPM", FakeBatch):
+            for cfg in bench_batch.CONFIGS:
+                calls.clear()
+                bench_batch.measure(cfg, "batch", "memory", 2, 4, None)
+                (_, warm_ipm), (_, warm_batch), (_, timed) = calls
+                self.assertEqual({k: v for k, v in warm_ipm.items() if k != "random_seed"}, self.WARMUP, cfg)
+                self.assertEqual({k: v for k, v in warm_batch.items()
+                                  if k not in ("num_maps", "random_seed", "devices")}, self.WARMUP, cfg)
+                self.assertEqual((warm_batch["num_maps"], warm_batch["devices"]), (2, [0, 1]), cfg)
+                self.assertEqual({k: timed[k] for k in bench_batch.CONFIGS[cfg]}, bench_batch.CONFIGS[cfg], cfg)
+
     def test_resume_skips_existing_keys(self):
         specs = bench_batch.plan(["small_f"], [1], ["memory"], 1, maps=4, save_root=None)
         done = specs[0]["key"]

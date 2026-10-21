@@ -12,9 +12,10 @@ foreign processes on them before and after.
 
 The timed region of a child is: serial, the loop of IPM(...).run() [+ save()] over all maps; batch, building the
 BatchedIPM, running it (to the last map consumed, or the last file written in save mode) but not close().
-Before timing, the child runs an untimed 200x200 map of the same lens on device 0, which creates its CUDA
-context; the batch kind then runs an untimed BatchedIPM of g 200x200 maps on devices 0..g-1, one map per GPU,
-which creates the CUDA context of every device. That warm-up batch is closed before timing, so the timed region
+Before timing, the child runs an untimed 1000x1000 map of the nb lens (kappa_tot 0.4, shear 0.4, kappa_star 0.2,
+half-lengths 25) on device 0, the same for every configuration, which creates its CUDA context and loads the
+kernels; the batch kind then runs an untimed BatchedIPM of g such maps on devices 0..g-1, one map per GPU, which
+creates the CUDA context of every device. That warm-up batch is closed before timing, so the timed region
 of the batch kind still includes the memory estimates, opening the worker slots it uses (a C++ IPM object and a
 stream each) and growing their buffers to the map size.
 The peak RSS (VmHWM) of a child includes the warm-up. The serial kind is measured on one GPU only (g = 1).
@@ -56,8 +57,15 @@ CONFIGS = {
                        num_pixels_y1=5000, num_pixels_y2=5000),
     "px40k_f": dict(LENS_NB, half_length_y1=25, half_length_y2=25, num_pixels_y1=40000, num_pixels_y2=40000),
 }
-WARMUP_PIXELS = 200
+# The untimed warm-up map only creates the CUDA contexts and loads the kernels, so every configuration uses the same
+# small nb map: a small map of another lens can fail (200x200 of stars1e6_f: "Expansion order needs to be >= 3").
+WARMUP = dict(LENS_NB, half_length_y1=25, half_length_y2=25, num_pixels_y1=1000, num_pixels_y2=1000)
 STDERR_TAIL = 2000
+
+
+def warmup_params(config):
+    """The IPM inputs of the warm-up maps of a measurement of config: the same for every configuration."""
+    return dict(WARMUP)
 
 
 def speedup(serial, batch):
@@ -227,7 +235,7 @@ def measure(config, kind, mode, g, maps, save_dir):
     from microlensing.IPM.ipm import IPM
 
     kw = dict(CONFIGS[config])
-    warm = dict(kw, num_pixels_y1=WARMUP_PIXELS, num_pixels_y2=WARMUP_PIXELS)
+    warm = warmup_params(config)
     save = mode == "save"
     if save and not save_dir:
         raise ValueError("save mode needs --save-dir")
@@ -235,7 +243,7 @@ def measure(config, kind, mode, g, maps, save_dir):
     seeds = list(range(1, maps + 1))
     rec = {"maps": maps, "map_errors": 0}
 
-    IPM(**warm, random_seed=1).run()     # creates the CUDA context
+    IPM(**warm, random_seed=1).run()     # creates the CUDA context and loads the kernels
     if kind == "batch":
         with BatchedIPM(num_maps=g, **warm, random_seed=list(range(1, g + 1)), devices=list(range(g))) as w:
             for _ in w.run():
