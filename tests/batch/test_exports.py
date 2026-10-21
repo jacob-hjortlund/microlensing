@@ -88,7 +88,7 @@ class ExportTests(unittest.TestCase):
                 set_valid_map(lib, obj)
                 before = read_all(lib, obj), lib.get_num_stars(obj)
                 self.assertTrue(lib.estimate_memory(obj, out))
-                self.assertEqual(out[0], 1000 * 1000 * size * 2 + (8 << 20))
+                self.assertEqual(out[0], 1000 * 1000 * size * 2 + (16 << 20))
                 self.assertEqual((out[3] - 1000 * 1000 * size) % (3 * size), 0)
                 self.assertGreater(out[3] - 1000 * 1000 * size, 0)
                 self.assertGreaterEqual(out[2], 1 << 20)
@@ -96,7 +96,7 @@ class ExportTests(unittest.TestCase):
                 self.assertEqual((read_all(lib, obj), lib.get_num_stars(obj)), before)
                 set_valid_map(lib, obj, write_parities=1)
                 self.assertTrue(lib.estimate_memory(obj, out))
-                self.assertEqual(out[0], 1000 * 1000 * size * 4 + 3 * (8 << 20))
+                self.assertEqual(out[0], 1000 * 1000 * size * 4 + 3 * (16 << 20))
             finally:
                 lib.IPM_delete(obj)
 
