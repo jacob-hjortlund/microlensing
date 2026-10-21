@@ -311,6 +311,35 @@ class SchedulerTests(unittest.TestCase):
         f.release()
         gen.close()
 
+    def test_gpu_whose_slots_wait_for_queue_room_takes_no_map_from_another(self):
+        # 2 GPUs of 2 slots, 9 GiB budgets, a 3 GiB limit. The device memory places L (6 GiB) and X1 then X2 on
+        # one GPU, B1 and B2 (4 GiB each) on the other. B1 and B2 finish while X1 and X2 wait (2 GiB), so both wait
+        # in their slots. Once the consumer releases X1, S fits next to X2 but B1 and B2 do not: S must start on
+        # the GPU of L at once, not be left to the other GPU, whose slots cannot start it
+        fake = FakeBackend(free=10 * GiB, total=10 * GiB)
+        sched = self.make(fake, maps_per_gpu=2, max_result_bytes=3 * GiB)
+        params = [{"index": 0, "pixel": 6 * GiB, "result": 100 * MiB, "time": 1.5},
+                  {"index": 1, "pixel": 4 * GiB, "result": int(2.5 * GiB), "time": 0.2},
+                  {"index": 2, "pixel": 4 * GiB, "result": int(2.5 * GiB), "time": 0.2},
+                  {"index": 3, "pixel": GiB, "result": GiB, "time": 0.05},
+                  {"index": 4, "pixel": GiB, "result": GiB, "time": 0.05},
+                  {"index": 5, "result": int(1.5 * GiB), "time": 0.05}]
+        out, released = [], {}
+        for f in sched.results(params):
+            out.append(f)
+            if f.index in (3, 4):
+                time.sleep(0.35)
+            released[f.index] = time.monotonic()
+            f.release()
+        self.assert_successes(out, 6)
+        r = runs(fake)
+        (big_l,), (b1,), (b2,), (x1,), (x2,), (s,) = (r[i] for i in range(6))
+        self.assertEqual({b1[0], b2[0]}, {1 - big_l[0]})
+        self.assertEqual({x1[0], x2[0], s[0]}, {big_l[0]})
+        start_s = fake.log_snapshot()[s[1]][4]
+        self.assertGreater(start_s, released[3])
+        self.assertLess(start_s, released[4])
+
     def test_oversized_map_runs_alone_and_small_maps_continue(self):
         # 20 small maps first, so that idle slots of both GPUs hold memory when the big map comes up
         fake = FakeBackend(free=10 * GiB, total=10 * GiB)
