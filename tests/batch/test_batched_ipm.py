@@ -7,6 +7,8 @@ import warnings
 from pathlib import Path
 from unittest import mock
 
+import numpy as np
+
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
@@ -50,6 +52,30 @@ class TestBatchedIPM(unittest.TestCase):
                    {"maps_per_gpu": [2]}, {"max_result_bytes": [1]}):
             with self.assertRaises(TypeError, msg=str(kw)):
                 make(FakeBackend(), **kw)
+
+    def test_constructor_validates_batch_level_values(self):
+        # checked when the batch is built, not at its first run()
+        bad = [({"maps_per_gpu": 0}, ValueError), ({"maps_per_gpu": -1}, ValueError),
+               ({"maps_per_gpu": True}, TypeError), ({"maps_per_gpu": 1.5}, TypeError),
+               ({"maps_per_gpu": "2"}, TypeError),
+               ({"devices": []}, ValueError), ({"devices": [0, 0]}, ValueError), ({"devices": [1, -1]}, ValueError),
+               ({"devices": [True]}, TypeError), ({"devices": [0.5]}, TypeError),
+               ({"max_result_bytes": 0}, ValueError), ({"max_result_bytes": -1}, ValueError),
+               ({"max_result_bytes": True}, TypeError), ({"max_result_bytes": 1.5}, TypeError),
+               ({"max_result_bytes": None}, TypeError)]
+        for kw, exc in bad:
+            with self.subTest(**{k: repr(v) for k, v in kw.items()}):
+                with self.assertRaises(exc):
+                    make(FakeBackend(), **kw)
+        good = [({"maps_per_gpu": None}, "_maps_per_gpu", None), ({"maps_per_gpu": np.int64(3)}, "_maps_per_gpu", 3),
+                ({"devices": None}, "_devices", None), ({"devices": (1, 0)}, "_devices", [1, 0]),
+                ({"devices": range(2)}, "_devices", [0, 1]), ({"max_result_bytes": 1}, "_max_result_bytes", 1)]
+        for kw, attr, value in good:
+            with self.subTest(**{k: repr(v) for k, v in kw.items()}):
+                b = make(FakeBackend(), **kw)
+                self.assertEqual(getattr(b, attr), value)
+                self.assertEqual(type(getattr(b, attr)), type(value))
+                b.close()
 
     def test_num_maps_and_params(self):
         b = make(FakeBackend(), num_maps=3, outfile_prefix="r/")

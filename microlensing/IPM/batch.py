@@ -52,7 +52,27 @@ def _check_devices(devices):
             operator.index(d)
         except TypeError:
             raise TypeError(f"devices must hold integers, got {d!r}") from None
-    return [operator.index(d) for d in items]
+    items = [operator.index(d) for d in items]
+    if not items:
+        raise ValueError("devices must list at least one GPU")
+    if any(d < 0 for d in items):
+        raise ValueError(f"devices must hold GPU numbers of at least 0, got {items}")
+    if len(set(items)) != len(items):
+        raise ValueError(f"devices has repeated entries: {items}")
+    return items
+
+
+def _check_positive(name, value):
+    """value as an int of at least 1; a bool or a non-integer raises TypeError."""
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be an integer, got {value!r}")
+    try:
+        value = operator.index(value)
+    except TypeError:
+        raise TypeError(f"{name} must be an integer, got {value!r}") from None
+    if value < 1:
+        raise ValueError(f"{name} must be at least 1, got {value!r}")
+    return value
 
 
 class BatchedIPM:
@@ -72,8 +92,8 @@ class BatchedIPM:
             if name != "devices" and _is_sequence(args[name]):
                 raise TypeError(f"{name} applies to the whole batch and cannot be a sequence")
         self._devices = _check_devices(devices)
-        self._maps_per_gpu = maps_per_gpu
-        self._max_result_bytes = max_result_bytes
+        self._maps_per_gpu = None if maps_per_gpu is None else _check_positive("maps_per_gpu", maps_per_gpu)
+        self._max_result_bytes = _check_positive("max_result_bytes", max_result_bytes)
         self._verbose = verbose
         self._is_double = is_double
         self._params = expand({k: args[k] for k in _INPUT_NAMES}, num_maps)
