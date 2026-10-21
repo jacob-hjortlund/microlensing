@@ -31,7 +31,7 @@ def collect(sched, params):
 
 
 def runs(fake):
-    """index -> list of (device, start position, end position) in the fake's log."""
+    """index -> list of (device, start position, end position, slot_id) in the fake's log."""
     log = fake.log_snapshot()
     open_runs = {}
     out = {}
@@ -40,8 +40,25 @@ def runs(fake):
             open_runs[(slot_id, index)] = pos
         elif event == "end":
             start = open_runs.pop((slot_id, index))
-            out.setdefault(index, []).append((device, start, pos))
+            out.setdefault(index, []).append((device, start, pos, slot_id))
     return out
+
+
+def releases(fake, device, after=-1):
+    """(position, slot_id) of each release() on the device that returned after the given log position."""
+    return [(pos, e[2]) for pos, e in enumerate(fake.log_snapshot())
+            if e[0] == "release" and e[1] == device and pos > after]
+
+
+def max_running_after(fake, after, device):
+    """The most maps running at once on the device at log positions after the given one."""
+    running = peak = 0
+    for pos, e in enumerate(fake.log_snapshot()):
+        if e[1] == device and e[0] in ("start", "end"):
+            running += 1 if e[0] == "start" else -1
+            if pos > after:
+                peak = max(peak, running)
+    return peak
 
 
 def overlaps(a, b):
@@ -172,17 +189,21 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(max(fake.max_concurrency.values()), 1)
 
     def test_oversized_map_runs_alone_and_small_maps_continue(self):
+        # 20 small maps first, so that idle slots of both GPUs hold memory when the big map comes up
         fake = FakeBackend(free=10 * GiB, total=10 * GiB)
         sched = self.make(fake)
-        params = maps(20, pixel=GiB, time=0.05)
-        params[5].update(pixel=int(8.5 * GiB), time=0.5)
-        self.assert_successes(collect(sched, params), 20)
+        params = maps(40, pixel=GiB, time=0.05)
+        params[20].update(pixel=int(8.5 * GiB), time=0.5)
+        self.assert_successes(collect(sched, params), 40)
         self.assertEqual(sched.stats["devices"][0]["budget"], 9 * GiB)
         r = runs(fake)
-        (big,) = r[5]
-        others = [run for i, rs in r.items() if i != 5 for run in rs]
+        (big,) = r[20]
+        others = [run for i, rs in r.items() if i != 20 for run in rs]
         self.assertEqual([o for o in others if o[0] == big[0] and overlaps(o, big)], [])
         self.assertTrue([o for o in others if o[0] != big[0] and overlaps(o, big)])
+        # the idle slots' memory was really freed before the big map started
+        self.assertTrue([p for p, _ in releases(fake, big[0]) if p < big[1]])
+        self.assertLessEqual(fake.peak_alloc[big[0]], 9 * GiB)
 
     def test_map_bigger_than_budget_still_attempted_alone(self):
         fake = FakeBackend(devices=1, free=10 * GiB, total=10 * GiB)
@@ -194,6 +215,58 @@ class SchedulerTests(unittest.TestCase):
         (big,) = r[2]
         self.assertEqual([o for i, rs in r.items() if i != 2 for o in rs if overlaps(o, big)], [])
         self.assertEqual(sched.stats["devices"][0]["peak_committed"], 20 * GiB)
+
+    def test_slow_release_blocks_admission_on_its_gpu(self):
+        # map 2 runs alone after maps 0 and 1; while their slots are still being freed (0.2 s each), maps 3 and
+        # 4 must not start on top of memory that is not free yet
+        fake = FakeBackend(devices=1, free=10 * GiB, total=10 * GiB, release_time=0.2)
+        sched = self.make(fake, maps_per_gpu=4)
+        params = [{"index": 0, "pixel": 6 * GiB, "time": 0.1},
+                  {"index": 1, "pixel": 0, "star": 3 * GiB, "time": 0.1},
+                  {"index": 2, "pixel": 0, "tree": 2 * GiB, "time": 0.4},
+                  {"index": 3, "pixel": 3 * GiB, "time": 0.4},
+                  {"index": 4, "pixel": 3 * GiB, "time": 0.4}]
+        self.assert_successes(collect(sched, params), 5)
+        dev = sched.stats["devices"][0]
+        self.assertEqual(dev["budget"], 9 * GiB)
+        self.assertLessEqual(dev["peak_committed"], dev["budget"])
+        self.assertLessEqual(fake.peak_alloc[0], dev["budget"])
+        r = runs(fake)
+        (two,) = r[2]
+        freed = [p for p, _ in releases(fake, 0) if p < two[1]]
+        self.assertEqual(len(freed), 2)
+        self.assertTrue(all(r[i][0][1] > max(freed) for i in (3, 4)))
+
+    def test_grow_only_slot_gives_memory_back_after_a_big_map(self):
+        # real slots keep their buffers: without giving them back, the slot that ran the big map would keep
+        # re-admitting small maps alone and the GPU would stay serial for the rest of the batch
+        fake = FakeBackend(devices=1, free=10 * GiB, total=10 * GiB, grow_only=True)
+        sched = self.make(fake)
+        params = [{"index": 0, "pixel": int(8.5 * GiB), "time": 0.2}] + \
+                 [{"index": i, "pixel": GiB, "time": 0.05} for i in range(1, 41)]
+        self.assert_successes(collect(sched, params), 41)
+        (big,) = runs(fake)[0]
+        self.assertTrue(releases(fake, 0, after=big[2]))
+        self.assertGreaterEqual(max_running_after(fake, big[2], 0), 2)
+        self.assertLessEqual(fake.peak_alloc[0], 9 * GiB)
+
+    def test_slot_holding_more_than_needed_shrinks_while_others_run(self):
+        # a 6 GiB map runs next to three 1 GiB maps (9 GiB budget) while four slots wait for memory. Small maps
+        # keep running, so the run-alone release never fires: the slot that ran the big map has to give its
+        # memory back while the others run, so that more than 4 maps run at once afterwards
+        fake = FakeBackend(devices=1, free=10 * GiB, total=10 * GiB, grow_only=True)
+        sched = self.make(fake)
+        params = [{"index": 0, "pixel": 6 * GiB, "time": 0.3}] + \
+                 [{"index": i, "pixel": GiB, "time": 0.05} for i in range(1, 61)]
+        self.assert_successes(collect(sched, params), 61)
+        r = runs(fake)
+        (big,) = r[0]
+        others = [o for i, rs in r.items() if i != 0 for o in rs]
+        shrinks = [p for p, slot_id in releases(fake, 0, after=big[2]) if slot_id == big[3]]
+        self.assertTrue(shrinks)
+        self.assertTrue([o for o in others if o[1] < shrinks[0] < o[2]])
+        self.assertGreaterEqual(max_running_after(fake, shrinks[0], 0), 6)
+        self.assertLessEqual(fake.peak_alloc[0], 9 * GiB)
 
     def test_estimate_failure_reported_and_batch_continues(self):
         threads = []
