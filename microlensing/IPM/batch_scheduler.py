@@ -6,8 +6,10 @@ slots already hold, fits the GPU's budget. A map goes to a GPU that runs fewer m
 at once, so that a batch spreads over every GPU. A map that does not fit runs alone once nothing else runs on
 the GPU. A slot that keeps more memory than its next map needs gives it back while another slot waits for memory,
 and no map is admitted on a GPU while memory is being freed on it. Finished results wait in a queue until the
-consumer releases them, and the results of the maps in progress and in that queue are bounded in bytes by
-max_result_bytes, raised to fit one map per GPU. A failing map becomes a BatchMapError result and the batch
+consumer releases them. The waiting results are bounded in bytes by max_result_bytes, with always room for one:
+a slot starts a map only while the map's result estimate fits next to the waiting results, and a finished map
+whose result does not fit keeps it in its slot thread until there is room. Maps in progress do not count against
+the limit; the slots and the device memory bound them. A failing map becomes a BatchMapError result and the batch
 carries on.
 
 A map that runs out of device memory while other maps run on its GPU goes back to the front of the queue, to be
@@ -120,15 +122,15 @@ class Backend(Protocol):
 
 @dataclass
 class Finished:
-    """One map's result: an IPM-like object, or a BatchMapError. Its bytes count against the scheduler's
-    result budget until release() is called."""
+    """One map's result: an IPM-like object, or a BatchMapError. Its bytes count as waiting, against the
+    scheduler's max_result_bytes, until release() is called."""
     index: int
     result: object
     _nbytes: int = field(default=0, repr=False, compare=False)
     _run: object = field(default=None, repr=False, compare=False)
 
     def release(self) -> None:
-        """Return the result's bytes to the result budget. Calling it again does nothing."""
+        """Stop counting the result's bytes as waiting. Calling it again does nothing."""
         run = self._run
         if run is not None:
             run.release(self)
@@ -153,10 +155,11 @@ def _growth(held, e):
     return held.cmax(e).device_bytes() - held.device_bytes()
 
 
-def _empty_stats(devices, dead):
+def _empty_stats(devices, dead, max_result_bytes):
     return {"devices": {d: {"budget": 0, "maps": 0, "max_concurrent": 0, "peak_committed": 0, "oom_retries": 0,
                             "parked_slots": 0, "dead": d in dead} for d in devices},
-            "direct_deposit_maps": 0, "peak_result_bytes": 0, "result_budget": 0}
+            "direct_deposit_maps": 0, "peak_result_bytes": 0, "peak_in_flight_result_bytes": 0,
+            "result_budget": max_result_bytes}
 
 
 class _SlotState:
@@ -180,7 +183,7 @@ class _Job(NamedTuple):
 class _Run:
     """The state of one results() call. Every field is read and written under the scheduler's condition."""
 
-    def __init__(self, cond, params, devices, dead):
+    def __init__(self, cond, params, devices, dead, max_result_bytes):
         self.cond = cond
         self.params = params
         self.estimates = [None] * len(params)
@@ -202,16 +205,18 @@ class _Run:
         self.pinned = {}          # index -> the GPU that alone may run this out-of-memory retry
         self.parks = [0] * len(params)      # how much each map's retries lowered slot_limit on its pinned GPU
         self.total_running = 0
-        self.reserved_result = 0  # host bytes of results running, queued, or yielded and not released
-        self.result_budget = 0    # the most reserved_result may reach (beyond one map): set when the threads start
-        self.stats = _empty_stats(devices, dead)
+        self.waiting_bytes = 0    # host bytes of finished results queued, or yielded and not released
+        # result bytes of the maps in progress: a running map's estimate, then its result's bytes while the result
+        # waits in its slot thread for room in the queue
+        self.in_progress_bytes = 0
+        self.stats = _empty_stats(devices, dead, max_result_bytes)
 
     def release(self, item):
         with self.cond:
             if item._run is not self:
                 return
             item._run = None
-            self.reserved_result -= item._nbytes
+            self.waiting_bytes -= item._nbytes
             self.cond.notify_all()
 
 
@@ -221,11 +226,13 @@ class Scheduler:
 
     stats describes the latest results() call and is updated while it runs:
     {"devices": {d: {"budget", "maps", "max_concurrent", "peak_committed", "oom_retries", "parked_slots",
-    "dead"}}, "direct_deposit_maps": int, "peak_result_bytes": int, "result_budget": int}. "maps" counts the
-    maps that succeeded on that GPU, "oom_retries" the maps sent back to the queue after running out of memory
-    there, "parked_slots" how many of its slots no longer run maps in this call, and "dead" whether the GPU has
-    left the batch. "result_budget" is the result budget of the call: max_result_bytes, raised to the number of
-    GPUs in use times the largest result estimate of the batch, so that every GPU can run a map."""
+    "dead"}}, "direct_deposit_maps": int, "peak_result_bytes": int, "peak_in_flight_result_bytes": int,
+    "result_budget": int}. "maps" counts the maps that succeeded on that GPU, "oom_retries" the maps sent back to
+    the queue after running out of memory there, "parked_slots" how many of its slots no longer run maps in this
+    call, and "dead" whether the GPU has left the batch. "peak_result_bytes" is the most bytes of finished results
+    that waited at once (queued, or yielded and not released), and "peak_in_flight_result_bytes" the most bytes of
+    those and of the results of the maps in progress together (their estimates while they run). "result_budget"
+    is max_result_bytes, the limit on the waiting results."""
 
     def __init__(self, backend: Backend, devices=None, maps_per_gpu=None,
                  max_result_bytes=DEFAULT_MAX_RESULT_BYTES, slot_cap=DEFAULT_SLOT_CAP):
@@ -258,14 +265,17 @@ class Scheduler:
         self._dead = {}           # device -> (cuda error, message); a dead device stays dead
         self._run = None          # the results() call whose threads may still be alive
         self._closed = False
-        self.stats = _empty_stats(devices, self._dead)
+        self.stats = _empty_stats(devices, self._dead, max_result_bytes)
 
     def results(self, params: list[dict]) -> Iterator[Finished]:
         """Run every map and yield one Finished per map, in completion order.
 
-        Release each Finished when its result is no longer needed: at most stats["result_budget"] bytes of
-        results that are running, queued or unreleased are held at a time (always at least one map). Closing the
-        generator (break, an exception in the consumer, Ctrl-C) lets the maps in progress finish, drops their
+        Release each Finished when its result is no longer needed: until then it counts as waiting. At most
+        max_result_bytes of finished results wait at a time (always at least one). While the waiting results
+        leave no room for a map's result, no slot starts that map, and a finished map whose result does not fit
+        waits in its slot until there is room; so a consumer that waits for the next result while it keeps
+        unreleased results that leave no room for it waits forever. The maps in progress are not counted. Closing
+        the generator (break, an exception in the consumer, Ctrl-C) lets the maps in progress finish, drops their
         results and joins every slot thread."""
         params = list(params)
         run = self._begin(params)
@@ -324,7 +334,7 @@ class Scheduler:
         with self._cond:
             if self._run is not None:
                 raise RuntimeError("another results() call is still in progress on this scheduler")
-            run = _Run(self._cond, params, self._devices, self._dead)
+            run = _Run(self._cond, params, self._devices, self._dead, self._max_result_bytes)
             self._run = run
             self.stats = run.stats
             self._cond.notify_all()
@@ -373,10 +383,6 @@ class Scheduler:
                 dev = run.stats["devices"][d]
                 dev["budget"] = run.budget[d]
                 dev["peak_committed"] = held
-            # room for one map per GPU, so that the result budget does not leave GPUs idle
-            largest = max((e.result for e in run.estimates if e is not None), default=0)
-            run.result_budget = max(self._max_result_bytes, len(devices) * largest)
-            run.stats["result_budget"] = run.result_budget
             # slot 0 of every GPU first, then slot 1, and so on, so that the first maps find a thread on every GPU
             for k in range(max(run.n_slots.values(), default=0)):
                 for d in devices:
@@ -501,7 +507,7 @@ class Scheduler:
             return None
         i = run.pending[pos]
         e = run.estimates[i]
-        if run.reserved_result > 0 and run.reserved_result + e.result > run.result_budget:
+        if not self._room_for(run, e.result):
             return None
         if run.running[d] >= run.slot_limit[d]:
             return None
@@ -532,7 +538,7 @@ class Scheduler:
         run.committed[d] = self._held_on(d)
         run.running[d] += 1
         run.total_running += 1
-        run.reserved_result += e.result
+        run.in_progress_bytes += e.result
         run.releases[d] += len(frees)
         self._update_peaks(run, d)
         return _Job(i, e, frees)
@@ -607,18 +613,29 @@ class Scheduler:
         return code != 0, code
 
     def _complete(self, run, st, job, outcome):
+        """A map that ran. Its slot is idle on its GPU at once, and its result joins the queue once it fits next to
+        the waiting results (_room_for). Until then this thread keeps the result, counted as in progress. A
+        stopping run drops it."""
         d = st.device
+        nbytes = outcome.result_bytes
         with self._cond:
             run.running[d] -= 1
             run.total_running -= 1
             run.active[d].discard(st)
             st.held = outcome.held
             run.committed[d] = self._held_on(d)
-            run.reserved_result += outcome.result_bytes - job.estimate.result
-            run.queue.append(Finished(job.index, outcome.result, outcome.result_bytes, run))
+            run.in_progress_bytes += nbytes - job.estimate.result
             run.stats["devices"][d]["maps"] += 1
             if outcome.direct_deposit:
                 run.stats["direct_deposit_maps"] += 1
+            self._update_peaks(run, d)
+            self._cond.notify_all()
+            while not run.stopping and not self._room_for(run, nbytes):
+                self._cond.wait()
+            run.in_progress_bytes -= nbytes
+            if not run.stopping:
+                run.waiting_bytes += nbytes
+                run.queue.append(Finished(job.index, outcome.result, nbytes, run))
             self._update_peaks(run, d)
             self._cond.notify_all()
 
@@ -692,7 +709,7 @@ class Scheduler:
         run.running[d] -= 1
         run.total_running -= 1
         run.active[d].discard(st)
-        run.reserved_result -= job.estimate.result
+        run.in_progress_bytes -= job.estimate.result
         if st.slot is None:
             st.held = _NOTHING    # the slot never opened, so it holds nothing
             run.committed[d] = self._held_on(d)
@@ -752,6 +769,12 @@ class Scheduler:
 
     # ---- helpers (lock held)
 
+    def _room_for(self, run, nbytes):
+        """Whether a result of nbytes fits next to the waiting results: within max_result_bytes, or nothing
+        waits (always room for one). It decides both whether a map may start and whether a finished one may join
+        the queue, so the waiting results never exceed max(max_result_bytes, one result)."""
+        return run.waiting_bytes == 0 or run.waiting_bytes + nbytes <= self._max_result_bytes
+
     def _taken_elsewhere(self, run, d, pos):
         """Whether another GPU that runs fewer maps than d would start pending[pos], d's next map, at once: the map
         is not pinned to d, no map ahead of it is pinned to that GPU, the GPU is below its slot limit, no memory
@@ -804,4 +827,6 @@ class Scheduler:
         dev = run.stats["devices"][d]
         dev["max_concurrent"] = max(dev["max_concurrent"], run.running[d])
         dev["peak_committed"] = max(dev["peak_committed"], run.committed[d])
-        run.stats["peak_result_bytes"] = max(run.stats["peak_result_bytes"], run.reserved_result)
+        run.stats["peak_result_bytes"] = max(run.stats["peak_result_bytes"], run.waiting_bytes)
+        run.stats["peak_in_flight_result_bytes"] = max(run.stats["peak_in_flight_result_bytes"],
+                                                       run.waiting_bytes + run.in_progress_bytes)

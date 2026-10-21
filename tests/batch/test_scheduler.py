@@ -229,52 +229,63 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual({e[1] for e in fake.log_snapshot() if e[0] == "start"}, {1})
         self.assertEqual(list(sched.stats["devices"]), [1])
 
-    def test_result_bytes_bounded(self):
+    def slow_consumer(self, sched, params, limit, delay=0.03):
+        """Consume every map, releasing each one `delay` s after receiving it. Returns the items and the most
+        result bytes seen waiting (queued, or received and not released) when each one was received."""
+        out, seen = [], []
+        for f in sched.results(params):
+            out.append(f)
+            seen.append(sched.stats["peak_result_bytes"])
+            time.sleep(delay)
+            f.release()
+        self.assertTrue(all(s <= limit for s in seen), seen)
+        return out
+
+    def test_waiting_results_bounded_for_a_slow_consumer(self):
+        # 2 GPUs of 8 slots, 1 GiB results and a 3 GiB limit, with a consumer slower than the maps: the finished
+        # results waiting for it never exceed the limit, while the maps in progress do not count against it, so
+        # all 16 slots start maps at once
         fake = FakeBackend()
         sched = self.make(fake, max_result_bytes=3 * GiB)
-        out = []
-        for f in sched.results(maps(12, result=GiB, time=0.01)):
-            out.append(f)
-            time.sleep(0.05)
-            f.release()
-        self.assert_successes(out, 12)
-        self.assertEqual(sched.stats["result_budget"], 3 * GiB)
-        self.assertLessEqual(sched.stats["peak_result_bytes"], 3 * GiB)
-        self.assertGreaterEqual(sched.stats["peak_result_bytes"], 2 * GiB)
-
-        # on one GPU the budget is raised to one map, so the maps run one at a time
+        self.assert_successes(self.slow_consumer(sched, maps(40, result=GiB, time=0.02), 3 * GiB), 40)
+        stats = sched.stats
+        self.assertEqual(stats["result_budget"], 3 * GiB)
+        self.assertEqual(stats["peak_result_bytes"], 3 * GiB)
+        self.assertEqual(max_running(fake), 16)
+        self.assertGreaterEqual(stats["peak_in_flight_result_bytes"], 16 * GiB)
+        self.assertLessEqual(stats["peak_in_flight_result_bytes"], 3 * GiB + 16 * GiB)   # limit + one per slot
+        # a limit below one result: always room for one result, never for two, and the maps still overlap
         fake = FakeBackend(devices=1)
         sched = self.make(fake, max_result_bytes=1)
-        self.assert_successes(collect(sched, maps(8, result=GiB, time=0.01)), 8)
-        self.assertEqual(sched.stats["result_budget"], GiB)
+        self.assert_successes(self.slow_consumer(sched, maps(16, result=GiB, time=0.02), GiB), 16)
+        self.assertEqual(sched.stats["result_budget"], 1)
         self.assertEqual(sched.stats["peak_result_bytes"], GiB)
-        self.assertEqual(max(fake.max_concurrency.values()), 1)
+        self.assertEqual(fake.max_concurrency[0], 8)
+        self.assertLessEqual(sched.stats["peak_in_flight_result_bytes"], GiB + 8 * GiB)
 
-    def test_result_budget_fits_one_map_per_gpu(self):
-        # results of 6 GiB on 8 GPUs: the default 8 GiB budget is raised to 8 x 6 GiB, so that every GPU runs a
-        # map at once instead of one map at a time on the whole node
+    def test_large_results_run_side_by_side(self):
+        # 40000^2 float maps have 6 GiB results: one GPU with 2 slots at the default 8 GiB limit runs 2 of them at
+        # once, since the maps in progress are not counted, but never queues two (12 GiB > 8 GiB)
+        fake = FakeBackend(devices=1)
+        sched = self.make(fake, maps_per_gpu=2)
+        self.assert_successes(collect(sched, maps(6, result=6 * GiB, time=0.1)), 6)
+        self.assertEqual(fake.max_concurrency[0], 2)
+        self.assertEqual(sched.stats["result_budget"], 8 * GiB)
+        self.assertEqual(sched.stats["peak_result_bytes"], 6 * GiB)
+        self.assertEqual(sched.stats["peak_in_flight_result_bytes"], 12 * GiB)
+        # the same with a slow consumer: a finished map that does not fit waits in its slot
+        fake = FakeBackend(devices=1)
+        sched = self.make(fake, maps_per_gpu=2)
+        self.assert_successes(self.slow_consumer(sched, maps(6, result=6 * GiB, time=0.1), 6 * GiB, 0.15), 6)
+        self.assertEqual(fake.max_concurrency[0], 2)
+        self.assertEqual(sched.stats["peak_result_bytes"], 6 * GiB)
+        # 8 GPUs: the limit is not raised, and every GPU runs maps at once
         fake = FakeBackend(devices=8)
         sched = self.make(fake)
         self.assert_successes(collect(sched, maps(16, result=6 * GiB, time=0.1)), 16)
-        self.assertGreaterEqual(max_running(fake), 8)
-        self.assertEqual(sched.stats["result_budget"], 48 * GiB)
-        self.assertLessEqual(sched.stats["peak_result_bytes"], sched.stats["result_budget"])
-        # with max_result_bytes = 1 on 2 GPUs, each GPU runs one map at a time
-        fake = FakeBackend()
-        sched = self.make(fake, max_result_bytes=1)
-        self.assert_successes(collect(sched, maps(8, result=GiB, time=0.05)), 8)
-        self.assertEqual(sched.stats["result_budget"], 2 * GiB)
-        self.assertEqual(max_running(fake), 2)
-        self.assertEqual(fake.max_concurrency, {0: 1, 1: 1})
-        self.assertLessEqual(sched.stats["peak_result_bytes"], 2 * GiB)
-        # the largest estimate counts, and a failed estimate none
-        fake = FakeBackend(fail_estimate_when=lambda p: MapFailed("bad estimate") if p["index"] == 0 else None)
-        sched = self.make(fake, max_result_bytes=GiB)
-        params = maps(6, result=MiB, time=0.01)
-        params[0]["result"] = 9 * GiB
-        params[4]["result"] = 3 * GiB
-        self.assert_successes(collect(sched, params), 6, failed={0})
-        self.assertEqual(sched.stats["result_budget"], 6 * GiB)
+        self.assertEqual(max_running(fake), 16)
+        self.assertEqual(sched.stats["result_budget"], 8 * GiB)
+        self.assertEqual(sched.stats["peak_result_bytes"], 6 * GiB)
 
     def test_waiting_slot_threads_keep_no_finished_result(self):
         # 4 slots on 1 GPU: map 0 runs for 1 s, maps 1-7 end within about 0.1 s. While map 0 runs, the other 3
@@ -840,6 +851,21 @@ class SchedulerTests(unittest.TestCase):
                 if k == 1:
                     raise ValueError("consumer failed")
         self.assert_stopped_cleanly(fake, sched, 50)
+
+    def test_break_while_results_wait_in_slots_stops_cleanly(self):
+        # a 1-byte limit lets one 1 GiB result wait at a time: the consumer stops after the first map while the
+        # other 3 finished maps still wait in their slots for room in the queue
+        fake = FakeBackend(devices=1)
+        sched = self.make(fake, maps_per_gpu=4, max_result_bytes=1)
+        gen = sched.results(maps(10, result=GiB, time=0.05))
+        f = next(gen)
+        time.sleep(0.2)
+        self.assertEqual(len(events(fake, "end")), 4)
+        self.assertEqual(sched.stats["peak_result_bytes"], GiB)
+        self.assertEqual(sched.stats["peak_in_flight_result_bytes"], 4 * GiB)
+        gen.close()
+        f.release()
+        self.assert_stopped_cleanly(fake, sched, 10)
 
     def test_interrupt_while_waiting_stops_cleanly(self):
         fake = FakeBackend(devices=1)
