@@ -78,6 +78,8 @@ private:
 	using Microlensing<T>::threads;
 	using Microlensing<T>::blocks;
 	using Microlensing<T>::cuda_device_prop;
+	using Microlensing<T>::stream;
+	using Microlensing<T>::use_device;
 	using Microlensing<T>::mean_mass;
 	using Microlensing<T>::mean_mass2;
 	using Microlensing<T>::mean_mass2_ln_mass;
@@ -213,6 +215,10 @@ private:
 		h_pixels_minima = nullptr;
 		delete[] h_pixels_saddles;
 		h_pixels_saddles = nullptr;
+
+		if (!Microlensing<T>::use_device_to_free(d_pixels || d_pixels_minima || d_pixels_saddles || d_steps || d_clamp_count || d_clamp_total
+			|| leaves || leaf_coef_re || leaf_coef_im || direct_stars || histogram || histogram_minima || histogram_saddles
+			|| log_histogram || log_histogram_minima || log_histogram_saddles, return_on_error)) return false;
 
 		if (!Microlensing<T>::clear_memory(verbose, return_on_error)) return false;
 
@@ -497,14 +503,14 @@ private:
 		print_verbose("Initializing array values...\n", verbose, 3);
 		stopwatch.start();
 
-		cudaMemset(d_pixels, 0, pixel_bytes);
-		if (cuda_error("cudaMemset(*d_pixels)", false, __FILE__, __LINE__)) return false;
+		cudaMemsetAsync(d_pixels, 0, pixel_bytes, stream);
+		if (cuda_error("cudaMemsetAsync(*d_pixels)", false, __FILE__, __LINE__)) return false;
 		if (write_parities)
 		{
-			cudaMemset(d_pixels_minima, 0, pixel_bytes);
-			if (cuda_error("cudaMemset(*d_pixels_minima)", false, __FILE__, __LINE__)) return false;
-			cudaMemset(d_pixels_saddles, 0, pixel_bytes);
-			if (cuda_error("cudaMemset(*d_pixels_saddles)", false, __FILE__, __LINE__)) return false;
+			cudaMemsetAsync(d_pixels_minima, 0, pixel_bytes, stream);
+			if (cuda_error("cudaMemsetAsync(*d_pixels_minima)", false, __FILE__, __LINE__)) return false;
+			cudaMemsetAsync(d_pixels_saddles, 0, pixel_bytes, stream);
+			if (cuda_error("cudaMemsetAsync(*d_pixels_saddles)", false, __FILE__, __LINE__)) return false;
 		}
 
 		t_elapsed = stopwatch.stop();
@@ -518,7 +524,7 @@ private:
 		print_verbose("Building compact leaf records...\n", verbose, 2);
 		stopwatch.start();
 		if (!ipm_leaf::build_leaf_records<T>(tree, num_nodes, stars, expansion_order,
-			leaves, leaf_coef_re, leaf_coef_im, direct_stars, num_leaves, num_direct, verbose)) return false;
+			leaves, leaf_coef_re, leaf_coef_im, direct_stars, num_leaves, num_direct, verbose, stream)) return false;
 		t_elapsed = stopwatch.stop();
 		print_verbose("Done building compact leaf records. Elapsed time: " << t_elapsed << " seconds.\n", verbose, 2);
 		return true;
@@ -548,8 +554,11 @@ private:
 		const unsigned long long int percentage_start = 1;
 		cudaMalloc(&percentage, sizeof(unsigned long long int));
 		if (cuda_error("cudaMalloc(*percentage)", false, __FILE__, __LINE__)) return false;
-		cudaMemcpy(percentage, &percentage_start, sizeof(unsigned long long int), cudaMemcpyHostToDevice);
-		if (cuda_error("cudaMemcpy(*percentage)", false, __FILE__, __LINE__)) return false;
+		cudaMemcpyAsync(percentage, &percentage_start, sizeof(unsigned long long int), cudaMemcpyHostToDevice, stream);
+		if (cuda_error("cudaMemcpyAsync(*percentage)", false, __FILE__, __LINE__)) return false;
+		//the source is a local that goes out of scope
+		cudaStreamSynchronize(stream);
+		if (cuda_error("cudaStreamSynchronize", false, __FILE__, __LINE__)) return false;
 
 		ipm_fast::SmoothConst<T> smooth_const = ipm_fast::make_smooth_const<T>(corner);
 
@@ -608,16 +617,16 @@ private:
 				if (cuda_error("cudaMalloc(*d_clamp_count)", false, __FILE__, __LINE__)) return false;
 				cudaMalloc(&d_clamp_total, sizeof(double));
 				if (cuda_error("cudaMalloc(*d_clamp_total)", false, __FILE__, __LINE__)) return false;
-				cudaMemset(d_clamp_count, 0, sizeof(unsigned long long));
-				if (cuda_error("cudaMemset(*d_clamp_count)", false, __FILE__, __LINE__)) return false;
-				cudaMemset(d_clamp_total, 0, sizeof(double));
-				if (cuda_error("cudaMemset(*d_clamp_total)", false, __FILE__, __LINE__)) return false;
-				cudaMemset(d_steps, 0, pixel_bytes);
-				if (cuda_error("cudaMemset(*d_steps)", false, __FILE__, __LINE__)) return false;
+				cudaMemsetAsync(d_clamp_count, 0, sizeof(unsigned long long), stream);
+				if (cuda_error("cudaMemsetAsync(*d_clamp_count)", false, __FILE__, __LINE__)) return false;
+				cudaMemsetAsync(d_clamp_total, 0, sizeof(double), stream);
+				if (cuda_error("cudaMemsetAsync(*d_clamp_total)", false, __FILE__, __LINE__)) return false;
+				cudaMemsetAsync(d_steps, 0, pixel_bytes, stream);
+				if (cuda_error("cudaMemsetAsync(*d_steps)", false, __FILE__, __LINE__)) return false;
 				if (write_parities)
 				{
-					cudaMemset(d_pixels, 0, pixel_bytes);
-					if (cuda_error("cudaMemset(*d_pixels)", false, __FILE__, __LINE__)) return false;
+					cudaMemsetAsync(d_pixels, 0, pixel_bytes, stream);
+					if (cuda_error("cudaMemsetAsync(*d_pixels)", false, __FILE__, __LINE__)) return false;
 					steps_min = d_pixels;
 					steps_sad = d_steps;
 				}
@@ -626,7 +635,7 @@ private:
 					steps = d_steps;
 				}
 				//the memsets must not run into the timed region
-				if (cuda_error("cudaDeviceSynchronize", true, __FILE__, __LINE__)) return false;
+				if (cuda_error("cudaStreamSynchronize", true, __FILE__, __LINE__, stream)) return false;
 				edge_min_bbox = ipm_fast::EDGE_MIN_BBOX;
 				print_verbose("Perimeter deposit for bounding boxes above " << ipm_fast::EDGE_MIN_BBOX << " pixels.\n", verbose, 2);
 			}
@@ -638,29 +647,29 @@ private:
 		******************************************************************************/
 		print_verbose("Shooting cells...\n", verbose, 1);
 		stopwatch.start();
-		ipm_fast::shoot_cells_tiled_kernel<T, pixel_arith_t> <<<static_cast<unsigned int>(grid), dim3(ipm_fast::TILE, ipm_fast::TILE)>>> (
+		ipm_fast::shoot_cells_tiled_kernel<T, pixel_arith_t> <<<static_cast<unsigned int>(grid), dim3(ipm_fast::TILE, ipm_fast::TILE), 0, stream>>> (
 			kappa_tot, shear, theta_star, stars, kappa_star, tree[0],
 			leaves, leaf_coef_re, leaf_coef_im, expansion_order + 1, direct_stars,
 			rectangular, corner, approx, taylor_smooth, smooth_const,
 			ray_half_sep, num_ray_threads, center_x, half_length_x,
 			center_y, half_length_y, d_pixels_minima, d_pixels_saddles, d_pixels, num_pixels_y,
 			steps_min, steps_sad, steps, edge_min_bbox, percentage, verbose);
-		if (cuda_error("shoot_cells_tiled_kernel", true, __FILE__, __LINE__)) return false;
+		if (cuda_error("shoot_cells_tiled_kernel", true, __FILE__, __LINE__, stream)) return false;
 		if (d_steps != nullptr)
 		{
 			const unsigned int row_blocks = static_cast<unsigned int>(
 				(1LL * num_pixels_y.im * 32 + ipm_fast::ROW_PREFIX_BLOCK - 1) / ipm_fast::ROW_PREFIX_BLOCK); //one warp per row
 			if (write_parities)
 			{
-				ipm_fast::add_row_prefix_kernel<T> <<<row_blocks, ipm_fast::ROW_PREFIX_BLOCK>>> (d_pixels_minima, steps_min, num_pixels_y, d_clamp_count, d_clamp_total);
+				ipm_fast::add_row_prefix_kernel<T> <<<row_blocks, ipm_fast::ROW_PREFIX_BLOCK, 0, stream>>> (d_pixels_minima, steps_min, num_pixels_y, d_clamp_count, d_clamp_total);
 				if (cuda_error("add_row_prefix_kernel", false, __FILE__, __LINE__)) return false;
-				ipm_fast::add_row_prefix_kernel<T> <<<row_blocks, ipm_fast::ROW_PREFIX_BLOCK>>> (d_pixels_saddles, steps_sad, num_pixels_y, d_clamp_count, d_clamp_total);
+				ipm_fast::add_row_prefix_kernel<T> <<<row_blocks, ipm_fast::ROW_PREFIX_BLOCK, 0, stream>>> (d_pixels_saddles, steps_sad, num_pixels_y, d_clamp_count, d_clamp_total);
 			}
 			else
 			{
-				ipm_fast::add_row_prefix_kernel<T> <<<row_blocks, ipm_fast::ROW_PREFIX_BLOCK>>> (d_pixels, steps, num_pixels_y, d_clamp_count, d_clamp_total);
+				ipm_fast::add_row_prefix_kernel<T> <<<row_blocks, ipm_fast::ROW_PREFIX_BLOCK, 0, stream>>> (d_pixels, steps, num_pixels_y, d_clamp_count, d_clamp_total);
 			}
-			if (cuda_error("add_row_prefix_kernel", true, __FILE__, __LINE__)) return false;
+			if (cuda_error("add_row_prefix_kernel", true, __FILE__, __LINE__, stream)) return false;
 		}
 		t_shoot_cells = stopwatch.stop();
 		print_verbose("\nDone shooting cells. Elapsed time: " << t_shoot_cells << " seconds.\n", verbose, 1);
@@ -669,10 +678,12 @@ private:
 		{
 			unsigned long long n_clamped = 0;
 			double clamped_total = 0;
-			cudaMemcpy(&n_clamped, d_clamp_count, sizeof(unsigned long long), cudaMemcpyDeviceToHost);
-			if (cuda_error("cudaMemcpy(*d_clamp_count)", false, __FILE__, __LINE__)) return false;
-			cudaMemcpy(&clamped_total, d_clamp_total, sizeof(double), cudaMemcpyDeviceToHost);
-			if (cuda_error("cudaMemcpy(*d_clamp_total)", false, __FILE__, __LINE__)) return false;
+			cudaMemcpyAsync(&n_clamped, d_clamp_count, sizeof(unsigned long long), cudaMemcpyDeviceToHost, stream);
+			if (cuda_error("cudaMemcpyAsync(*d_clamp_count)", false, __FILE__, __LINE__)) return false;
+			cudaMemcpyAsync(&clamped_total, d_clamp_total, sizeof(double), cudaMemcpyDeviceToHost, stream);
+			if (cuda_error("cudaMemcpyAsync(*d_clamp_total)", false, __FILE__, __LINE__)) return false;
+			cudaStreamSynchronize(stream);
+			if (cuda_error("cudaStreamSynchronize", false, __FILE__, __LINE__)) return false;
 			if (!free_step_buffers()) return false;
 			print_verbose("Row sums clamped " << n_clamped << " pixels, total " << clamped_total << ".\n", verbose, 2);
 		}
@@ -684,7 +695,7 @@ private:
 		if (write_parities)
 		{
 			print_verbose("Adding arrays...\n", verbose, 2);
-			thrust::transform(thrust::device,
+			thrust::transform(thrust::cuda::par_nosync.on(stream),
 							  thrust::device_pointer_cast(d_pixels_minima), thrust::device_pointer_cast(d_pixels_minima) + (1ULL * num_pixels_y.re * num_pixels_y.im),
 							  thrust::device_pointer_cast(d_pixels_saddles),
 							  thrust::device_pointer_cast(d_pixels),
@@ -717,15 +728,19 @@ private:
 			/******************************************************************************
 			histogram of mu
 			one fused min/max pass per array (device memory, so go through
-			thrust::device_ptr; dereferencing copies the value to the host)
+			thrust::device_ptr; the two values are copied to the host on the stream)
 			******************************************************************************/
 			const size_t npix_total = 1ULL * num_pixels_y.re * num_pixels_y.im;
 			auto minmax = [&](T* d_arr, T& lo, T& hi)
 			{
 				thrust::device_ptr<T> dp = thrust::device_pointer_cast(d_arr);
-				auto mm = thrust::minmax_element(thrust::device, dp, dp + npix_total);
-				lo = *mm.first;
-				hi = *mm.second;
+				auto mm = thrust::minmax_element(thrust::cuda::par_nosync.on(stream), dp, dp + npix_total);
+				cudaMemcpyAsync(&lo, d_arr + (mm.first - dp), sizeof(T), cudaMemcpyDeviceToHost, stream);
+				cuda_error("cudaMemcpyAsync(*lo)", false, __FILE__, __LINE__);
+				cudaMemcpyAsync(&hi, d_arr + (mm.second - dp), sizeof(T), cudaMemcpyDeviceToHost, stream);
+				cuda_error("cudaMemcpyAsync(*hi)", false, __FILE__, __LINE__);
+				cudaStreamSynchronize(stream);
+				cuda_error("cudaStreamSynchronize", false, __FILE__, __LINE__);
 			};
 			T lo_all, hi_all;
 			minmax(d_pixels, lo_all, hi_all);
@@ -793,25 +808,28 @@ private:
 			}
 
 
-			thrust::fill(thrust::device, histogram, histogram + histogram_length, 0);
+			cudaMemsetAsync(histogram, 0, histogram_length * sizeof(int), stream);
+			if (cuda_error("cudaMemsetAsync(*histogram)", false, __FILE__, __LINE__)) return false;
 			if (write_parities)
 			{
-				thrust::fill(thrust::device, histogram_minima, histogram_minima + histogram_length, 0);
-				thrust::fill(thrust::device, histogram_saddles, histogram_saddles + histogram_length, 0);
+				cudaMemsetAsync(histogram_minima, 0, histogram_length * sizeof(int), stream);
+				if (cuda_error("cudaMemsetAsync(*histogram_minima)", false, __FILE__, __LINE__)) return false;
+				cudaMemsetAsync(histogram_saddles, 0, histogram_length * sizeof(int), stream);
+				if (cuda_error("cudaMemsetAsync(*histogram_saddles)", false, __FILE__, __LINE__)) return false;
 			}
 
 
 			set_threads(threads, 16, 16);
 			set_blocks(threads, blocks, num_pixels_y.re, num_pixels_y.im);
 
-			histogram_kernel<T> <<<blocks, threads>>> (d_pixels, num_pixels_y, min_mag, histogram, factor);
-			if (cuda_error("histogram_kernel", true, __FILE__, __LINE__)) return false;
+			histogram_kernel<T> <<<blocks, threads, 0, stream>>> (d_pixels, num_pixels_y, min_mag, histogram, factor);
+			if (cuda_error("histogram_kernel", true, __FILE__, __LINE__, stream)) return false;
 			if (write_parities)
 			{
-				histogram_kernel<T> <<<blocks, threads>>> (d_pixels_minima, num_pixels_y, min_mag, histogram_minima, factor);
-				if (cuda_error("histogram_kernel", true, __FILE__, __LINE__)) return false;
-				histogram_kernel<T> <<<blocks, threads>>> (d_pixels_saddles, num_pixels_y, min_mag, histogram_saddles, factor);
-				if (cuda_error("histogram_kernel", true, __FILE__, __LINE__)) return false;
+				histogram_kernel<T> <<<blocks, threads, 0, stream>>> (d_pixels_minima, num_pixels_y, min_mag, histogram_minima, factor);
+				if (cuda_error("histogram_kernel", true, __FILE__, __LINE__, stream)) return false;
+				histogram_kernel<T> <<<blocks, threads, 0, stream>>> (d_pixels_saddles, num_pixels_y, min_mag, histogram_saddles, factor);
+				if (cuda_error("histogram_kernel", true, __FILE__, __LINE__, stream)) return false;
 			}
 			
 
@@ -832,25 +850,28 @@ private:
 			}
 
 
-			thrust::fill(thrust::device, log_histogram, log_histogram + log_histogram_length, 0);
+			cudaMemsetAsync(log_histogram, 0, log_histogram_length * sizeof(int), stream);
+			if (cuda_error("cudaMemsetAsync(*log_histogram)", false, __FILE__, __LINE__)) return false;
 			if (write_parities)
 			{
-				thrust::fill(thrust::device, log_histogram_minima, log_histogram_minima + log_histogram_length, 0);
-				thrust::fill(thrust::device, log_histogram_saddles, log_histogram_saddles + log_histogram_length, 0);
+				cudaMemsetAsync(log_histogram_minima, 0, log_histogram_length * sizeof(int), stream);
+				if (cuda_error("cudaMemsetAsync(*log_histogram_minima)", false, __FILE__, __LINE__)) return false;
+				cudaMemsetAsync(log_histogram_saddles, 0, log_histogram_length * sizeof(int), stream);
+				if (cuda_error("cudaMemsetAsync(*log_histogram_saddles)", false, __FILE__, __LINE__)) return false;
 			}
 
 
 			set_threads(threads, 16, 16);
 			set_blocks(threads, blocks, num_pixels_y.re, num_pixels_y.im);
 
-			log_histogram_kernel<T> <<<blocks, threads>>> (d_pixels, num_pixels_y, min_log_mag, log_histogram, factor);
-			if (cuda_error("log_histogram_kernel", true, __FILE__, __LINE__)) return false;
+			log_histogram_kernel<T> <<<blocks, threads, 0, stream>>> (d_pixels, num_pixels_y, min_log_mag, log_histogram, factor);
+			if (cuda_error("log_histogram_kernel", true, __FILE__, __LINE__, stream)) return false;
 			if (write_parities)
 			{
-				log_histogram_kernel<T> <<<blocks, threads>>> (d_pixels_minima, num_pixels_y, min_log_mag, log_histogram_minima, factor);
-				if (cuda_error("log_histogram_kernel", true, __FILE__, __LINE__)) return false;
-				log_histogram_kernel<T> <<<blocks, threads>>> (d_pixels_saddles, num_pixels_y, min_log_mag, log_histogram_saddles, factor);
-				if (cuda_error("log_histogram_kernel", true, __FILE__, __LINE__)) return false;
+				log_histogram_kernel<T> <<<blocks, threads, 0, stream>>> (d_pixels_minima, num_pixels_y, min_log_mag, log_histogram_minima, factor);
+				if (cuda_error("log_histogram_kernel", true, __FILE__, __LINE__, stream)) return false;
+				log_histogram_kernel<T> <<<blocks, threads, 0, stream>>> (d_pixels_saddles, num_pixels_y, min_log_mag, log_histogram_saddles, factor);
+				if (cuda_error("log_histogram_kernel", true, __FILE__, __LINE__, stream)) return false;
 			}
 
 
@@ -875,6 +896,7 @@ private:
 		outfile.precision(9);
 		std::string fname;
 
+		if (!use_device()) return false;
 
 		if (!Microlensing<T>::write_files(verbose, "ipm")) return false;
 
@@ -930,8 +952,10 @@ private:
 					std::cerr << "Error. Unable to allocate a host copy of a histogram.\n";
 					return false;
 				}
-				cudaMemcpy(h_hist.data(), d_hist, n * sizeof(int), cudaMemcpyDeviceToHost);
-				return !cuda_error("cudaMemcpy(*h_hist)", false, __FILE__, __LINE__);
+				cudaMemcpyAsync(h_hist.data(), d_hist, n * sizeof(int), cudaMemcpyDeviceToHost, stream);
+				if (cuda_error("cudaMemcpyAsync(*h_hist)", false, __FILE__, __LINE__)) return false;
+				cudaStreamSynchronize(stream);
+				return !cuda_error("cudaStreamSynchronize", false, __FILE__, __LINE__);
 			};
 
 			fname = outfile_prefix + "ipm_mags_numpixels.txt";
@@ -1034,14 +1058,18 @@ private:
 	bool copy_map(const T* d_map, T* dst, const char* name) const
 	{
 		if (d_map == nullptr || dst == nullptr) return false;
-		cudaMemcpy(dst, d_map, (1ULL * num_pixels_y.re * num_pixels_y.im) * sizeof(T), cudaMemcpyDeviceToHost);
-		return !cuda_error(name, false, __FILE__, __LINE__);
+		if (!use_device()) return false;
+		cudaMemcpyAsync(dst, d_map, (1ULL * num_pixels_y.re * num_pixels_y.im) * sizeof(T), cudaMemcpyDeviceToHost, stream);
+		if (cuda_error(name, false, __FILE__, __LINE__)) return false;
+		cudaStreamSynchronize(stream);
+		return !cuda_error("cudaStreamSynchronize", false, __FILE__, __LINE__);
 	}
 
 	T* host_copy(const T* d_map, T*& h_map, const char* name)
 	{
 		if (h_map == nullptr && d_map != nullptr)
 		{
+			if (!use_device()) return nullptr;
 			T* copy = new (std::nothrow) T[1ULL * num_pixels_y.re * num_pixels_y.im];
 			if (copy == nullptr)
 			{
@@ -1152,11 +1180,16 @@ public:
 		if (!shoot_cells(verbose)) return false;
 		if (!create_histograms(verbose)) return false;
 
+		//everything has finished on the stream before run() returns
+		cudaStreamSynchronize(stream);
+		if (cuda_error("cudaStreamSynchronize", false, __FILE__, __LINE__)) return false;
+
 		return true;
 	}
 
 	bool save(int verbose)
 	{
+		if (!use_device()) return false;
 		if (!write_files(verbose)) return false;
 
 		return true;

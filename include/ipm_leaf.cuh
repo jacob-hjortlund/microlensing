@@ -141,11 +141,12 @@ namespace ipm_leaf
 	\param expansion_order -- global expansion order (coefficient stride is +1)
 	\param leaves, coef_re, coef_im, direct -- output device arrays (allocated here)
 	\param num_leaves, num_direct -- output sizes
+	\param stream -- stream the kernels run on
 	******************************************************************************/
 	template <typename T>
 	bool build_leaf_records(const std::vector<TreeNode<T>*>& tree, const std::vector<int>& num_nodes, const star<T>* stars,
 		int expansion_order, LeafRecord<T>*& leaves, T*& coef_re, T*& coef_im, StarXYM<T>*& direct,
-		int& num_leaves, int& num_direct, int verbose)
+		int& num_leaves, int& num_direct, int verbose, cudaStream_t stream)
 	{
 		int* counters = nullptr;
 		cudaMallocManaged(&counters, 2 * sizeof(int));
@@ -159,8 +160,8 @@ namespace ipm_leaf
 		{
 			set_threads(threads, 256);
 			set_blocks(threads, blocks, num_nodes[i]);
-			count_leaves_kernel<T> <<<blocks, threads>>> (tree[i], num_nodes[i], &counters[0], &counters[1]);
-			if (cuda_error("count_leaves_kernel", true, __FILE__, __LINE__)) return false;
+			count_leaves_kernel<T> <<<blocks, threads, 0, stream>>> (tree[i], num_nodes[i], &counters[0], &counters[1]);
+			if (cuda_error("count_leaves_kernel", true, __FILE__, __LINE__, stream)) return false;
 		}
 		num_leaves = counters[0];
 		num_direct = counters[1];
@@ -182,8 +183,8 @@ namespace ipm_leaf
 		{
 			set_threads(threads, 256);
 			set_blocks(threads, blocks, num_nodes[i]);
-			fill_leaves_kernel<T> <<<blocks, threads>>> (tree[i], num_nodes[i], stars, leaves, coef_re, coef_im, coef_stride, direct);
-			if (cuda_error("fill_leaves_kernel", true, __FILE__, __LINE__)) return false;
+			fill_leaves_kernel<T> <<<blocks, threads, 0, stream>>> (tree[i], num_nodes[i], stars, leaves, coef_re, coef_im, coef_stride, direct);
+			if (cuda_error("fill_leaves_kernel", true, __FILE__, __LINE__, stream)) return false;
 		}
 
 		cudaFree(counters);
