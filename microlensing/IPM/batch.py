@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .batch_backend import CtypesBackend
 from .batch_params import expand
 from .batch_scheduler import BatchMapError, Scheduler
 from .ipm import IPM, _INPUT_NAMES
@@ -30,7 +31,7 @@ def _make_backend(is_double: bool, verbose: int):
     lib = (lib_ipm_double if is_double else lib_ipm).lib
     if not hasattr(lib, "set_worker"):
         return None
-    return None   # the ctypes backend arrives with batch_backend
+    return CtypesBackend(is_double, verbose)
 
 
 def _is_sequence(value):

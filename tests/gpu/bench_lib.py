@@ -176,6 +176,27 @@ def check_gpu_allocation():
     return None
 
 
+def check_all_gpus_allocated():
+    """Error message if any CUDA_VISIBLE_DEVICES entry is not among the Slurm-allocated GPUs (or
+    CUDA_VISIBLE_DEVICES is unset, so that every GPU of the node is visible), else None. None when Slurm sets
+    neither SLURM_STEP_GPUS nor SLURM_JOB_GPUS. For tests that use several GPUs."""
+    allocated = os.environ.get("SLURM_STEP_GPUS")
+    if allocated is None:
+        allocated = os.environ.get("SLURM_JOB_GPUS")
+    if not allocated:
+        return None
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if raw is None:
+        return (f"CUDA_VISIBLE_DEVICES is unset, so every GPU of the node is visible, but Slurm allocated only "
+                f"{allocated!r} (SLURM_STEP_GPUS/SLURM_JOB_GPUS)")
+    want = {g.strip() for g in allocated.split(",") if g.strip()}
+    missing = [g.strip() for g in raw.split(",") if g.strip() and g.strip() not in want]
+    if missing:
+        return (f"CUDA_VISIBLE_DEVICES={raw!r} has entries {missing} that Slurm did not allocate "
+                f"(SLURM_STEP_GPUS/SLURM_JOB_GPUS={allocated!r}); only the allocated GPUs may be used")
+    return None
+
+
 def _as_text(data):
     """Decode the raw bytes that TimeoutExpired carries even with text=True; None becomes ''."""
     if isinstance(data, bytes):

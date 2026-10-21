@@ -467,6 +467,29 @@ class EnvironmentGuardTests(unittest.TestCase):
             os.environ.pop("SLURM_JOB_GPUS", None)
             self.assertIsNone(bench_lib.check_gpu_allocation())
 
+    def test_check_all_gpus_allocated(self):
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0,1", "SLURM_STEP_GPUS": "0"}):
+            msg = bench_lib.check_all_gpus_allocated()
+            self.assertIsNotNone(msg)
+            self.assertIn("'1'", msg)
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0,1", "SLURM_STEP_GPUS": "0,1"}):
+            self.assertIsNone(bench_lib.check_all_gpus_allocated())
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "1,0", "SLURM_STEP_GPUS": "0,1,2"}):
+            self.assertIsNone(bench_lib.check_all_gpus_allocated())
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "1", "SLURM_JOB_GPUS": "0,1"}):
+            os.environ.pop("SLURM_STEP_GPUS", None)
+            self.assertIsNone(bench_lib.check_all_gpus_allocated())
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0,3", "SLURM_JOB_GPUS": "0,1"}):
+            os.environ.pop("SLURM_STEP_GPUS", None)
+            self.assertIn("'3'", bench_lib.check_all_gpus_allocated())
+        with mock.patch.dict(os.environ, {"SLURM_STEP_GPUS": "0,1"}):
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)   # every GPU of the node is visible
+            self.assertIn("unset", bench_lib.check_all_gpus_allocated())
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0,1"}):
+            os.environ.pop("SLURM_STEP_GPUS", None)
+            os.environ.pop("SLURM_JOB_GPUS", None)
+            self.assertIsNone(bench_lib.check_all_gpus_allocated())
+
 
 class RunIpmTests(unittest.TestCase):
     def run_fake(self, env_over=None, **kw):
