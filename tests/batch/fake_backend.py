@@ -16,6 +16,7 @@ Failure injection:
   (also a run in progress when it happens) and check_device returns 700.
 - device_errors={device: code}: what check_device returns for a device the fake has not killed (default 0).
   A test may change it while a batch runs, for a context that broke without failing the runs in progress.
+  check_device takes check_time seconds.
 - open_fails_for: devices whose open_slot raises RuntimeError.
 - fail_release_when / fail_close_when: callables slot -> exception instance or None; release() or close()
   raises it. A failed release() keeps the slot's memory allocated; a failed close() still closes the slot.
@@ -23,7 +24,8 @@ Failure injection:
 Records, all under one lock:
 - log: (event, device, slot_id, params.get("index"), time.monotonic()) for the events "estimate", "open",
   "open_failed", "start", "end", "oom", "dead" (dead_after killed the device), "release", "release_failed",
-  "check" (a check_device call) and "close". A run that is not rejected for memory logs "start" and "end".
+  "check" and "checked" (a check_device call begins and returns) and "close". A run that is not rejected for
+  memory logs "start" and "end".
 - max_concurrency[d]: the most maps seen running at once on device d; peak_alloc[d]: the most memory seen held
   by d's open slots.
 - per slot: release_calls and close_calls (failed calls included) and run_threads (the name of the thread of
@@ -153,7 +155,7 @@ class FakeBackend:
     def __init__(self, devices=2, free=40 << 30, total=40 << 30, concurrent_managed=True, run_time=0.01,
                  fail_estimate_when=None, fail_run_when=None, save_fails_when=None, oom_above=None,
                  dead_after=None, open_fails_for=(), grow_only=False, release_time=0.0, device_errors=None,
-                 fail_release_when=None, fail_close_when=None):
+                 fail_release_when=None, fail_close_when=None, check_time=0.0):
         self.devices = devices
         self.free = free
         self.total = total
@@ -170,6 +172,7 @@ class FakeBackend:
         self.device_errors = dict(device_errors or {})
         self.fail_release_when = fail_release_when
         self.fail_close_when = fail_close_when
+        self.check_time = check_time
         self.lock = threading.Lock()
         self.log = []
         self.slots = []
@@ -232,4 +235,7 @@ class FakeBackend:
     def check_device(self, device):
         with self.lock:
             self.log_event("check", device, None, {})
+        time.sleep(self.check_time)
+        with self.lock:
+            self.log_event("checked", device, None, {})
             return 700 if self.dead[device] else self.device_errors.get(device, 0)
