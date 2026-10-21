@@ -132,15 +132,18 @@ class TestBatchedIPM(unittest.TestCase):
         self.assertEqual(recs[1].random_seed, b.params(1)["random_seed"])
 
     def test_save_mode_bounds_staging(self):
-        fb = FakeBackend(run_time=0.0)
+        # the 2 writers are slower than the maps: the results waiting to be written never exceed the limit, while
+        # the 10 maps, which all start at once, are not counted against it while they run
+        fb = FakeBackend(run_time=0.05)
         limit = 3 * MiB
         with make(fb, num_maps=10, write_maps=True, max_result_bytes=limit) as b:
-            with mock.patch("fake_backend.FakeResult.save", autospec=True,
-                            side_effect=lambda self: time.sleep(0.02)):
+            with mock.patch.object(FakeResult, "save", lambda self: time.sleep(0.02)):
                 b.run(save=True)
-            self.assertEqual(b.last_run_stats["result_budget"], limit)   # above 2 GPUs x 1 MiB, so not raised
-            self.assertLessEqual(b.last_run_stats["peak_result_bytes"], limit)
-            self.assertGreater(b.last_run_stats["peak_result_bytes"], 0)
+            stats = b.last_run_stats
+            self.assertEqual(stats["result_budget"], limit)
+            self.assertEqual(stats["peak_result_bytes"], limit)
+            self.assertEqual(stats["peak_in_flight_result_bytes"], 10 * MiB)
+            self.assertEqual(sum(fb.max_concurrency.values()), 10)
 
     @staticmethod
     def slow_first_map(b):
