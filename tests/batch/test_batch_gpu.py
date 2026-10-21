@@ -450,7 +450,12 @@ class SchedulingTests(unittest.TestCase):
         self.assertEqual(stats["devices"][1]["maps"], 4)
 
     def test_break_then_rerun(self):
-        # 2000^2 maps, so that the slots hold some 270 MiB per GPU: a slot that close() left open would show
+        # 2000^2 maps, so that the slots hold some 270 MiB per GPU: a slot that close() left open would show. The
+        # driver keeps a cache of device memory that nvidia-smi gives to no process and that moves in steps of
+        # about 128 MiB (after earlier tests put managed memory on a GPU, measured 2026-10-22), so the free memory
+        # may move by up to 256 MiB. This process's own usage must come back within 64 MiB after close(), and must
+        # not grow over 3 further close()/rerun cycles
+        free_tolerance = 256 * MiB
         maps = [nb(2000)] * 20
         n_dev = device_count()
         with batch_of(maps[:4], random_seed=8000) as warm:   # each GPU's first batch also loads code onto it
@@ -475,21 +480,34 @@ class SchedulingTests(unittest.TestCase):
             b.close()
         after = {d: device_free(d) for d in range(n_dev)}
         after_mine, after_others = gpu_processes()
+        cycles_mine = []   # this process's usage after each further close()
+        for _ in range(3):
+            try:
+                out = dict(b.run())   # a closed batch opens new slots
+                self.assertEqual(sorted(out), list(range(20)))
+                self.assertTrue(all(not isinstance(r, BatchMapError) for r in out.values()), out)
+            finally:
+                b.close()
+            self.assertEqual(batch_threads(), [])
+            cycles_mine.append(gpu_processes()[0])
         print(f"\nfree memory before / after close (MiB): "
               + ", ".join(f"GPU {d} {before[d] / MiB:.0f} / {after[d] / MiB:.0f}" for d in range(n_dev))
-              + f"\nthis process (nvidia-smi, MiB): before {before_mine}, holding {holding_mine}, after {after_mine}; "
+              + f"\nthis process (nvidia-smi, MiB): before {before_mine}, holding {holding_mine}, "
+              f"after {after_mine}, after 3 more close()/rerun cycles {cycles_mine}; "
               f"other processes before {before_others}, after {after_others}")
         if before_mine is None:   # no per-process memory from nvidia-smi: only the free memory can be checked
             for d in range(n_dev):
-                self.assertLessEqual(abs(after[d] - before[d]), 64 * MiB, f"GPU {d}")
+                self.assertLessEqual(abs(after[d] - before[d]), free_tolerance, f"GPU {d}")
             return
         for d in range(n_dev):
             # this process's own memory on each GPU, which other processes on a shared GPU cannot disturb
             self.assertGreater(holding_mine.get(d, 0), before_mine.get(d, 0) + 100, f"GPU {d}: slots not seen")
             self.assertLessEqual(abs(after_mine.get(d, 0) - before_mine.get(d, 0)), 64, f"GPU {d}")
+            for k, mine in enumerate(cycles_mine):   # no growth from one close() to the next
+                self.assertLessEqual(mine.get(d, 0) - after_mine.get(d, 0), 64, f"GPU {d}, cycle {k + 1}")
             # the free memory, on a GPU that no other process uses: another process's allocations would move it
             if not before_others.get(d) and not after_others.get(d):
-                self.assertLessEqual(abs(after[d] - before[d]), 64 * MiB, f"GPU {d}")
+                self.assertLessEqual(abs(after[d] - before[d]), free_tolerance, f"GPU {d}")
             else:
                 print(f"GPU {d}: free-memory check skipped, another process uses this GPU "
                       f"({before_others.get(d)} / {after_others.get(d)} MiB before / after)")
