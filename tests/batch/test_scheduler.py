@@ -316,9 +316,8 @@ class SchedulerTests(unittest.TestCase):
         ooms = events(fake, "oom", 0)
         self.assertGreaterEqual(dev["oom_retries"], 1)
         self.assertEqual(dev["oom_retries"], len(ooms))
-        # an error needs 3 maps in progress, so every error parked a slot and GPU 0 kept at least 2 of its 8
-        self.assertGreaterEqual(dev["parked_slots"], 1)
-        self.assertEqual(dev["parked_slots"], dev["oom_retries"])
+        # an error needs 3 maps in progress, so every error parked at least one slot and GPU 0 kept at least 2
+        self.assertGreaterEqual(dev["parked_slots"], dev["oom_retries"])
         self.assertLessEqual(dev["parked_slots"], 6)
         self.assertEqual(sched.stats["devices"][1]["oom_retries"], 0)
         self.assertLessEqual(max_running_after(fake, ooms[0][0], 0), 2)
@@ -327,6 +326,42 @@ class SchedulerTests(unittest.TestCase):
         for pos, slot_id in ooms:
             nxt = [e[0] for e in log[pos + 1:] if e[2] == slot_id and e[0] in ("start", "oom", "release")]
             self.assertEqual(nxt[0], "release", (pos, slot_id))
+
+    def test_oom_retry_waits_for_fewer_maps_in_progress(self):
+        # one GPU of 8 slots runs just 3 maps when map 2 runs out of memory. Its limit drops to 2 (not 7), so the
+        # retry starts only once one of maps 0 and 1 has ended, never while both still run
+        tries_of_2 = []
+        always = []
+
+        def fail(p):
+            if p["index"] != 2:
+                return None
+            tries_of_2.append(p["index"])
+            if always or len(tries_of_2) == 1:
+                time.sleep(0.02)
+                return MapFailed("out of memory", 2)
+            return None
+
+        fake = FakeBackend(devices=1, fail_run_when=fail)
+        sched = self.make(fake)
+        params = [{"index": 0, "time": 0.2}, {"index": 1, "time": 0.4}, {"index": 2, "time": 0.05}]
+        self.assert_successes(collect(sched, params), 3)
+        dev = sched.stats["devices"][0]
+        self.assertEqual((dev["oom_retries"], dev["parked_slots"]), (1, 6))
+        r = runs(fake)
+        first, retry = r[2]
+        alongside = [r[i][0] for i in (0, 1)]
+        self.assertTrue(all(overlaps(o, first) for o in alongside))
+        still_running = [o for o in alongside if o[1] < retry[1] < o[2]]
+        self.assertEqual(len(still_running), 1)   # map 0 had ended, map 1 still ran
+        self.assertLess(r[0][0][2], retry[1])
+        # when map 2 always runs out, it fails alone in the end and the GPU gets back all 6 + 1 parked slots
+        always.append(True)
+        out = collect(sched, params)
+        self.assert_successes(out, 3, failed={2})
+        dev = sched.stats["devices"][0]
+        self.assertGreaterEqual(dev["oom_retries"], 2)
+        self.assertEqual(dev["parked_slots"], 0)
 
     def test_oom_alone_fails_map(self):
         # map 3 runs out of memory however few maps run next to it: it is retried with fewer maps in progress

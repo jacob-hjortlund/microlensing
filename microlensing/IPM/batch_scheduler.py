@@ -8,7 +8,8 @@ and no map is admitted on a GPU while memory is being freed on it. Finished resu
 bytes until the consumer releases them. A failing map becomes a BatchMapError result and the batch carries on.
 
 A map that runs out of device memory while other maps run on its GPU goes back to the front of the queue, to be
-retried on that GPU only, and that GPU runs one map fewer at a time. A map that runs out of memory alone has the
+retried on that GPU only, and that GPU runs fewer maps at a time than were in progress when it ran out (at least
+one map fewer than its limit). A map that runs out of memory alone has the
 memory of the GPU's idle slots freed and is tried once more; it fails only when it runs out of memory alone on a
 GPU whose idle slots hold nothing, and that GPU then gets back the slots its retries parked. A GPU whose CUDA
 context broke (a sticky error), or where a slot cannot open, leaves the batch for the scheduler's lifetime: its
@@ -190,7 +191,7 @@ class _Run:
         self.active = {}          # device -> slots with an admitted map
         self.attempts = [0] * len(params)   # how often each map moved off a GPU that left the batch
         self.pinned = {}          # index -> the GPU that alone may run this out-of-memory retry
-        self.parks = [0] * len(params)      # slot_limit decrements each map's retries made on its pinned GPU
+        self.parks = [0] * len(params)      # how much each map's retries lowered slot_limit on its pinned GPU
         self.total_running = 0
         self.reserved_result = 0  # host bytes of results running, queued, or yielded and not released
         self.stats = _empty_stats(devices, dead)
@@ -654,9 +655,10 @@ class Scheduler:
         - a map that fails on a GPU that has left the batch moves to another GPU, once (_move);
         - a map that did not run because its slot could not free its memory goes back to the front of the queue;
         - a map that runs out of memory goes back to the front of the queue, pinned to its GPU, if another map
-          ran on that GPU while it did (and the GPU parks a slot), or if it ran alone while idle slots held
-          memory, which _failed has freed. Otherwise it fails, and its GPU gets back the slots its retries
-          parked;
+          ran on that GPU while it did, or if it ran alone while idle slots held memory, which _failed has freed.
+          In the first case the GPU's slot_limit drops below the number of maps in progress when the failure is
+          classified (this one included), and below its current value, so that the retry starts only once fewer
+          maps run there. Otherwise the map fails, and its GPU gets back the slots its retries parked;
         - any other failure fails the map."""
         d = st.device
         i = job.index
@@ -684,9 +686,11 @@ class Scheduler:
                 if self._usable(run, d):
                     run.pinned[i] = d
                 dev["oom_retries"] += 1
-                if st.shared and run.slot_limit[d] > 1:
-                    run.slot_limit[d] -= 1
-                    run.parks[i] += 1
+                if st.shared:
+                    in_progress = run.running[d] + 1    # running[d] no longer counts this map
+                    limit = max(1, min(run.slot_limit[d] - 1, in_progress - 1))
+                    run.parks[i] += run.slot_limit[d] - limit
+                    run.slot_limit[d] = limit
             else:
                 run.slot_limit[d] = min(run.n_slots[d], run.slot_limit[d] + run.parks[i])
                 run.parks[i] = 0
