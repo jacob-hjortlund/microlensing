@@ -33,6 +33,8 @@ class IPM : public Microlensing<T>
 {
 
 public:
+	using Microlensing<T>::device;
+	using Microlensing<T>::use_device;
 	/******************************************************************************
 	default input variables
 	******************************************************************************/
@@ -79,7 +81,6 @@ private:
 	using Microlensing<T>::blocks;
 	using Microlensing<T>::cuda_device_prop;
 	using Microlensing<T>::stream;
-	using Microlensing<T>::use_device;
 	using Microlensing<T>::mean_mass;
 	using Microlensing<T>::mean_mass2;
 	using Microlensing<T>::mean_mass2_ln_mass;
@@ -735,15 +736,16 @@ private:
 			{
 				thrust::device_ptr<T> dp = thrust::device_pointer_cast(d_arr);
 				auto mm = thrust::minmax_element(thrust::cuda::par_nosync.on(stream), dp, dp + npix_total);
+				if (cuda_error("thrust::minmax_element", false, __FILE__, __LINE__)) return false;
 				cudaMemcpyAsync(&lo, d_arr + (mm.first - dp), sizeof(T), cudaMemcpyDeviceToHost, stream);
-				cuda_error("cudaMemcpyAsync(*lo)", false, __FILE__, __LINE__);
+				if (cuda_error("cudaMemcpyAsync(*lo)", false, __FILE__, __LINE__)) return false;
 				cudaMemcpyAsync(&hi, d_arr + (mm.second - dp), sizeof(T), cudaMemcpyDeviceToHost, stream);
-				cuda_error("cudaMemcpyAsync(*hi)", false, __FILE__, __LINE__);
+				if (cuda_error("cudaMemcpyAsync(*hi)", false, __FILE__, __LINE__)) return false;
 				cudaStreamSynchronize(stream);
-				cuda_error("cudaStreamSynchronize", false, __FILE__, __LINE__);
+				return !cuda_error("cudaStreamSynchronize", false, __FILE__, __LINE__);
 			};
 			T lo_all, hi_all;
-			minmax(d_pixels, lo_all, hi_all);
+			if (!minmax(d_pixels, lo_all, hi_all)) return false;
 			min_mag = std::round(lo_all * factor);
 			max_mag = std::round(hi_all * factor);
 			min_log_mag = std::round(std::log10(lo_all) * factor);
@@ -764,8 +766,8 @@ private:
 			if (write_parities)
 			{
 				T lo_min, hi_min, lo_sad, hi_sad;
-				minmax(d_pixels_minima, lo_min, hi_min);
-				minmax(d_pixels_saddles, lo_sad, hi_sad);
+				if (!minmax(d_pixels_minima, lo_min, hi_min)) return false;
+				if (!minmax(d_pixels_saddles, lo_sad, hi_sad)) return false;
 				int min_mag_minima = std::round(lo_min * factor);
 				int max_mag_minima = std::round(hi_min * factor);
 
