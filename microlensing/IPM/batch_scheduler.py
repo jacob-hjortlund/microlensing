@@ -442,15 +442,8 @@ class Scheduler:
 
     def _slot_thread(self, run, st):
         try:
-            while True:
-                job = self._admit(run, st)
-                if job is None:
-                    return
-                stage, outcome, exc = self._execute(run, st, job)
-                if stage == "done":
-                    self._complete(run, st, job, outcome)
-                else:
-                    self._failed(run, st, job, stage, exc)
+            while self._one_map(run, st):
+                pass
         except BaseException as exc:   # a fault in the scheduler itself: stop the batch and tell the consumer
             with self._cond:
                 if run.error is None:
@@ -460,6 +453,20 @@ class Scheduler:
         finally:
             with self._cond:
                 self._cond.notify_all()
+
+    def _one_map(self, run, st):
+        """Admit, run and hand on one map in this slot; False when the thread should exit. The map's job, outcome,
+        result and exception are locals of this call only, so that nothing of a finished map stays referenced
+        while the thread waits in _admit for its next map."""
+        job = self._admit(run, st)
+        if job is None:
+            return False
+        stage, outcome, exc = self._execute(run, st, job)
+        if stage == "done":
+            self._complete(run, st, job, outcome)
+        else:
+            self._failed(run, st, job, stage, exc)
+        return True
 
     def _admit(self, run, st):
         """Wait until the map at the head of pending can start in this slot. Returns None when the thread

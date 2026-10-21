@@ -155,8 +155,11 @@ class BatchedIPM:
     def _serial(self):
         self.last_run_stats = None
         for i in range(len(self._params)):
-            ipm, error = self._serial_map(i)
-            yield _Done(i, ipm if error is None else error)
+            yield self._serial_done(i)   # no local keeps map i (and its GPU memory) while map i + 1 runs
+
+    def _serial_done(self, i):
+        ipm, error = self._serial_map(i)
+        return _Done(i, ipm if error is None else error)
 
     def _serial_map(self, i, save=False):
         ipm = None
@@ -190,7 +193,7 @@ class BatchedIPM:
         try:
             for fin in gen:
                 fin.release()
-                yield fin.index, fin.result
+                yield _take(fin)
         finally:
             gen.close()
             self._after_run()
@@ -237,12 +240,13 @@ class BatchedIPM:
                 if isinstance(fin.result, BatchMapError):
                     records[fin.index] = self._record(fin.index, None, fin.result)
                     fin.release()
-                    continue
-                try:
-                    futures.append(executor.submit(save_one, fin))
-                except BaseException:
-                    fin.release()
-                    raise
+                else:
+                    try:
+                        futures.append(executor.submit(save_one, fin))
+                    except BaseException:
+                        fin.release()
+                        raise
+                fin = None    # a writer has it now: keep nothing of it while waiting for the next map
         finally:
             gen.close()
             executor.shutdown(wait=True)
@@ -250,6 +254,13 @@ class BatchedIPM:
         for f in futures:
             f.result()
         return [records[i] for i in sorted(records)]
+
+
+def _take(fin):
+    """(index, result) of a finished map, dropping the item's own reference to the result, so that the memory-mode
+    generator keeps nothing of the map while it waits for the next one."""
+    result, fin.result = fin.result, None
+    return fin.index, result
 
 
 class _Done:

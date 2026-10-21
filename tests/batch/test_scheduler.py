@@ -2,10 +2,12 @@
 python -m unittest tests.batch.test_scheduler -v"""
 import _thread
 import faulthandler
+import gc
 import sys
 import threading
 import time
 import unittest
+import weakref
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -273,6 +275,30 @@ class SchedulerTests(unittest.TestCase):
         params[4]["result"] = 3 * GiB
         self.assert_successes(collect(sched, params), 6, failed={0})
         self.assertEqual(sched.stats["result_budget"], 6 * GiB)
+
+    def test_waiting_slot_threads_keep_no_finished_result(self):
+        # 4 slots on 1 GPU: map 0 runs for 1 s, maps 1-7 end within about 0.1 s. While map 0 runs, the other 3
+        # slot threads wait for a map: the results that the consumer received, released and dropped must be freed
+        # by then, not kept until the threads exit
+        fake = FakeBackend(devices=1)
+        sched = self.make(fake, maps_per_gpu=4)
+        params = maps(8, time=0.02)
+        params[0]["time"] = 1.0
+        gen = sched.results(params)
+        refs = []
+        for _ in range(7):
+            f = next(gen)
+            self.assertNotEqual(f.index, 0)
+            refs.append(weakref.ref(f.result))
+            f.release()
+            del f
+        gc.collect()
+        self.assertNotIn(0, [e[3] for e in fake.log_snapshot() if e[0] == "end"])   # map 0 still runs
+        self.assertEqual(sum(r() is not None for r in refs), 0)
+        f = next(gen)
+        self.assertEqual(f.index, 0)
+        f.release()
+        gen.close()
 
     def test_oversized_map_runs_alone_and_small_maps_continue(self):
         # 20 small maps first, so that idle slots of both GPUs hold memory when the big map comes up
