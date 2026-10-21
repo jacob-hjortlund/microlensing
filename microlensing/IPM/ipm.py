@@ -67,7 +67,35 @@ class IPM(object):
 
         self._host_only = False
 
-        self._apply_inputs(**{name: locals()[name] for name in _INPUT_NAMES})
+        self._apply_inputs(
+            kappa_tot=kappa_tot,
+            shear=shear,
+            smooth_fraction=smooth_fraction,
+            kappa_star=kappa_star,
+            theta_star=theta_star,
+            mass_function=mass_function,
+            m_solar=m_solar,
+            m_lower=m_lower,
+            m_upper=m_upper,
+            light_loss=light_loss,
+            rectangular=rectangular,
+            approx=approx,
+            safety_scale=safety_scale,
+            starfile=starfile,
+            center_y1=center_y1,
+            center_y2=center_y2,
+            half_length_y1=half_length_y1,
+            half_length_y2=half_length_y2,
+            num_pixels_y1=num_pixels_y1,
+            num_pixels_y2=num_pixels_y2,
+            num_rays_y=num_rays_y,
+            random_seed=random_seed,
+            write_stars=write_stars,
+            write_maps=write_maps,
+            write_parities=write_parities,
+            write_histograms=write_histograms,
+            outfile_prefix=outfile_prefix,
+        )
 
     def _apply_inputs(self, kappa_tot: float = None, shear: float = None, smooth_fraction: float = None, kappa_star: float = None, 
                       theta_star: float = None, mass_function: str = None, m_solar: float = None, m_lower: float = None, m_upper: float = None,
