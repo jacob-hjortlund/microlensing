@@ -5,8 +5,10 @@ slot drives it. A map is admitted to a GPU when the extra memory its slot needs,
 slots already hold, fits the GPU's budget. A map goes to a GPU that runs fewer maps when that GPU can start it
 at once, so that a batch spreads over every GPU. A map that does not fit runs alone once nothing else runs on
 the GPU. A slot that keeps more memory than its next map needs gives it back while another slot waits for memory,
-and no map is admitted on a GPU while memory is being freed on it. Finished results wait in a queue bounded in
-bytes until the consumer releases them. A failing map becomes a BatchMapError result and the batch carries on.
+and no map is admitted on a GPU while memory is being freed on it. Finished results wait in a queue until the
+consumer releases them, and the results of the maps in progress and in that queue are bounded in bytes by
+max_result_bytes, raised to fit one map per GPU. A failing map becomes a BatchMapError result and the batch
+carries on.
 
 A map that runs out of device memory while other maps run on its GPU goes back to the front of the queue, to be
 retried on that GPU only, and that GPU runs fewer maps at a time than were in progress when it ran out (at least
@@ -154,7 +156,7 @@ def _growth(held, e):
 def _empty_stats(devices, dead):
     return {"devices": {d: {"budget": 0, "maps": 0, "max_concurrent": 0, "peak_committed": 0, "oom_retries": 0,
                             "parked_slots": 0, "dead": d in dead} for d in devices},
-            "direct_deposit_maps": 0, "peak_result_bytes": 0}
+            "direct_deposit_maps": 0, "peak_result_bytes": 0, "result_budget": 0}
 
 
 class _SlotState:
@@ -201,6 +203,7 @@ class _Run:
         self.parks = [0] * len(params)      # how much each map's retries lowered slot_limit on its pinned GPU
         self.total_running = 0
         self.reserved_result = 0  # host bytes of results running, queued, or yielded and not released
+        self.result_budget = 0    # the most reserved_result may reach (beyond one map): set when the threads start
         self.stats = _empty_stats(devices, dead)
 
     def release(self, item):
@@ -218,10 +221,11 @@ class Scheduler:
 
     stats describes the latest results() call and is updated while it runs:
     {"devices": {d: {"budget", "maps", "max_concurrent", "peak_committed", "oom_retries", "parked_slots",
-    "dead"}}, "direct_deposit_maps": int, "peak_result_bytes": int}. "maps" counts the maps that succeeded
-    on that GPU, "oom_retries" the maps sent back to the queue after running out of memory there,
-    "parked_slots" how many of its slots no longer run maps in this call, and "dead" whether the GPU has left
-    the batch."""
+    "dead"}}, "direct_deposit_maps": int, "peak_result_bytes": int, "result_budget": int}. "maps" counts the
+    maps that succeeded on that GPU, "oom_retries" the maps sent back to the queue after running out of memory
+    there, "parked_slots" how many of its slots no longer run maps in this call, and "dead" whether the GPU has
+    left the batch. "result_budget" is the result budget of the call: max_result_bytes, raised to the number of
+    GPUs in use times the largest result estimate of the batch, so that every GPU can run a map."""
 
     def __init__(self, backend: Backend, devices=None, maps_per_gpu=None,
                  max_result_bytes=DEFAULT_MAX_RESULT_BYTES, slot_cap=DEFAULT_SLOT_CAP):
@@ -259,10 +263,10 @@ class Scheduler:
     def results(self, params: list[dict]) -> Iterator[Finished]:
         """Run every map and yield one Finished per map, in completion order.
 
-        Release each Finished when its result is no longer needed: at most max_result_bytes of results that
-        are running, queued or unreleased are held at a time (always at least one map). Closing the generator
-        (break, an exception in the consumer, Ctrl-C) lets the maps in progress finish, drops their results
-        and joins every slot thread."""
+        Release each Finished when its result is no longer needed: at most stats["result_budget"] bytes of
+        results that are running, queued or unreleased are held at a time (always at least one map). Closing the
+        generator (break, an exception in the consumer, Ctrl-C) lets the maps in progress finish, drops their
+        results and joins every slot thread."""
         params = list(params)
         run = self._begin(params)
         try:
@@ -369,6 +373,10 @@ class Scheduler:
                 dev = run.stats["devices"][d]
                 dev["budget"] = run.budget[d]
                 dev["peak_committed"] = held
+            # room for one map per GPU, so that the result budget does not leave GPUs idle
+            largest = max((e.result for e in run.estimates if e is not None), default=0)
+            run.result_budget = max(self._max_result_bytes, len(devices) * largest)
+            run.stats["result_budget"] = run.result_budget
             # slot 0 of every GPU first, then slot 1, and so on, so that the first maps find a thread on every GPU
             for k in range(max(run.n_slots.values(), default=0)):
                 for d in devices:
@@ -486,7 +494,7 @@ class Scheduler:
             return None
         i = run.pending[pos]
         e = run.estimates[i]
-        if run.reserved_result > 0 and run.reserved_result + e.result > self._max_result_bytes:
+        if run.reserved_result > 0 and run.reserved_result + e.result > run.result_budget:
             return None
         if run.running[d] >= run.slot_limit[d]:
             return None

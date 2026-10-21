@@ -64,6 +64,16 @@ def max_running_after(fake, after, device):
     return peak
 
 
+def max_running(fake):
+    """The most maps running at once on all devices together."""
+    running = peak = 0
+    for e in fake.log_snapshot():
+        if e[0] in ("start", "end"):
+            running += 1 if e[0] == "start" else -1
+            peak = max(peak, running)
+    return peak
+
+
 def overlaps(a, b):
     return a[1] < b[2] and b[1] < a[2]
 
@@ -226,14 +236,43 @@ class SchedulerTests(unittest.TestCase):
             time.sleep(0.05)
             f.release()
         self.assert_successes(out, 12)
+        self.assertEqual(sched.stats["result_budget"], 3 * GiB)
         self.assertLessEqual(sched.stats["peak_result_bytes"], 3 * GiB)
         self.assertGreaterEqual(sched.stats["peak_result_bytes"], 2 * GiB)
 
-        fake = FakeBackend()
+        # on one GPU the budget is raised to one map, so the maps run one at a time
+        fake = FakeBackend(devices=1)
         sched = self.make(fake, max_result_bytes=1)
         self.assert_successes(collect(sched, maps(8, result=GiB, time=0.01)), 8)
+        self.assertEqual(sched.stats["result_budget"], GiB)
         self.assertEqual(sched.stats["peak_result_bytes"], GiB)
         self.assertEqual(max(fake.max_concurrency.values()), 1)
+
+    def test_result_budget_fits_one_map_per_gpu(self):
+        # results of 6 GiB on 8 GPUs: the default 8 GiB budget is raised to 8 x 6 GiB, so that every GPU runs a
+        # map at once instead of one map at a time on the whole node
+        fake = FakeBackend(devices=8)
+        sched = self.make(fake)
+        self.assert_successes(collect(sched, maps(16, result=6 * GiB, time=0.1)), 16)
+        self.assertGreaterEqual(max_running(fake), 8)
+        self.assertEqual(sched.stats["result_budget"], 48 * GiB)
+        self.assertLessEqual(sched.stats["peak_result_bytes"], sched.stats["result_budget"])
+        # with max_result_bytes = 1 on 2 GPUs, each GPU runs one map at a time
+        fake = FakeBackend()
+        sched = self.make(fake, max_result_bytes=1)
+        self.assert_successes(collect(sched, maps(8, result=GiB, time=0.05)), 8)
+        self.assertEqual(sched.stats["result_budget"], 2 * GiB)
+        self.assertEqual(max_running(fake), 2)
+        self.assertEqual(fake.max_concurrency, {0: 1, 1: 1})
+        self.assertLessEqual(sched.stats["peak_result_bytes"], 2 * GiB)
+        # the largest estimate counts, and a failed estimate none
+        fake = FakeBackend(fail_estimate_when=lambda p: MapFailed("bad estimate") if p["index"] == 0 else None)
+        sched = self.make(fake, max_result_bytes=GiB)
+        params = maps(6, result=MiB, time=0.01)
+        params[0]["result"] = 9 * GiB
+        params[4]["result"] = 3 * GiB
+        self.assert_successes(collect(sched, params), 6, failed={0})
+        self.assertEqual(sched.stats["result_budget"], 6 * GiB)
 
     def test_oversized_map_runs_alone_and_small_maps_continue(self):
         # 20 small maps first, so that idle slots of both GPUs hold memory when the big map comes up
