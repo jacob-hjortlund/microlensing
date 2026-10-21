@@ -142,6 +142,20 @@ class TestBenchBatch(unittest.TestCase):
             self.assertIn("timeout", rec["error"])
             self.assertEqual(rec["stderr_tail"], "slow")
 
+    def test_launch_child_with_failing_nvidia_smi_is_unknown(self):
+        spec = bench_batch.plan(["small_f"], [1], ["memory"], 1, maps=4, save_root=None)[1]
+        done = subprocess.CompletedProcess([], 0, stdout='{"ok": true, "maps_per_s": 3.0, "maps": 4, "peak_rss_mib": 5}\n',
+                                           stderr="")
+        with mock.patch.object(bench_batch.subprocess, "run", lambda *a, **k: done), \
+                mock.patch.object(bench_batch, "allocated_gpus", lambda: [0, 1]), \
+                mock.patch.object(bench_batch, "foreign_processes", lambda own=(): None):
+            rec = bench_batch.launch_child(spec, 1)
+        self.assertEqual(rec["chosen_gpus"], [0])
+        self.assertIsNone(rec["foreign_before"])
+        self.assertIsNone(rec["foreign_after"])
+        row = [ln for ln in bench_batch.render_table({rec["key"]: rec}).splitlines() if ln.startswith("|")][2]
+        self.assertIn("unknown", row)
+
     def test_foreign_processes_none_when_smi_fails(self):
         with mock.patch.object(bench_batch, "_smi", lambda *a: None):
             self.assertIsNone(bench_batch.foreign_processes())
