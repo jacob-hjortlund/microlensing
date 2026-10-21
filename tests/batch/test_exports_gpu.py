@@ -19,24 +19,33 @@ HAS_GPU = lib_ipm.lib.get_device_count() > 0 if hasattr(lib_ipm.lib, "get_device
 @unittest.skipUnless(HAS_GPU, "no GPU visible")
 class ExportGpuTests(unittest.TestCase):
     def test_estimate_bounds_allocation(self):
+        names = ("pixel", "star", "tree")
         for label, lib in LIBS:
             for name, params in mtb.CONFIGS.items():
                 for parities in (0, 1):
-                    with self.subTest(precision=label, config=name, parities=parities):
-                        obj = lib.IPM_init()
-                        try:
-                            self.assertTrue(lib.set_worker(obj, 0))
-                            mtb.apply(lib, obj, params, parities)
-                            est = (ctypes.c_ulonglong * 4)()
-                            alloc = (ctypes.c_ulonglong * 3)()
-                            self.assertTrue(lib.estimate_memory(obj, est))
-                            self.assertTrue(lib.run(obj, 0))
-                            lib.get_allocated_bytes(obj, alloc)
-                            for k in range(3):
-                                self.assertGreaterEqual(est[k], alloc[k], f"component {k}")
-                            self.assertLessEqual(sum(est[:3]), 1.5 * sum(alloc) + (64 << 20))
-                        finally:
-                            lib.IPM_delete(obj)
+                    for seed in (3, 4, 5):
+                        with self.subTest(precision=label, config=name, parities=parities, seed=seed):
+                            obj = lib.IPM_init()
+                            try:
+                                self.assertTrue(lib.set_worker(obj, 0))
+                                mtb.apply(lib, obj, params, parities)
+                                lib.set_random_seed(obj, seed)
+                                est = (ctypes.c_ulonglong * 4)()
+                                alloc = (ctypes.c_ulonglong * 3)()
+                                self.assertTrue(lib.estimate_memory(obj, est))
+                                self.assertTrue(lib.run(obj, 0))
+                                lib.get_allocated_bytes(obj, alloc)
+                                for k in range(3):
+                                    self.assertGreaterEqual(
+                                        est[k], alloc[k],
+                                        f"{names[k]}: est={est[k]} alloc={alloc[k]} ratio={est[k] / alloc[k]:.4f}")
+                                self.assertLessEqual(
+                                    sum(est[:3]), 1.5 * sum(alloc) + (64 << 20),
+                                    f"total: est={sum(est[:3])} alloc={sum(alloc)} ratio={sum(est[:3]) / sum(alloc):.4f}")
+                                print(f"ratios {label} {name} p{parities} s{seed}: "
+                                      + " ".join(f"{names[k]}={est[k] / alloc[k]:.3f}" for k in range(3)))
+                            finally:
+                                lib.IPM_delete(obj)
 
     def test_snapshot_copies_inputs(self):
         for label, lib in LIBS:

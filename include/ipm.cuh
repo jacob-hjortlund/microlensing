@@ -1534,7 +1534,9 @@ public:
 	estimate is made on a copy of the inputs. For a map without a star file no
 	CUDA call is made.
 
-	\param pixel_bytes  -- maps, step buffer and histograms
+	\param pixel_bytes  -- maps, step buffer and histograms (16 MiB per map kind: the
+	                       histogram length depends on the magnification range, and a
+	                       reused object grows its histograms with 1.25 headroom)
 	\param star_bytes   -- curand states, two star arrays and binomial coefficients
 	\param tree_bytes   -- tree pool and compact tree, from tree_bytes_per_star
 	\param result_bytes -- the maps and the stars of a finished map held on the host
@@ -1553,7 +1555,7 @@ public:
 		unsigned long long n_maps = probe.write_parities ? 3 : 1;
 		unsigned long long n_stars = probe.num_stars;
 
-		pixel_bytes = npix * sizeof(T) * (n_maps + 1) + (probe.write_histograms ? n_maps * (8ULL << 20) : 0);
+		pixel_bytes = npix * sizeof(T) * (n_maps + 1) + (probe.write_histograms ? n_maps * (16ULL << 20) : 0);
 		star_bytes = n_stars * (sizeof(curandState) + 2 * sizeof(star<T>))
 			+ 1ULL * (2 * treenode::MAX_EXPANSION_ORDER * (2 * treenode::MAX_EXPANSION_ORDER + 3) / 2 + 1) * sizeof(long long);
 		tree_bytes = n_stars * tree_bytes_per_star + (1ULL << 20);
