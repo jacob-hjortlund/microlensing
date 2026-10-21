@@ -7,6 +7,11 @@ GPU. A slot that keeps more memory than its next map needs gives it back while a
 and no map is admitted on a GPU while memory is being freed on it. Finished results wait in a queue bounded in
 bytes until the consumer releases them. A failing map becomes a BatchMapError result and the batch carries on.
 
+A map that runs out of device memory while other maps run on its GPU goes back to the front of the queue, and that
+GPU runs one map fewer at a time from then on; a map that runs out of memory alone fails. A GPU whose CUDA context
+broke (a sticky error), or where a slot cannot open, leaves the batch for the scheduler's lifetime: its threads
+exit and the maps it was running move to the other GPUs, once each. When no GPU is left, the remaining maps fail.
+
 The scheduler knows nothing of IPM. A backend estimates the maps, describes the GPUs and opens the slots,
 and the parameter dicts pass through untouched."""
 import operator
@@ -121,8 +126,16 @@ class Finished:
             run.release(self)
 
 
+def _describe(exc):
+    return str(exc) or type(exc).__name__
+
+
+def _cuda_error(exc):
+    return exc.cuda_error if isinstance(exc, MapFailed) else 0
+
+
 def _map_error(index, exc):
-    error = BatchMapError(index, str(exc) or type(exc).__name__, exc.cuda_error if isinstance(exc, MapFailed) else 0)
+    error = BatchMapError(index, _describe(exc), _cuda_error(exc))
     error.__cause__ = exc
     return error
 
@@ -141,12 +154,14 @@ class _SlotState:
         self.number = number
         self.slot = None
         self.held = _NOTHING      # device memory the slot holds, or will hold while it runs its admitted map
+        self.broken = False       # its release() raised: it is not used again, and its memory stays counted
+        self.shared = False       # another map was admitted on the device while this slot's latest map was
 
 
 class _Job(NamedTuple):
     index: int
     estimate: MemoryEstimate
-    releases: list              # slots whose memory is freed (release()) before this map runs
+    frees: list                 # (slot state, slot, held before the admission): release() each before the map runs
 
 
 class _Run:
@@ -168,6 +183,8 @@ class _Run:
         self.committed = {}
         self.releases = {}        # device -> release() calls in flight on it; admission on it waits for them
         self.mem_waiters = {}     # device -> slots whose latest admission attempt waited for memory
+        self.active = {}          # device -> slots with an admitted map
+        self.attempts = [0] * len(params)   # how often each map moved off a GPU that left the batch
         self.total_running = 0
         self.reserved_result = 0  # host bytes of results running, queued, or yielded and not released
         self.stats = _empty_stats(devices, dead)
@@ -188,7 +205,9 @@ class Scheduler:
     stats describes the latest results() call and is updated while it runs:
     {"devices": {d: {"budget", "maps", "max_concurrent", "peak_committed", "oom_retries", "parked_slots",
     "dead"}}, "direct_deposit_maps": int, "peak_result_bytes": int}. "maps" counts the maps that succeeded
-    on that GPU."""
+    on that GPU, "oom_retries" the maps sent back to the queue after running out of memory there,
+    "parked_slots" how many of its slots no longer run maps in this call, and "dead" whether the GPU has left
+    the batch."""
 
     def __init__(self, backend: Backend, devices=None, maps_per_gpu=None,
                  max_result_bytes=DEFAULT_MAX_RESULT_BYTES, slot_cap=DEFAULT_SLOT_CAP):
@@ -241,7 +260,9 @@ class Scheduler:
             self._stop(run)
 
     def close(self) -> None:
-        """Stop a results() call in progress, then close every slot. Calling it again does nothing."""
+        """Stop a results() call in progress, then close every slot. Calling it again does nothing. A slot of a
+        GPU that left the batch, or one whose memory could not be freed, that fails to close gives a warning;
+        any other slot that fails to close raises, after every slot was closed."""
         with self._cond:
             self._closed = True
             run = self._run
@@ -251,18 +272,23 @@ class Scheduler:
         if run is not None and not self._finish_stop(run):
             return    # called from a slot thread, which cannot wait for itself: leave the slots open
         with self._cond:
-            slots = [st.slot for states in self._slots.values() for st in states if st.slot is not None]
+            slots = [(st.device, st.slot, st.broken or st.device in self._dead)
+                     for states in self._slots.values() for st in states if st.slot is not None]
             for states in self._slots.values():
                 for st in states:
                     st.slot = None
                     st.held = _NOTHING
             self._cond.notify_all()
         first = None
-        for slot in slots:
+        for d, slot, broken in slots:
             try:
                 slot.close()
             except Exception as exc:
-                first = first or exc
+                if broken:    # a slot of a GPU that left the batch, or one whose memory could not be freed
+                    warnings.warn(f"closing a slot on GPU {d} failed: {_describe(exc)}", RuntimeWarning,
+                                  stacklevel=2)
+                elif first is None:
+                    first = exc
         if first is not None:
             raise first
 
@@ -324,12 +350,14 @@ class Scheduler:
                 run.committed[d] = held
                 run.releases[d] = 0
                 run.mem_waiters[d] = set()
+                run.active[d] = set()
                 dev = run.stats["devices"][d]
                 dev["budget"] = run.budget[d]
                 dev["peak_committed"] = held
                 for st in states[:n]:
-                    run.threads.append(threading.Thread(target=self._slot_thread, args=(run, st),
-                                                        name=f"ipm-batch-{d}-{st.number}", daemon=True))
+                    if not st.broken:
+                        run.threads.append(threading.Thread(target=self._slot_thread, args=(run, st),
+                                                            name=f"ipm-batch-{d}-{st.number}", daemon=True))
             self._cond.notify_all()
         for d in unmanaged:
             warnings.warn(f"GPU {d} has no concurrent managed memory access, so its maps run one at a time",
@@ -355,10 +383,9 @@ class Scheduler:
             return item
 
     def _fail_stranded(self, run):
-        """Fail the maps still waiting when no slot thread is left to run them (lock held)."""
+        """Fail the maps still waiting when no GPU or slot thread is left to run them (lock held)."""
         while run.pending:
-            i = run.pending.popleft()
-            run.queue.append(Finished(i, BatchMapError(i, "no usable GPU left")))
+            self._fail(run, run.pending.popleft(), *self._no_gpu())
         self._cond.notify_all()
 
     def _stop(self, run):
@@ -393,8 +420,11 @@ class Scheduler:
                 job = self._admit(run, st)
                 if job is None:
                     return
-                outcome, exc = self._execute(run, st, job)
-                self._complete(run, st, job, outcome, exc)
+                stage, outcome, exc = self._execute(run, st, job)
+                if stage == "done":
+                    self._complete(run, st, job, outcome)
+                else:
+                    self._failed(run, st, job, stage, exc)
         except BaseException as exc:   # a fault in the scheduler itself: stop the batch and tell the consumer
             with self._cond:
                 if run.error is None:
@@ -407,13 +437,15 @@ class Scheduler:
 
     def _admit(self, run, st):
         """Wait until the map at the head of pending can start in this slot. Returns None when the thread
-        should exit: the run is stopping, the device is dead, or nothing is left to run anywhere."""
+        should exit: the run is stopping, the device is dead, the slot is broken, or nothing is left to run
+        anywhere."""
         with self._cond:
             waiters = run.mem_waiters[st.device]
             while True:
                 was_waiting = st in waiters
                 waiters.discard(st)
-                if run.stopping or st.device in self._dead or (not run.pending and run.total_running == 0):
+                if run.stopping or st.device in self._dead or st.broken or \
+                        (not run.pending and run.total_running == 0):
                     self._cond.notify_all()
                     return None
                 job = self._try_admit(run, st) if run.pending else None
@@ -443,80 +475,219 @@ class Scheduler:
                 run.mem_waiters[d].add(st)
                 return None
             # Nothing runs on d: free what its idle slots hold and run this map alone.
-            victims = [x for x in self._slots[d] if x.held.device_bytes() > 0]
+            victims = [x for x in self._slots[d] if x.held.device_bytes() > 0 and not x.broken]
         elif need.device_bytes() > e.device_bytes() and any(w is not st for w in run.mem_waiters[d]):
             # The map fits, but this slot keeps more than the map needs (grow-only buffers from a bigger map)
             # while another slot of d waits for memory: free this slot first, then hold just the map's estimate.
             victims = [st]
-        releases = [x.slot for x in victims if x.slot is not None]
+        frees = [(x, x.slot, x.held) for x in victims if x.slot is not None]
         for x in victims:
             x.held = _NOTHING
         need = st.held.cmax(e)
         run.pending.popleft()
         st.held = need
+        st.shared = bool(run.active[d])
+        for x in run.active[d]:
+            x.shared = True
+        run.active[d].add(st)
         run.committed[d] = self._held_on(d)
         run.running[d] += 1
         run.total_running += 1
         run.reserved_result += e.result
-        run.releases[d] += len(releases)
+        run.releases[d] += len(frees)
         self._update_peaks(run, d)
-        return _Job(i, e, releases)
+        return _Job(i, e, frees)
 
     def _execute(self, run, st, job):
-        """Free the job's slots, open this slot if needed and run the map, all outside the lock. Never
-        raises: returns (outcome, None) or (None, exception)."""
+        """Free the job's slots, open this slot if needed and run the map, all outside the lock. Never raises.
+        Returns (stage, outcome, exception): stage is "done" when the map ran, "free" when it did not run because
+        freeing memory took this slot or its device out of the batch, "open" when open_slot raised and "run"
+        when the run raised."""
+        stage = "free"
         try:
-            failed = None
-            for slot in job.releases:
-                try:
-                    slot.release()
-                except BaseException as exc:
-                    if failed is None:
-                        failed = exc
-                finally:
-                    with self._cond:
-                        run.releases[st.device] -= 1
-                        self._cond.notify_all()
-            if failed is not None:
-                raise failed
+            error = self._free(run, st.device, job.frees)
+            with self._cond:
+                if st.broken or st.device in self._dead:
+                    return stage, None, error
+            stage = "open"
             slot = st.slot
             if slot is None:
                 slot = self._backend.open_slot(st.device)
                 with self._cond:
                     st.slot = slot
                     self._cond.notify_all()
-            return slot.run(run.params[job.index]), None
+            stage = "run"
+            return "done", slot.run(run.params[job.index]), None
         except BaseException as exc:
-            return None, exc
+            return stage, None, exc
 
-    def _complete(self, run, st, job, outcome, exc):
+    def _free(self, run, d, frees):
+        """Call release() on each slot in frees, outside the lock. The caller counted each call in
+        run.releases[d] and set the slot's held to what it holds once freed, so admission on d waits until the
+        count is back down. A release() that raises leaves the slot's memory counted as before and the slot
+        unusable, and makes the device checked: a device that reports an error leaves the batch. Returns the
+        first exception raised, or None."""
+        first = None
+        for state, slot, held_before in frees:
+            error = None
+            failed, code = False, 0
+            try:
+                try:
+                    slot.release()
+                except BaseException as exc:
+                    error = exc
+                    failed, code = self._check(d, exc)
+            finally:
+                with self._cond:
+                    if error is not None:
+                        state.held = held_before    # the memory may still be allocated: keep counting it
+                        state.broken = True
+                        run.committed[d] = self._held_on(d)
+                        if failed:
+                            self._mark_dead(run, d, code, _describe(error))
+                        self._update_peaks(run, d)
+                    run.releases[d] -= 1
+                    self._cond.notify_all()
+            if error is not None:
+                if first is None:
+                    first = error
+                warnings.warn(f"freeing the memory of a slot on GPU {d} failed: {_describe(error)}; "
+                              + ("the GPU leaves the batch" if failed else "the slot is not used again"),
+                              RuntimeWarning, stacklevel=2)
+        return first
+
+    def _check(self, d, exc):
+        """Ask the backend whether device d still works, outside the lock. Returns (failed, CUDA error). A
+        device that cannot be checked counts as failed, with the code of the error that made us check."""
+        try:
+            code = int(self._backend.check_device(d))
+        except Exception:
+            return True, _cuda_error(exc)
+        return code != 0, code
+
+    def _complete(self, run, st, job, outcome):
         d = st.device
         with self._cond:
             run.running[d] -= 1
             run.total_running -= 1
-            if exc is None:
-                st.held = outcome.held
-                run.committed[d] = self._held_on(d)
-                run.reserved_result += outcome.result_bytes - job.estimate.result
-                run.queue.append(Finished(job.index, outcome.result, outcome.result_bytes, run))
-                run.stats["devices"][d]["maps"] += 1
-                if outcome.direct_deposit:
-                    run.stats["direct_deposit_maps"] += 1
-            else:
-                self._map_failed(run, st, job, exc)
+            run.active[d].discard(st)
+            st.held = outcome.held
+            run.committed[d] = self._held_on(d)
+            run.reserved_result += outcome.result_bytes - job.estimate.result
+            run.queue.append(Finished(job.index, outcome.result, outcome.result_bytes, run))
+            run.stats["devices"][d]["maps"] += 1
+            if outcome.direct_deposit:
+                run.stats["direct_deposit_maps"] += 1
             self._update_peaks(run, d)
             self._cond.notify_all()
 
-    def _map_failed(self, run, st, job, exc):
-        """Classify a failed run (lock held). This is the one place that decides what a failure means; for
-        now every failure fails its map."""
+    def _failed(self, run, st, job, stage, exc):
+        """A job whose map did not succeed. After an out-of-memory error the slot's memory is freed, and after
+        another CUDA error the device is checked, both outside the lock; then _classify decides."""
+        d = st.device
+        code = _cuda_error(exc)
+        device_error = None
+        if stage == "run":
+            with self._cond:
+                dead = d in self._dead
+                frees = []
+                if not dead and code == CUDA_ERROR_MEMORY_ALLOCATION and st.slot is not None:
+                    # counted like every release, so that nothing is admitted on d until the memory is free
+                    frees = [(st, st.slot, st.held)]
+                    st.held = _NOTHING
+                    run.committed[d] = self._held_on(d)
+                    run.releases[d] += 1
+                    self._cond.notify_all()
+            if frees:
+                self._free(run, d, frees)
+            elif not dead and code not in (0, CUDA_ERROR_MEMORY_ALLOCATION):
+                failed, device_code = self._check(d, exc)
+                if failed:
+                    device_error = device_code
+        with self._cond:
+            self._classify(run, st, job, stage, exc, device_error)
+            self._update_peaks(run, d)
+            self._cond.notify_all()
+
+    def _classify(self, run, st, job, stage, exc, device_error):
+        """Decide what a failed job means (lock held). This is the one place that classifies failures:
+        - a GPU where a slot cannot open, or whose check after a CUDA error reports an error, leaves the batch,
+          and the map whose error made us check fails with the GPU's error;
+        - a map that fails on a GPU that has left the batch moves to another GPU, once (_move);
+        - a map that did not run because its slot could not free its memory goes back to the front of the queue;
+        - a map that runs out of memory goes back to the front of the queue if another map ran on its GPU while
+          it did, and that GPU parks a slot; a map that ran out of memory alone fails;
+        - any other failure fails the map."""
+        d = st.device
+        i = job.index
+        run.running[d] -= 1
+        run.total_running -= 1
+        run.active[d].discard(st)
+        run.reserved_result -= job.estimate.result
         if st.slot is None:
             st.held = _NOTHING    # the slot never opened, so it holds nothing
-            run.committed[st.device] = self._held_on(st.device)
-        run.reserved_result -= job.estimate.result
-        run.queue.append(Finished(job.index, _map_error(job.index, exc)))
+            run.committed[d] = self._held_on(d)
+        if stage == "open":
+            self._mark_dead(run, d, _cuda_error(exc), _describe(exc))
+        elif device_error is not None and d not in self._dead:
+            self._mark_dead(run, d, device_error, _describe(exc))
+            self._fail(run, i, *self._dead[d], exc)
+            return
+        if d in self._dead:
+            self._move(run, i, d, exc)
+        elif stage == "free" and st.broken:
+            run.pending.appendleft(i)
+        elif stage == "run" and _cuda_error(exc) == CUDA_ERROR_MEMORY_ALLOCATION:
+            if st.shared:
+                run.pending.appendleft(i)
+                run.slot_limit[d] = max(1, run.slot_limit[d] - 1)
+                dev = run.stats["devices"][d]
+                dev["oom_retries"] += 1
+                dev["parked_slots"] = run.n_slots[d] - run.slot_limit[d]
+            else:
+                self._fail(run, i, CUDA_ERROR_MEMORY_ALLOCATION,
+                           f"out of device memory with no other map on GPU {d}", exc)
+        else:
+            run.queue.append(Finished(i, _map_error(i, exc)))
+
+    def _move(self, run, i, d, cause):
+        """A map that failed on GPU d, which has left the batch, goes back to the front of the queue to run on
+        another GPU, once (lock held). The second time it fails with d's error; with no GPU left, it fails."""
+        if run.attempts[i] > 0:
+            self._fail(run, i, *self._dead[d], cause)
+        elif self._all_dead():
+            self._fail(run, i, *self._no_gpu(), cause)
+        else:
+            run.attempts[i] += 1
+            run.pending.appendleft(i)
+
+    def _mark_dead(self, run, d, code, detail):
+        """Take GPU d out of the batch for the scheduler's lifetime (lock held): its slot threads exit and it is
+        not used again. When no GPU is left, the maps still waiting fail."""
+        if d in self._dead:
+            return
+        self._dead[d] = (code, f"GPU {d} failed ({code}): {detail}")
+        run.stats["devices"][d]["dead"] = True
+        if self._all_dead():
+            self._fail_stranded(run)
+        self._cond.notify_all()
 
     # ---- helpers (lock held)
+
+    def _all_dead(self):
+        return all(d in self._dead for d in self._devices)
+
+    def _no_gpu(self):
+        """(code, message) for a map that no GPU is left to run: the error of the first GPU that failed."""
+        if not self._dead:
+            return 0, "no usable GPU left"
+        code, message = next(iter(self._dead.values()))
+        return code, "no usable GPU left: " + message
+
+    def _fail(self, run, i, code, message, cause=None):
+        error = BatchMapError(i, message, code)
+        error.__cause__ = cause
+        run.queue.append(Finished(i, error))
 
     def _held_on(self, d):
         return sum(st.held.device_bytes() for st in self._slots[d])

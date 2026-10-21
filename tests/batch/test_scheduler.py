@@ -1,6 +1,7 @@
 """Login-node tests (no GPU) of the batch scheduler, driven through a fake backend:
 python -m unittest tests.batch.test_scheduler -v"""
 import _thread
+import faulthandler
 import sys
 import threading
 import time
@@ -9,6 +10,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+
+TEST_TIMEOUT = 60   # seconds; a test that hangs kills the run with a traceback of every thread
 
 from fake_backend import GiB, FakeBackend, FakeResult  # noqa: E402
 from microlensing.IPM.batch_scheduler import BatchMapError, MapFailed, Scheduler  # noqa: E402
@@ -65,8 +68,23 @@ def overlaps(a, b):
     return a[1] < b[2] and b[1] < a[2]
 
 
+def events(fake, name, device=None):
+    """(position, slot_id) of each event of that name in the fake's log, on the device if one is given."""
+    return [(pos, e[2]) for pos, e in enumerate(fake.log_snapshot())
+            if e[0] == name and (device is None or e[1] == device)]
+
+
+def gpu_failed(d):
+    return f"GPU {d} failed (700): illegal address"
+
+
+OOM_ALONE = "out of device memory with no other map on GPU 0"
+
+
 class SchedulerTests(unittest.TestCase):
     def setUp(self):
+        faulthandler.dump_traceback_later(TEST_TIMEOUT, exit=True)
+        self.addCleanup(faulthandler.cancel_dump_traceback_later)
         self.addCleanup(self.assert_no_batch_threads)
 
     def assert_no_batch_threads(self):
@@ -267,6 +285,248 @@ class SchedulerTests(unittest.TestCase):
         self.assertTrue([o for o in others if o[1] < shrinks[0] < o[2]])
         self.assertGreaterEqual(max_running_after(fake, shrinks[0], 0), 6)
         self.assertLessEqual(fake.peak_alloc[0], 9 * GiB)
+
+    # ---- running out of memory
+
+    def test_oom_with_others_running_requeues_and_parks(self):
+        # GPU 0 runs out of memory with more than 2 maps in progress. Each map that does frees its slot and goes
+        # back to the front of the queue, and GPU 0 parks one slot each time
+        fake = FakeBackend(oom_above={0: 2})
+        sched = self.make(fake)
+        self.assert_successes(collect(sched, maps(30, time=0.05)), 30)
+        dev = sched.stats["devices"][0]
+        ooms = events(fake, "oom", 0)
+        self.assertGreaterEqual(dev["oom_retries"], 1)
+        self.assertEqual(dev["oom_retries"], len(ooms))
+        # an error needs 3 maps in progress, so every error parked a slot and GPU 0 kept at least 2 of its 8
+        self.assertGreaterEqual(dev["parked_slots"], 1)
+        self.assertEqual(dev["parked_slots"], dev["oom_retries"])
+        self.assertLessEqual(dev["parked_slots"], 6)
+        self.assertEqual(sched.stats["devices"][1]["oom_retries"], 0)
+        self.assertLessEqual(max_running_after(fake, ooms[0][0], 0), 2)
+        # the slot freed its memory before it did anything else
+        log = fake.log_snapshot()
+        for pos, slot_id in ooms:
+            nxt = [e[0] for e in log[pos + 1:] if e[2] == slot_id and e[0] in ("start", "oom", "release")]
+            self.assertEqual(nxt[0], "release", (pos, slot_id))
+
+    def test_oom_alone_fails_map(self):
+        # map 3 runs out of memory however few maps run next to it: it is retried with fewer maps in progress
+        # until it runs alone, and only then fails
+        fake = FakeBackend(devices=1,
+                           fail_run_when=lambda p: MapFailed("out of memory", 2) if p["index"] == 3 else None)
+        sched = self.make(fake)
+        out = collect(sched, maps(20, time=0.05))
+        self.assert_successes(out, 20, failed={3})
+        (err,) = [f.result for f in out if f.index == 3]
+        self.assertEqual((err.index, err.cuda_error, str(err)), (3, 2, OOM_ALONE))
+        self.assertIsInstance(err.__cause__, MapFailed)
+        r = runs(fake)
+        tries = r[3]
+        dev = sched.stats["devices"][0]
+        self.assertGreaterEqual(len(tries), 2)
+        self.assertEqual(dev["oom_retries"], len(tries) - 1)
+        self.assertEqual(dev["parked_slots"], dev["oom_retries"])
+        self.assertEqual([o for i, rs in r.items() if i != 3 for o in rs if overlaps(o, tries[-1])], [])
+        self.assertEqual(len(releases(fake, 0)), len(tries))   # each try freed its slot
+
+    def test_oom_on_every_run_fails_every_map_and_stops(self):
+        # no map fits, and each one takes 20 ms to find out: every map is retried while others run, then fails
+        # alone, and the batch still ends
+        def oom(p):
+            time.sleep(0.02)
+            return MapFailed("out of memory", 2)
+
+        fake = FakeBackend(devices=1, fail_run_when=oom)
+        sched = self.make(fake)
+        out = collect(sched, maps(12))
+        self.assert_successes(out, 12, failed=set(range(12)))
+        for f in out:
+            self.assertEqual((f.result.cuda_error, str(f.result)), (2, OOM_ALONE))
+        dev = sched.stats["devices"][0]
+        r = runs(fake)
+        self.assertEqual(dev["oom_retries"], sum(len(rs) for rs in r.values()) - 12)
+        self.assertGreaterEqual(dev["parked_slots"], 1)
+        self.assertLessEqual(dev["parked_slots"], 7)
+        everything = [o for rs in r.values() for o in rs]
+        for i, rs in r.items():   # each map failed on a try that ran alone
+            self.assertEqual([o for o in everything if o is not rs[-1] and overlaps(o, rs[-1])], [], i)
+
+    def test_release_when_running_alone(self):
+        # four slots hold 2 GiB each after maps 0-3. Map 4 needs 6 GiB of a 9 GiB budget, so it waits until
+        # nothing runs; then every idle slot's memory is freed before it starts
+        fake = FakeBackend(devices=1, free=10 * GiB, total=10 * GiB)
+        sched = self.make(fake, maps_per_gpu=4)
+        params = maps(4, pixel=2 * GiB, time=0.1) + [{"index": 4, "pixel": 6 * GiB, "time": 0.1}] + \
+            [{"index": i, "pixel": GiB, "time": 0.05} for i in range(5, 8)]
+        self.assert_successes(collect(sched, params), 8)
+        r = runs(fake)
+        (big,) = r[4]
+        holders = sorted(r[i][0][3] for i in range(4))
+        self.assertEqual(len(set(holders)), 4)
+        self.assertTrue(all(r[i][0][2] < big[1] for i in range(4)))
+        self.assertEqual(sorted(slot_id for pos, slot_id in releases(fake, 0) if pos < big[1]), holders)
+        self.assertLessEqual(fake.peak_alloc[0], 9 * GiB)
+
+    # ---- broken GPUs
+
+    def test_dead_device_moves_maps(self):
+        # GPU 1 breaks at its 4th map. The map that reports the error first fails; the others in progress on
+        # GPU 1 go back to the queue and run on GPU 0, and GPU 1 is not used again
+        fake = FakeBackend(dead_after={1: 3},
+                           fail_close_when=lambda s: RuntimeError("broken") if s.device == 1 else None)
+        sched = self.make(fake)
+        out = collect(sched, maps(40, time=0.05))
+        errors = [f for f in out if isinstance(f.result, BatchMapError)]
+        self.assertEqual(len(errors), 1)
+        trigger = errors[0]
+        self.assertEqual((trigger.result.cuda_error, str(trigger.result)), (700, gpu_failed(1)))
+        self.assert_successes(out, 40, failed={trigger.index})
+        ((death, _),) = events(fake, "dead")
+        r = runs(fake)
+        for f in out:
+            if f.index != trigger.index and f.result.device != 0:
+                (only,) = r[f.index]
+                self.assertLess(only[2], death, f.index)   # succeeded on GPU 1 only before it broke
+        self.assertTrue(all(len(rs) <= 2 for rs in r.values()))   # moved at most once
+        late = [slot_id for pos, slot_id in events(fake, "start", 1) if pos > death]
+        self.assertEqual(len(late), len(set(late)))   # each slot of GPU 1 started at most one map after it broke
+        self.assertTrue(sched.stats["devices"][1]["dead"])
+        self.assertFalse(sched.stats["devices"][0]["dead"])
+        self.assertEqual(sum(d["maps"] for d in sched.stats["devices"].values()), 39)
+        # closing a slot of the broken GPU raises: close() warns and closes every slot once
+        with self.assertWarns(RuntimeWarning):
+            sched.close()
+        self.assertEqual([s.close_calls for s in fake.slots], [1] * len(fake.slots))
+
+    def test_all_devices_dead_fails_remaining(self):
+        fake = FakeBackend(devices=1, dead_after={0: 2})
+        sched = self.make(fake)
+        out = collect(sched, maps(10, time=0.3))
+        self.assert_successes(out, 10, failed=set(range(10)))
+        messages = [str(f.result) for f in out]
+        self.assertEqual(messages.count(gpu_failed(0)), 1)
+        self.assertEqual(messages.count("no usable GPU left: " + gpu_failed(0)), 9)
+        self.assertEqual({f.result.cuda_error for f in out}, {700})
+        self.assertTrue(sched.stats["devices"][0]["dead"])
+        # the GPU stays out: a later batch fails at once without running anything
+        started = len(events(fake, "start"))
+        out = collect(sched, maps(3))
+        self.assert_successes(out, 3, failed={0, 1, 2})
+        self.assertEqual({(str(f.result), f.result.cuda_error) for f in out},
+                         {("no usable GPU left: " + gpu_failed(0), 700)})
+        self.assertEqual(len(events(fake, "start")), started)
+        self.assertTrue(sched.stats["devices"][0]["dead"])
+
+    def test_open_slot_failure_marks_device_dead(self):
+        fake = FakeBackend(open_fails_for=(1,))
+        sched = self.make(fake)
+        out = collect(sched, maps(20, time=0.02))
+        self.assert_successes(out, 20)
+        self.assertEqual({f.result.device for f in out}, {0})
+        self.assertEqual(events(fake, "start", 1), [])
+        self.assertTrue(all(len(rs) == 1 for rs in runs(fake).values()))
+        self.assertTrue(sched.stats["devices"][1]["dead"])
+        self.assertEqual(sched.stats["devices"][0]["maps"], 20)
+        tries = len(events(fake, "open_failed"))
+        self.assertGreaterEqual(tries, 1)
+        self.assertLessEqual(tries, 8)
+        # GPU 1 stays out of the batch: the next call does not try to open it again
+        out = collect(sched, maps(10, time=0.02))
+        self.assert_successes(out, 10)
+        self.assertEqual({f.result.device for f in out}, {0})
+        self.assertEqual(len(events(fake, "open_failed")), tries)
+        self.assertTrue(sched.stats["devices"][1]["dead"])
+
+    def test_map_moves_once_then_fails(self):
+        # one slot per GPU and no GPU can open one: the map moves from the first GPU to the second, then fails
+        # with the second GPU's error
+        fake = FakeBackend(open_fails_for=(0, 1))
+        sched = self.make(fake, maps_per_gpu=1)
+        (f,) = collect(sched, maps(1))
+        tried = events(fake, "open_failed")
+        self.assertEqual(len(tried), 2)
+        devices = [fake.log_snapshot()[pos][1] for pos, _ in tried]
+        self.assertEqual(sorted(devices), [0, 1])
+        self.assertIsInstance(f.result, BatchMapError)
+        self.assertEqual((f.result.cuda_error, str(f.result)),
+                         (0, f"GPU {devices[1]} failed (0): cannot open a slot on fake GPU {devices[1]}"))
+        self.assertTrue(all(sched.stats["devices"][d]["dead"] for d in (0, 1)))
+
+    def test_every_map_moves_at_most_once_when_every_gpu_breaks(self):
+        fake = FakeBackend(fail_run_when=lambda p: MapFailed("illegal address", 700), device_errors={0: 700, 1: 700})
+        sched = self.make(fake, maps_per_gpu=2)
+        out = collect(sched, maps(12, time=0.05))
+        self.assert_successes(out, 12, failed=set(range(12)))
+        self.assertTrue(all(len(rs) <= 2 for rs in runs(fake).values()))
+        broken = {gpu_failed(0), gpu_failed(1)}
+        firsts = set()
+        for f in out:
+            message = str(f.result)
+            self.assertEqual(f.result.cuda_error, 700)
+            if message.startswith("no usable GPU left: "):
+                firsts.add(message[len("no usable GPU left: "):])
+            else:
+                self.assertIn(message, broken)
+        self.assertLessEqual(len(firsts), 1)
+        self.assertTrue(firsts <= broken)
+        self.assertTrue(all(sched.stats["devices"][d]["dead"] for d in (0, 1)))
+
+    def test_cuda_error_on_a_working_gpu_fails_only_its_map(self):
+        fake = FakeBackend(fail_run_when=lambda p: MapFailed("invalid argument", 1) if p["index"] == 3 else None)
+        sched = self.make(fake)
+        out = collect(sched, maps(20, time=0.01))
+        self.assert_successes(out, 20, failed={3})
+        (err,) = [f.result for f in out if f.index == 3]
+        self.assertEqual((err.cuda_error, str(err)), (1, "invalid argument"))
+        self.assertEqual(len(events(fake, "check")), 1)
+        self.assertFalse(any(d["dead"] for d in sched.stats["devices"].values()))
+
+    # ---- release() failures
+
+    def test_failed_release_keeps_memory_counted(self):
+        # slot 0 cannot free its 2 GiB when map 4 has to run alone. The GPU still works, so slot 0 is not used
+        # again and its memory still counts: the 3 GiB maps after map 4 must not run on top of it
+        fake = FakeBackend(devices=1, free=10 * GiB, total=10 * GiB,
+                           fail_release_when=lambda s: RuntimeError("cannot free") if s.slot_id == 0 else None)
+        sched = self.make(fake, maps_per_gpu=4)
+        params = maps(4, pixel=2 * GiB, time=0.1) + [{"index": 4, "pixel": 6 * GiB, "time": 0.1}] + \
+            [{"index": i, "pixel": 3 * GiB, "time": 0.05} for i in range(5, 11)]
+        with self.assertWarns(RuntimeWarning):
+            out = collect(sched, params)
+        self.assert_successes(out, 11)
+        self.assertLessEqual(fake.peak_alloc[0], 9 * GiB)
+        ((failed_at, _),) = events(fake, "release_failed")
+        self.assertTrue([p for p, _ in events(fake, "check", 0) if p > failed_at])
+        self.assertEqual([p for p, slot_id in events(fake, "start") if slot_id == 0 and p > failed_at], [])
+        self.assertFalse(sched.stats["devices"][0]["dead"])
+
+    def test_failed_release_on_a_broken_gpu_takes_it_out(self):
+        # a slot of GPU 1 runs out of memory and cannot free it because GPU 1's context broke: GPU 1 leaves the
+        # batch and its map runs on GPU 0. Maps already in progress on GPU 1 may still finish there
+        fake = FakeBackend(oom_above={1: 2})
+
+        def fail(slot):
+            if slot.device != 1:
+                return None
+            fake.device_errors[1] = 700
+            return MapFailed("illegal address", 700)
+
+        fake.fail_release_when = fail
+        sched = self.make(fake)
+        with self.assertWarns(RuntimeWarning):
+            out = collect(sched, maps(30, time=0.05))
+        self.assert_successes(out, 30)
+        self.assertTrue(sched.stats["devices"][1]["dead"])
+        self.assertEqual(sched.stats["devices"][1]["oom_retries"], 0)
+        failed_at = events(fake, "release_failed", 1)[0][0]
+        late = [slot_id for pos, slot_id in events(fake, "start", 1) if pos > failed_at]
+        self.assertEqual(len(late), len(set(late)))
+        moved = {e[3] for e in fake.log_snapshot() if e[0] == "oom"}
+        self.assertTrue(moved)
+        self.assertTrue(all(f.result.device == 0 for f in out if f.index in moved))
+
+    # ---- other failures
 
     def test_estimate_failure_reported_and_batch_continues(self):
         threads = []

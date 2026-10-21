@@ -6,7 +6,7 @@ Each map's estimate comes from its params keys pixel, star, tree and result (def
 componentwise maximum of what it held and the estimate. Afterwards it holds exactly the estimate or, with
 grow_only=True, keeps that maximum (as the real grow-only buffers do) until release(). release() takes
 release_time seconds before the memory counts as free. With params["direct_deposit"] true, the outcome
-reports the direct deposit.
+reports the direct deposit. A result records the device that ran it (FakeResult.device).
 
 Failure injection:
 - fail_estimate_when / fail_run_when: callables params -> exception instance or None; the exception is raised.
@@ -14,14 +14,20 @@ Failure injection:
 - oom_above={device: k}: a run raises MapFailed(..., 2) when it would make more than k maps run on that device.
 - dead_after={device: n}: after n maps started on the device, runs raise MapFailed("illegal address", 700)
   (also a run in progress when it happens) and check_device returns 700.
+- device_errors={device: code}: what check_device returns for a device the fake has not killed (default 0).
+  A test may change it while a batch runs, for a context that broke without failing the runs in progress.
 - open_fails_for: devices whose open_slot raises RuntimeError.
+- fail_release_when / fail_close_when: callables slot -> exception instance or None; release() or close()
+  raises it. A failed release() keeps the slot's memory allocated; a failed close() still closes the slot.
 
 Records, all under one lock:
 - log: (event, device, slot_id, params.get("index"), time.monotonic()) for the events "estimate", "open",
-  "start", "end", "oom", "release" and "close". A run that is not rejected for memory logs "start" and "end".
+  "open_failed", "start", "end", "oom", "dead" (dead_after killed the device), "release", "release_failed",
+  "check" (a check_device call) and "close". A run that is not rejected for memory logs "start" and "end".
 - max_concurrency[d]: the most maps seen running at once on device d; peak_alloc[d]: the most memory seen held
   by d's open slots.
-- per slot: release_calls, close_calls and run_threads (the name of the thread of each run).
+- per slot: release_calls and close_calls (failed calls included) and run_threads (the name of the thread of
+  each run).
 - violations: a slot run while busy, closed or being released, or released or closed while running."""
 import threading
 import time
@@ -34,8 +40,9 @@ NOTHING = MemoryEstimate()
 
 
 class FakeResult:
-    def __init__(self, params, backend=None):
+    def __init__(self, params, backend=None, device=None):
         self.params = params
+        self.device = device
         self.save_calls = 0
         self._backend = backend
 
@@ -78,8 +85,10 @@ class FakeSlot:
             b.running[d] += 1
             b.max_concurrency[d] = max(b.max_concurrency[d], b.running[d])
             b.device_runs[d] += 1
-            if b.dead_after is not None and d in b.dead_after and b.device_runs[d] > b.dead_after[d]:
+            if b.dead_after is not None and d in b.dead_after and b.device_runs[d] > b.dead_after[d] \
+                    and not b.dead[d]:
                 b.dead[d] = True
+                b.log_event("dead", d, self.slot_id, params)
             dead = b.dead[d]
             self.alloc = self.alloc.cmax(e)
             b.note_alloc(d)
@@ -98,7 +107,7 @@ class FakeSlot:
                 if not b.grow_only:
                     self.alloc = e
                 held = self.alloc
-            return SlotOutcome(FakeResult(params, b), e.result, held, bool(params.get("direct_deposit", False)))
+            return SlotOutcome(FakeResult(params, b, d), e.result, held, bool(params.get("direct_deposit", False)))
         finally:
             with b.lock:
                 b.running[d] -= 1
@@ -112,12 +121,18 @@ class FakeSlot:
                 b.violations.append(f"release of slot {self.slot_id} while busy={self.busy} "
                                     f"releasing={self.releasing}")
             self.releasing = True
-        time.sleep(b.release_time)
-        with b.lock:
             self.release_calls += 1
-            self.alloc = NOTHING
+        time.sleep(b.release_time)
+        exc = b.fail_release_when(self) if b.fail_release_when is not None else None
+        with b.lock:
             self.releasing = False
-            b.log_event("release", self.device, self.slot_id, {})
+            if exc is None:
+                self.alloc = NOTHING
+                b.log_event("release", self.device, self.slot_id, {})
+            else:
+                b.log_event("release_failed", self.device, self.slot_id, {})
+        if exc is not None:
+            raise exc
 
     def close(self):
         b = self.backend
@@ -129,12 +144,16 @@ class FakeSlot:
             self.closed = True
             self.alloc = NOTHING
             b.log_event("close", self.device, self.slot_id, {})
+        exc = b.fail_close_when(self) if b.fail_close_when is not None else None
+        if exc is not None:
+            raise exc
 
 
 class FakeBackend:
     def __init__(self, devices=2, free=40 << 30, total=40 << 30, concurrent_managed=True, run_time=0.01,
                  fail_estimate_when=None, fail_run_when=None, save_fails_when=None, oom_above=None,
-                 dead_after=None, open_fails_for=(), grow_only=False, release_time=0.0):
+                 dead_after=None, open_fails_for=(), grow_only=False, release_time=0.0, device_errors=None,
+                 fail_release_when=None, fail_close_when=None):
         self.devices = devices
         self.free = free
         self.total = total
@@ -148,6 +167,9 @@ class FakeBackend:
         self.open_fails_for = tuple(open_fails_for)
         self.grow_only = grow_only
         self.release_time = release_time
+        self.device_errors = dict(device_errors or {})
+        self.fail_release_when = fail_release_when
+        self.fail_close_when = fail_close_when
         self.lock = threading.Lock()
         self.log = []
         self.slots = []
@@ -199,6 +221,7 @@ class FakeBackend:
     def open_slot(self, device):
         with self.lock:
             if device in self.open_fails_for:
+                self.log_event("open_failed", device, None, {})
                 raise RuntimeError(f"cannot open a slot on fake GPU {device}")
             self.open_calls += 1
             slot = FakeSlot(self, device, len(self.slots))
@@ -208,4 +231,5 @@ class FakeBackend:
 
     def check_device(self, device):
         with self.lock:
-            return 700 if self.dead[device] else 0
+            self.log_event("check", device, None, {})
+            return 700 if self.dead[device] else self.device_errors.get(device, 0)
