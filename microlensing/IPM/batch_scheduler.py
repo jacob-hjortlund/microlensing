@@ -3,8 +3,9 @@
 Each slot runs one map at a time and keeps its GPU memory between maps. During results(), one thread per
 slot drives it. A map is admitted to a GPU when the extra memory its slot needs, on top of what that GPU's
 slots already hold, fits the GPU's budget. A map that does not fit runs alone once nothing else runs on the
-GPU. Finished results wait in a queue bounded in bytes until the consumer releases them. A failing map
-becomes a BatchMapError result and the batch carries on.
+GPU. A slot that keeps more memory than its next map needs gives it back while another slot waits for memory,
+and no map is admitted on a GPU while memory is being freed on it. Finished results wait in a queue bounded in
+bytes until the consumer releases them. A failing map becomes a BatchMapError result and the batch carries on.
 
 The scheduler knows nothing of IPM. A backend estimates the maps, describes the GPUs and opens the slots,
 and the parameter dicts pass through untouched."""
@@ -140,13 +141,12 @@ class _SlotState:
         self.number = number
         self.slot = None
         self.held = _NOTHING      # device memory the slot holds, or will hold while it runs its admitted map
-        self.releasing = False    # another thread is freeing the slot's memory
 
 
 class _Job(NamedTuple):
     index: int
     estimate: MemoryEstimate
-    victims: list               # idle slots of the device whose memory is freed before this map runs
+    releases: list              # slots whose memory is freed (release()) before this map runs
 
 
 class _Run:
@@ -166,6 +166,8 @@ class _Run:
         self.slot_limit = {}
         self.running = {}
         self.committed = {}
+        self.releases = {}        # device -> release() calls in flight on it; admission on it waits for them
+        self.mem_waiters = {}     # device -> slots whose latest admission attempt waited for memory
         self.total_running = 0
         self.reserved_result = 0  # host bytes of results running, queued, or yielded and not released
         self.stats = _empty_stats(devices, dead)
@@ -320,6 +322,8 @@ class Scheduler:
                 run.n_slots[d] = run.slot_limit[d] = n
                 run.running[d] = 0
                 run.committed[d] = held
+                run.releases[d] = 0
+                run.mem_waiters[d] = set()
                 dev = run.stats["devices"][d]
                 dev["budget"] = run.budget[d]
                 dev["peak_committed"] = held
@@ -405,22 +409,26 @@ class Scheduler:
         """Wait until the map at the head of pending can start in this slot. Returns None when the thread
         should exit: the run is stopping, the device is dead, or nothing is left to run anywhere."""
         with self._cond:
+            waiters = run.mem_waiters[st.device]
             while True:
-                if run.stopping or st.device in self._dead:
+                was_waiting = st in waiters
+                waiters.discard(st)
+                if run.stopping or st.device in self._dead or (not run.pending and run.total_running == 0):
+                    self._cond.notify_all()
                     return None
-                if not run.pending:
-                    if run.total_running == 0:
-                        return None
-                elif not st.releasing:
-                    job = self._try_admit(run, st)
-                    if job is not None:
-                        self._cond.notify_all()
-                        return job
+                job = self._try_admit(run, st) if run.pending else None
+                if job is not None or was_waiting != (st in waiters):
+                    self._cond.notify_all()
+                if job is not None:
+                    return job
                 self._cond.wait()
 
     def _try_admit(self, run, st):
-        """The admission rules (lock held). Returns a _Job, or None to wait."""
+        """The admission rules (lock held). Returns a _Job, or None to wait. A slot that waits because its map
+        does not fit next to the maps running on its device is added to mem_waiters."""
         d = st.device
+        if run.releases[d] > 0:
+            return None    # memory of d is still being freed, so committed[d] is not free yet
         i = run.pending[0]
         e = run.estimates[i]
         if run.reserved_result > 0 and run.reserved_result + e.result > self._max_result_bytes:
@@ -432,37 +440,45 @@ class Scheduler:
         victims = []
         if run.committed[d] + growth > run.budget[d]:
             if run.running[d] > 0:
+                run.mem_waiters[d].add(st)
                 return None
             # Nothing runs on d: free what its idle slots hold and run this map alone.
             victims = [x for x in self._slots[d] if x.held.device_bytes() > 0]
-            for x in victims:
-                x.held = _NOTHING
-                if x is not st:
-                    x.releasing = True
-            need = st.held.cmax(e)
+        elif need.device_bytes() > e.device_bytes() and any(w is not st for w in run.mem_waiters[d]):
+            # The map fits, but this slot keeps more than the map needs (grow-only buffers from a bigger map)
+            # while another slot of d waits for memory: free this slot first, then hold just the map's estimate.
+            victims = [st]
+        releases = [x.slot for x in victims if x.slot is not None]
+        for x in victims:
+            x.held = _NOTHING
+        need = st.held.cmax(e)
         run.pending.popleft()
         st.held = need
         run.committed[d] = self._held_on(d)
         run.running[d] += 1
         run.total_running += 1
         run.reserved_result += e.result
+        run.releases[d] += len(releases)
         self._update_peaks(run, d)
-        return _Job(i, e, victims)
+        return _Job(i, e, releases)
 
     def _execute(self, run, st, job):
-        """Free the victims' memory, open the slot if needed and run the map, all outside the lock. Never
+        """Free the job's slots, open this slot if needed and run the map, all outside the lock. Never
         raises: returns (outcome, None) or (None, exception)."""
         try:
-            try:
-                for x in job.victims:
-                    if x.slot is not None:
-                        x.slot.release()
-            finally:
-                if job.victims:
+            failed = None
+            for slot in job.releases:
+                try:
+                    slot.release()
+                except BaseException as exc:
+                    if failed is None:
+                        failed = exc
+                finally:
                     with self._cond:
-                        for x in job.victims:
-                            x.releasing = False
+                        run.releases[st.device] -= 1
                         self._cond.notify_all()
+            if failed is not None:
+                raise failed
             slot = st.slot
             if slot is None:
                 slot = self._backend.open_slot(st.device)
