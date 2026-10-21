@@ -12,9 +12,14 @@ foreign processes on them before and after.
 
 The timed region of a child is: serial, the loop of IPM(...).run() [+ save()] over all maps; batch, building the
 BatchedIPM, running it (to the last map consumed, or the last file written in save mode) but not close().
-Before timing, the child creates the CUDA context and runs an untimed 200x200 map of the same lens; the batch
-kind also runs an untimed BatchedIPM of g 200x200 maps, which brings up the workers of the devices.
+Before timing, the child runs an untimed 200x200 map of the same lens on device 0, which creates its CUDA
+context; the batch kind then runs an untimed BatchedIPM of g 200x200 maps on devices 0..g-1, one map per GPU,
+which creates the CUDA context of every device. That warm-up batch is closed before timing, so the timed region
+of the batch kind still includes the memory estimates, opening the worker slots it uses (a C++ IPM object and a
+stream each) and growing their buffers to the map size.
 The peak RSS (VmHWM) of a child includes the warm-up. The serial kind is measured on one GPU only (g = 1).
+px40k_f runs max(--maps, 8 g) maps. A save measurement keeps all its files until it ends: a 40000x40000 float map
+is 6.4 GB, so px40k_f with --maps 64 needs about 410 GB free under the save root (nb_f: 100 MB per map).
 With BENCH_PROFILE_GAP=1 in the environment the child sleeps 1 s after the warm-up, so that
 `gpu_busy.py --after-gap 0.5` can find the start of the timed region in an Nsight Systems trace.
 """
