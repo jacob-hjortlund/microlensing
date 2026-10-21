@@ -1516,6 +1516,53 @@ public:
 	}
 
 	/******************************************************************************
+	bytes per star of the tree pool, its counters, the compact tree and the leaf
+	buffers: the largest allocation per star measured by
+	tests/batch/measure_tree_bytes.py (nb 1000^2 and 5000^2, hm100_f, stars1e6_f),
+	times 1.1, rounded up to a multiple of 64. (A margin of 1.5 puts the estimate
+	of stars1e6_f above 1.5 times its allocation, the bound the estimate is
+	tested against, because the bytes per star differ by a factor of 1.7 between
+	the configurations.) Per-star values measured on an A100:
+	float:  1416.10, 1432.86, 1724.50, 1323.65 -> 1920
+	double: 2313.98, 2354.55, 2798.78, 2175.06 -> 3136
+	******************************************************************************/
+	static constexpr unsigned long long tree_bytes_per_star = sizeof(T) == 8 ? 3136 : 1920;
+
+	/******************************************************************************
+	estimate the device memory a run of this object's inputs needs, in bytes, and
+	the host memory its saved results need. This object is not changed: the
+	estimate is made on a copy of the inputs. For a map without a star file no
+	CUDA call is made.
+
+	\param pixel_bytes  -- maps, step buffer and histograms
+	\param star_bytes   -- curand states, two star arrays and binomial coefficients
+	\param tree_bytes   -- tree pool and compact tree, from tree_bytes_per_star
+	\param result_bytes -- the maps and the stars of a finished map held on the host
+
+	\return bool -- true if the inputs are valid, false if not
+	******************************************************************************/
+	bool estimate_memory(unsigned long long& pixel_bytes, unsigned long long& star_bytes,
+		unsigned long long& tree_bytes, unsigned long long& result_bytes) const
+	{
+		IPM<T> probe;
+		probe.copy_inputs_from(*this);
+		if (!probe.check_input_params(0)) return false;
+		if (!probe.calculate_derived_params(0)) return false;
+
+		unsigned long long npix = 1ULL * probe.num_pixels_y.re * probe.num_pixels_y.im;
+		unsigned long long n_maps = probe.write_parities ? 3 : 1;
+		unsigned long long n_stars = probe.num_stars;
+
+		pixel_bytes = npix * sizeof(T) * (n_maps + 1) + (probe.write_histograms ? n_maps * (8ULL << 20) : 0);
+		star_bytes = n_stars * (sizeof(curandState) + 2 * sizeof(star<T>))
+			+ 1ULL * (2 * treenode::MAX_EXPANSION_ORDER * (2 * treenode::MAX_EXPANSION_ORDER + 3) / 2 + 1) * sizeof(long long);
+		tree_bytes = n_stars * tree_bytes_per_star + (1ULL << 20);
+		result_bytes = npix * sizeof(T) * n_maps + n_stars * 3 * sizeof(T);
+
+		return true;
+	}
+
+	/******************************************************************************
 	free every buffer of this object (a reused object keeps them otherwise). the
 	object can run again afterwards
 	******************************************************************************/
