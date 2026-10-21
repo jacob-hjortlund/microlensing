@@ -7,10 +7,13 @@ GPU. A slot that keeps more memory than its next map needs gives it back while a
 and no map is admitted on a GPU while memory is being freed on it. Finished results wait in a queue bounded in
 bytes until the consumer releases them. A failing map becomes a BatchMapError result and the batch carries on.
 
-A map that runs out of device memory while other maps run on its GPU goes back to the front of the queue, and that
-GPU runs one map fewer at a time from then on; a map that runs out of memory alone fails. A GPU whose CUDA context
-broke (a sticky error), or where a slot cannot open, leaves the batch for the scheduler's lifetime: its threads
-exit and the maps it was running move to the other GPUs, once each. When no GPU is left, the remaining maps fail.
+A map that runs out of device memory while other maps run on its GPU goes back to the front of the queue, to be
+retried on that GPU only, and that GPU runs one map fewer at a time. A map that runs out of memory alone has the
+memory of the GPU's idle slots freed and is tried once more; it fails only when it runs out of memory alone on a
+GPU whose idle slots hold nothing, and that GPU then gets back the slots its retries parked. A GPU whose CUDA
+context broke (a sticky error), or where a slot cannot open, leaves the batch for the scheduler's lifetime: its
+threads exit and the maps it was running move to the other GPUs, once each. When no GPU is left, the remaining
+maps fail. No map is admitted on a GPU while its memory is being freed or the GPU is being checked.
 
 The scheduler knows nothing of IPM. A backend estimates the maps, describes the GPUs and opens the slots,
 and the parameter dicts pass through untouched."""
@@ -183,8 +186,11 @@ class _Run:
         self.committed = {}
         self.releases = {}        # device -> release() calls in flight on it; admission on it waits for them
         self.mem_waiters = {}     # device -> slots whose latest admission attempt waited for memory
+        self.checks = {}          # device -> check_device() calls in flight on it; admission on it waits for them
         self.active = {}          # device -> slots with an admitted map
         self.attempts = [0] * len(params)   # how often each map moved off a GPU that left the batch
+        self.pinned = {}          # index -> the GPU that alone may run this out-of-memory retry
+        self.parks = [0] * len(params)      # slot_limit decrements each map's retries made on its pinned GPU
         self.total_running = 0
         self.reserved_result = 0  # host bytes of results running, queued, or yielded and not released
         self.stats = _empty_stats(devices, dead)
@@ -349,6 +355,7 @@ class Scheduler:
                 run.running[d] = 0
                 run.committed[d] = held
                 run.releases[d] = 0
+                run.checks[d] = 0
                 run.mem_waiters[d] = set()
                 run.active[d] = set()
                 dev = run.stats["devices"][d]
@@ -456,12 +463,16 @@ class Scheduler:
                 self._cond.wait()
 
     def _try_admit(self, run, st):
-        """The admission rules (lock held). Returns a _Job, or None to wait. A slot that waits because its map
+        """The admission rules (lock held) for the first map in pending that this slot's device may run (maps
+        pinned to another GPU are skipped). Returns a _Job, or None to wait. A slot that waits because its map
         does not fit next to the maps running on its device is added to mem_waiters."""
         d = st.device
-        if run.releases[d] > 0:
-            return None    # memory of d is still being freed, so committed[d] is not free yet
-        i = run.pending[0]
+        if run.releases[d] > 0 or run.checks[d] > 0:
+            return None    # memory of d is still being freed (committed[d] is not free yet), or d is being checked
+        pos = next((k for k, j in enumerate(run.pending) if run.pinned.get(j, d) == d), None)
+        if pos is None:
+            return None
+        i = run.pending[pos]
         e = run.estimates[i]
         if run.reserved_result > 0 and run.reserved_result + e.result > self._max_result_bytes:
             return None
@@ -484,7 +495,7 @@ class Scheduler:
         for x in victims:
             x.held = _NOTHING
         need = st.held.cmax(e)
-        run.pending.popleft()
+        del run.pending[pos]
         st.held = need
         st.shared = bool(run.active[d])
         for x in run.active[d]:
@@ -545,6 +556,8 @@ class Scheduler:
                         run.committed[d] = self._held_on(d)
                         if failed:
                             self._mark_dead(run, d, code, _describe(error))
+                        elif not self._usable(run, d):
+                            self._unpin(run, d)     # no slot of d can run its retries any more
                         self._update_peaks(run, d)
                     run.releases[d] -= 1
                     self._cond.notify_all()
@@ -582,41 +595,68 @@ class Scheduler:
             self._cond.notify_all()
 
     def _failed(self, run, st, job, stage, exc):
-        """A job whose map did not succeed. After an out-of-memory error the slot's memory is freed, and after
-        another CUDA error the device is checked, both outside the lock; then _classify decides."""
+        """A job whose map did not succeed. After an out-of-memory error the slot's memory is freed, and with it
+        the memory of the device's idle slots if the map ran alone; after another CUDA error the device is
+        checked. Both happen outside the lock and are counted so that nothing is admitted on the device
+        meanwhile. Then _classify decides."""
         d = st.device
         code = _cuda_error(exc)
         device_error = None
+        frees = []
+        freed_idle = False
+        checking = False
         if stage == "run":
             with self._cond:
                 dead = d in self._dead
-                frees = []
                 if not dead and code == CUDA_ERROR_MEMORY_ALLOCATION and st.slot is not None:
-                    # counted like every release, so that nothing is admitted on d until the memory is free
                     frees = [(st, st.slot, st.held)]
                     st.held = _NOTHING
+                    if not st.shared:
+                        # it ran alone: the idle slots' memory may be what it lacked, so free that too
+                        for x in self._slots[d]:
+                            if x is not st and not x.broken and x not in run.active[d] and x.held.device_bytes() > 0:
+                                if x.slot is not None:
+                                    frees.append((x, x.slot, x.held))
+                                x.held = _NOTHING
+                                freed_idle = True
                     run.committed[d] = self._held_on(d)
-                    run.releases[d] += 1
+                    run.releases[d] += len(frees)
+                    self._cond.notify_all()
+                elif not dead and code not in (0, CUDA_ERROR_MEMORY_ALLOCATION):
+                    checking = True
+                    run.checks[d] += 1
                     self._cond.notify_all()
             if frees:
                 self._free(run, d, frees)
-            elif not dead and code not in (0, CUDA_ERROR_MEMORY_ALLOCATION):
-                failed, device_code = self._check(d, exc)
+            elif checking:
+                try:
+                    failed, device_code = self._check(d, exc)
+                except BaseException:
+                    with self._cond:
+                        run.checks[d] -= 1
+                        self._cond.notify_all()
+                    raise
                 if failed:
                     device_error = device_code
         with self._cond:
-            self._classify(run, st, job, stage, exc, device_error)
-            self._update_peaks(run, d)
-            self._cond.notify_all()
+            try:
+                self._classify(run, st, job, stage, exc, device_error, freed_idle)
+            finally:
+                if checking:
+                    run.checks[d] -= 1    # only now, so that d is not used before its check's verdict is in
+                self._update_peaks(run, d)
+                self._cond.notify_all()
 
-    def _classify(self, run, st, job, stage, exc, device_error):
+    def _classify(self, run, st, job, stage, exc, device_error, freed_idle=False):
         """Decide what a failed job means (lock held). This is the one place that classifies failures:
         - a GPU where a slot cannot open, or whose check after a CUDA error reports an error, leaves the batch,
           and the map whose error made us check fails with the GPU's error;
         - a map that fails on a GPU that has left the batch moves to another GPU, once (_move);
         - a map that did not run because its slot could not free its memory goes back to the front of the queue;
-        - a map that runs out of memory goes back to the front of the queue if another map ran on its GPU while
-          it did, and that GPU parks a slot; a map that ran out of memory alone fails;
+        - a map that runs out of memory goes back to the front of the queue, pinned to its GPU, if another map
+          ran on that GPU while it did (and the GPU parks a slot), or if it ran alone while idle slots held
+          memory, which _failed has freed. Otherwise it fails, and its GPU gets back the slots its retries
+          parked;
         - any other failure fails the map."""
         d = st.device
         i = job.index
@@ -638,15 +678,21 @@ class Scheduler:
         elif stage == "free" and st.broken:
             run.pending.appendleft(i)
         elif stage == "run" and _cuda_error(exc) == CUDA_ERROR_MEMORY_ALLOCATION:
-            if st.shared:
+            dev = run.stats["devices"][d]
+            if st.shared or freed_idle:
                 run.pending.appendleft(i)
-                run.slot_limit[d] = max(1, run.slot_limit[d] - 1)
-                dev = run.stats["devices"][d]
+                if self._usable(run, d):
+                    run.pinned[i] = d
                 dev["oom_retries"] += 1
-                dev["parked_slots"] = run.n_slots[d] - run.slot_limit[d]
+                if st.shared and run.slot_limit[d] > 1:
+                    run.slot_limit[d] -= 1
+                    run.parks[i] += 1
             else:
+                run.slot_limit[d] = min(run.n_slots[d], run.slot_limit[d] + run.parks[i])
+                run.parks[i] = 0
                 self._fail(run, i, CUDA_ERROR_MEMORY_ALLOCATION,
                            f"out of device memory with no other map on GPU {d}", exc)
+            dev["parked_slots"] = run.n_slots[d] - run.slot_limit[d]
         else:
             run.queue.append(Finished(i, _map_error(i, exc)))
 
@@ -668,11 +714,23 @@ class Scheduler:
             return
         self._dead[d] = (code, f"GPU {d} failed ({code}): {detail}")
         run.stats["devices"][d]["dead"] = True
+        self._unpin(run, d)
         if self._all_dead():
             self._fail_stranded(run)
         self._cond.notify_all()
 
     # ---- helpers (lock held)
+
+    def _usable(self, run, d):
+        """Whether d can still run maps in this call: it is not dead and one of its slots is not broken."""
+        return d not in self._dead and not all(x.broken for x in self._slots[d][:run.n_slots[d]])
+
+    def _unpin(self, run, d):
+        """Let any GPU run the retries pinned to d, which can no longer run them."""
+        for i in [i for i, x in run.pinned.items() if x == d]:
+            del run.pinned[i]
+            run.parks[i] = 0
+        self._cond.notify_all()
 
     def _all_dead(self):
         return all(d in self._dead for d in self._devices)
