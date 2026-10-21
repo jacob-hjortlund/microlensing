@@ -70,7 +70,7 @@ The `examples` directory contains *very* brief examples of the python packages I
 
 `microlensing.IPM.batch.BatchedIPM` generates many IPM maps from one description, on one or more GPUs, and hands them back as they finish. It takes the arguments of `IPM`, plus `num_maps`. Each argument is either a single value shared by every map or a sequence with one value per map; sequences are paired element by element (use `itertools.product` for a grid). The number of maps is `num_maps` if given, otherwise the common length of the sequences (which must all agree, and must match `num_maps`), otherwise one. A string argument (`mass_function`, `starfile`, `outfile_prefix`) counts as a single value. Mismatches raise in the constructor, before any GPU work. `params(i)` returns the resolved inputs of map `i`.
 
-Seeds are fixed before any GPU work and are reported on each result as `random_seed`. A sequence of seeds is used as given. A single seed is a *starting* seed, even for one map: it gives each map a distinct seed in `1 ... 2**31 - 1` through `numpy.random.default_rng(start)`, map `i`'s seed does not depend on `num_maps`, and `random_seed=[s]` reproduces an `IPM` run with seed `s`. With no seed, distinct seeds are drawn. Seed and prefix sequences must not contain `None`, and given seeds must lie in `1 ... 2**31 - 1`. Maps with a `starfile` get seed 0, as with `IPM`. A single `outfile_prefix` (or none, meaning `"./"`) gives map `i` the prefix `prefix + f"{i}_"`; a sequence is used as given, and duplicate prefixes raise `ValueError`.
+Seeds are fixed before any GPU work and are reported on each result as `random_seed`. A sequence of seeds is used as given. A single seed is a *starting* seed, even for one map: it gives each map a distinct seed in `1 ... 2**31 - 1` through `numpy.random.default_rng(start)`, map `i`'s seed does not depend on `num_maps`, and `random_seed=[s]` reproduces an `IPM` run with seed `s`. With no seed, distinct seeds are drawn. Seed and prefix sequences must not contain `None`, and given seeds must lie in `1 ... 2**31 - 1`. Maps with a `starfile` get seed 0, as with `IPM`. A single `outfile_prefix` (or none, meaning `"./"`) gives map `i` the prefix `prefix + f"{i}_"`; a sequence is used as given, and duplicate prefixes raise `ValueError`. The prefixes name files only when maps are saved (`ipm.save()` on a result, or `run(save=True)` with `write_*` flags set); nothing is written otherwise, and, as with `IPM.save()`, the output directory must already exist.
 
 ```python
 from microlensing.IPM.batch import BatchedIPM
@@ -80,7 +80,7 @@ with BatchedIPM(kappa_tot=0.4, shear=0.4, smooth_fraction=0.5,
                 random_seed=range(1, 1001),                # or random_seed=42 and num_maps=1000
                 half_length_y1=25, half_length_y2=25,
                 num_pixels_y1=5000, num_pixels_y2=5000,
-                outfile_prefix="run1/") as batch:           # files: run1/0_ipm_..., run1/1_ipm_...
+                outfile_prefix="run1/") as batch:           # names files only when maps are saved: run1/0_ipm_..., run1/1_ipm_...
     for index, ipm in batch.run():                         # as maps finish, in any order
         if isinstance(ipm, Exception):                     # a BatchMapError: this map failed, the rest go on
             print(index, ipm); continue
