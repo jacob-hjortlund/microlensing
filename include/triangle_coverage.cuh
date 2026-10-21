@@ -204,10 +204,7 @@ namespace tri_cov
 		rows are in the frame of the clamped bounding box (rows 0..iy1-iy0); columns
 		are clamped to the map, not to the bounding box, because a step can fall on
 		the column just right of it. a span that starts left of the map has its step
-		on column 0; one that starts right of the last column has no step at all.
-		the span's first and last columns are compared with the map in precision P
-		before they are converted to int, so that an edge far outside the map
-		(beyond the int range) neither overflows the conversion nor wraps the sum
+		on column 0; one that starts right of the last column has no step at all
 		******************************************************************************/
 		if (1LL * (ix1 - ix0 + 1) * (iy1 - iy0 + 1) > edge_min_bbox)
 		{
@@ -228,11 +225,9 @@ namespace tri_cov
 					const P L = rb - ra;
 					if (!(L > 0)) continue;
 					const P xra = e.xa + (ra - e.ya) * e.slope, xrb = xra + L * e.slope;
-					//first and last span columns in the bounding-box frame; in the map frame (ix0 + them)
-					//they saturate to -1 left of the map and to ncol right of it
-					const P fs = floor(fmin(xra, xrb)), fe = floor(fmax(xra, xrb));
-					const int gs = fs < static_cast<P>(-ix0) ? -1 : (fs < static_cast<P>(ncol - ix0) ? ix0 + static_cast<int>(fs) : ncol);
-					const int ge = fe < static_cast<P>(-ix0) ? -1 : (fe < static_cast<P>(ncol - ix0) ? ix0 + static_cast<int>(fe) : ncol);
+					const P lo = fmin(xra, xrb), hi = fmax(xra, xrb);
+					const int gs = ix0 + static_cast<int>(floor(lo)); //first span column, map frame
+					const int ge = ix0 + static_cast<int>(floor(hi)); //last span column, map frame
 					const long long rowbase = 1LL * ncol * (iy0 + r);
 					const int cs = gs < 0 ? 0 : gs;
 					const int ce = ge > ncol - 1 ? ncol - 1 : ge;

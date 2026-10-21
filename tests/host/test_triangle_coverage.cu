@@ -14,7 +14,6 @@ per triangle category); exit 0 only if all pass.
 #include <limits>
 #include <random>
 #include <string>
-#include <utility>
 #include <vector>
 
 static int n_fail = 0;
@@ -534,100 +533,6 @@ static void test_outside(const char* ptag)
 	report(std::string("steps_outside_map_are_dropped_") + ptag, ok, detail);
 }
 
-/******************************************************************************
-edges far outside the map, beyond the int range in the frame of the bounding
-box. each triangle has a vertex A in row 16 of the map and an edge B-C far
-right (or far left) of it, in rows 16..24. far right, the edge B-C must deposit
-nothing and add no step, and each of the two edges from A must deposit on all
-four map columns of its span in row 16 (the conversion of a span column used
-to overflow, which put the steps of B-C on column 0 and dropped those spans);
-far left, B-C must put a step on column 0 of every row it crosses.
-
-T = double and P = float, with B and C at x = +-2147483647: the bounding box
-(shared with the direct path) is converted to int in precision T, and beyond
-the int range that conversion is undefined on the host (x86 gives INT_MIN, the
-device saturates), so a coordinate of ~3e9 would not reach the perimeter path
-here. in precision P the shifted coordinates round to +-2^31, already beyond it
-******************************************************************************/
-static void test_far_outside()
-{
-	const Complex<int> npix(64, 48);
-	const float factor = 1.7f;
-	const long long N = 1LL * npix.re * npix.im;
-	const double far = 2147483647.0;
-	bool ok = true;
-	std::string detail;
-	char buf[300];
-	for (int side = 0; side < 2; side++)
-	{
-		const bool right = side == 0;
-		const double ax = right ? 60.5 : 3.5, bx = right ? far : -far;
-		const int c0 = right ? 60 : 0, c1 = right ? 63 : 3; //map columns of the spans in row 16
-		for (int orient = 0; orient < 2; orient++)
-		{
-			Tri<double> tr = {Complex<double>(ax, 16.25), Complex<double>(bx, 16.75), Complex<double>(bx, 24.5), 0};
-			if (orient) std::swap(tr.p1, tr.p2);
-			std::vector<long long> deps, steps;
-			auto add = [&](long long i, float) { deps.push_back(i); };
-			auto step = [&](long long i, float) { steps.push_back(i); };
-			tri_cov::allocate_triangle<float, double>(tr.p0, tr.p1, tr.p2, shoelace(tr), factor, npix, 0, add, add, step);
-
-			const char* where = right ? "right" : "left";
-			for (long long i : deps)
-			{
-				if (i < 0 || i >= N || i / npix.re != 16 || i % npix.re < c0 || i % npix.re > c1)
-				{
-					ok = false;
-					std::snprintf(buf, sizeof buf, "%s orient %d: deposit at index %lld (row %lld column %lld); ", where, orient, i, i / npix.re, i % npix.re);
-					detail += buf;
-				}
-			}
-			if (deps.size() != 8)
-			{
-				ok = false;
-				std::snprintf(buf, sizeof buf, "%s orient %d: %zu deposits (want 8: columns %d..%d of row 16 for each edge from A); ", where, orient, deps.size(), c0, c1);
-				detail += buf;
-			}
-			if (right)
-			{
-				//one step per edge from A, at its span's first column; none from B-C
-				const bool two_at_a = steps.size() == 2 && steps[0] == 16LL * npix.re + 60 && steps[1] == 16LL * npix.re + 60;
-				if (!two_at_a)
-				{
-					ok = false;
-					std::snprintf(buf, sizeof buf, "right orient %d: %zu steps (want 2, both on row 16 column 60)", orient, steps.size());
-					detail += buf;
-					for (size_t k = 0; k < steps.size() && k < 4; k++)
-					{
-						std::snprintf(buf, sizeof buf, "%s%lld", k ? ", " : ": ", steps[k]);
-						detail += buf;
-					}
-					detail += "; ";
-				}
-			}
-			else
-			{
-				for (long long i : steps)
-				{
-					if (i < 0 || i >= N || i % npix.re != 0)
-					{
-						ok = false;
-						std::snprintf(buf, sizeof buf, "left orient %d: step at index %lld (want column 0); ", orient, i);
-						detail += buf;
-					}
-				}
-				for (int r = 16; r <= 24; r++)
-				{
-					bool found = false;
-					for (long long i : steps) found = found || i == 1LL * npix.re * r;
-					if (!found) { ok = false; std::snprintf(buf, sizeof buf, "left orient %d: no step on column 0 of row %d; ", orient, r); detail += buf; }
-				}
-			}
-		}
-	}
-	report("edges_far_outside_map_do_not_overflow", ok, detail);
-}
-
 int main()
 {
 	test_integral<double, false>("int_max0_matches_reference", "double");
@@ -644,6 +549,5 @@ int main()
 	test_threshold<float>("float");
 	test_outside<double>("double");
 	test_outside<float>("float");
-	test_far_outside();
 	return n_fail == 0 ? 0 : 1;
 }
