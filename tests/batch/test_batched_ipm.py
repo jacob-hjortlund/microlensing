@@ -109,6 +109,7 @@ class TestBatchedIPM(unittest.TestCase):
             with mock.patch("fake_backend.FakeResult.save", autospec=True,
                             side_effect=lambda self: time.sleep(0.02)):
                 b.run(save=True)
+            self.assertEqual(b.last_run_stats["result_budget"], limit)   # above 2 GPUs x 1 MiB, so not raised
             self.assertLessEqual(b.last_run_stats["peak_result_bytes"], limit)
             self.assertGreater(b.last_run_stats["peak_result_bytes"], 0)
 
