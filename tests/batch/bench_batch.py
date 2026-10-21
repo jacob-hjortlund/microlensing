@@ -112,6 +112,7 @@ def choose_gpus(allocated, g, foreign):
     """g of the allocated GPUs, those with the fewest foreign processes first (ties by order); sorted."""
     if g > len(allocated):
         raise ValueError(f"{g} GPUs requested but only {len(allocated)} allocated: {allocated}")
+    foreign = foreign or {}     # None: nvidia-smi failed, no GPU can be preferred
     ranked = sorted(allocated, key=lambda i: len(foreign.get(i, [])))   # sorted() is stable
     return sorted(ranked[:g])
 
