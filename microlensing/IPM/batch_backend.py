@@ -7,6 +7,7 @@ derived values such as the scaled mass limits and the seed back into the object)
 as an IPM object that holds no GPU memory (IPM._from_worker). The estimates use one probe object that never
 runs."""
 import ctypes
+import traceback
 
 import numpy as np
 
@@ -17,6 +18,15 @@ from .ipm import IPM
 
 def _library(is_double: bool):
     return (lib_ipm_double if is_double else lib_ipm).lib
+
+
+def _map_failed(message: str, cause: BaseException, cuda_error: int = 0) -> MapFailed:
+    """A MapFailed for an exception that IPM's Python code raised, to be raised `from cause`. The local variables
+    of the cause's finished frames are cleared: they hold the worker (self in _apply_inputs, worker in
+    _from_worker), and the error reaches the user, who may hold it after close() should have freed the worker and
+    its GPU memory. The traceback's file and line information stays."""
+    traceback.clear_frames(cause.__traceback__)
+    return MapFailed(message, cuda_error)
 
 
 def _open_failure(lib, device: int, code: int) -> str:
@@ -60,7 +70,7 @@ class CtypesBackend:
         try:
             probe._apply_inputs(**params)
         except ValueError as exc:
-            raise MapFailed(str(exc)) from exc
+            raise _map_failed(str(exc), exc) from exc
         out = (ctypes.c_ulonglong * 4)()
         if not self.lib.estimate_memory(probe.obj, out):
             raise MapFailed("the input parameters were rejected (see the messages above)")
@@ -95,7 +105,7 @@ class CtypesSlot:
         try:
             self.ipm._apply_inputs(**params)
         except ValueError as exc:
-            raise MapFailed(str(exc)) from exc
+            raise _map_failed(str(exc), exc) from exc
         lib.take_last_cuda_error()   # the code is per thread, and a successful earlier call can leave one behind
         if not lib.run(obj, self.verbose):
             raise MapFailed("IPM run failed (see the messages above)", lib.take_last_cuda_error())
@@ -103,8 +113,9 @@ class CtypesSlot:
         try:
             result = IPM._from_worker(self.ipm)
         except Exception as exc:   # the copy of the maps or the snapshot of the stars failed
-            raise MapFailed(f"copying the finished map from GPU {self.device} failed: {exc}",
-                            lib.take_last_cuda_error()) from exc
+            detail = str(exc) or type(exc).__name__
+            raise _map_failed(f"copying the finished map from GPU {self.device} failed: {detail}", exc,
+                              lib.take_last_cuda_error()) from exc
         alloc = (ctypes.c_ulonglong * 3)()
         lib.get_allocated_bytes(obj, alloc)
         held = MemoryEstimate(pixel=alloc[0], star=alloc[1], tree=alloc[2], result=0)
