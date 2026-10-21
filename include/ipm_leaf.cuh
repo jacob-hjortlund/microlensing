@@ -1,6 +1,7 @@
 #pragma once
 
 #include "complex.cuh"
+#include "device_buffer.cuh"
 #include "star.cuh"
 #include "tree_node.cuh"
 #include "util/util.cuh"
@@ -133,24 +134,60 @@ namespace ipm_leaf
 
 #ifdef __CUDACC__ //the host driver uses kernel launches; the kernels above also compile as plain host code for testing
 	/******************************************************************************
-	host driver. allocates (cudaMalloc) and fills the compact arrays.
+	the compact arrays (device) and the two counters that size them (managed).
+	grow-only (see reserve_buffer); capacities are in elements
+	******************************************************************************/
+	template <typename T>
+	struct LeafBuffers
+	{
+		LeafRecord<T>* leaves = nullptr;
+		size_t leaves_cap = 0;
+		T* coef_re = nullptr;
+		size_t coef_re_cap = 0;
+		T* coef_im = nullptr;
+		size_t coef_im_cap = 0;
+		StarXYM<T>* direct = nullptr;
+		size_t direct_cap = 0;
+		int* counters = nullptr; //number of leaves and of direct star entries
+		size_t counters_cap = 0;
+
+		/******************************************************************************
+		free every buffer
+
+		\param return_on_error -- whether to check for and return on a CUDA error
+
+		\return bool -- false if return_on_error is true and a cudaFree failed
+		******************************************************************************/
+		bool release(bool return_on_error)
+		{
+			if (!release_buffer(leaves, leaves_cap, return_on_error, "cudaFree(*leaves)")) return false;
+			if (!release_buffer(coef_re, coef_re_cap, return_on_error, "cudaFree(*coef_re)")) return false;
+			if (!release_buffer(coef_im, coef_im_cap, return_on_error, "cudaFree(*coef_im)")) return false;
+			if (!release_buffer(direct, direct_cap, return_on_error, "cudaFree(*direct)")) return false;
+			if (!release_buffer(counters, counters_cap, return_on_error, "cudaFree(*counters)")) return false;
+			return true;
+		}
+	};
+
+	/******************************************************************************
+	host driver. makes the buffers large enough (they only grow) and fills the
+	compact arrays.
 
 	\param tree -- per-level node arrays
 	\param num_nodes -- number of nodes per level
 	\param stars -- star array (sorted by node)
 	\param expansion_order -- global expansion order (coefficient stride is +1)
-	\param leaves, coef_re, coef_im, direct -- output device arrays (allocated here)
+	\param buf -- buffers of the compact arrays and the counters
 	\param num_leaves, num_direct -- output sizes
+	\param headroom -- factor applied to the sizes when a compact array grows
 	\param stream -- stream the kernels run on
 	******************************************************************************/
 	template <typename T>
 	bool build_leaf_records(const std::vector<TreeNode<T>*>& tree, const std::vector<int>& num_nodes, const star<T>* stars,
-		int expansion_order, LeafRecord<T>*& leaves, T*& coef_re, T*& coef_im, StarXYM<T>*& direct,
-		int& num_leaves, int& num_direct, int verbose, cudaStream_t stream)
+		int expansion_order, LeafBuffers<T>& buf, int& num_leaves, int& num_direct, double headroom, cudaStream_t stream, int verbose)
 	{
-		int* counters = nullptr;
-		cudaMallocManaged(&counters, 2 * sizeof(int));
-		if (cuda_error("cudaMallocManaged(*counters)", false, __FILE__, __LINE__)) return false;
+		if (!reserve_buffer(buf.counters, buf.counters_cap, 2, BufferKind::managed, 1.0, "cudaMallocManaged(*counters)")) return false;
+		int* counters = buf.counters;
 		counters[0] = 0;
 		counters[1] = 0;
 
@@ -170,25 +207,18 @@ namespace ipm_leaf
 			<< (num_leaves * (sizeof(LeafRecord<T>) + 2 * coef_stride * sizeof(T)) + num_direct * sizeof(StarXYM<T>)) / (1024.0 * 1024.0)
 			<< " MB)\n", verbose, 2);
 
-		cudaMalloc(&leaves, 1ULL * num_leaves * sizeof(LeafRecord<T>));
-		if (cuda_error("cudaMalloc(*leaves)", false, __FILE__, __LINE__)) return false;
-		cudaMalloc(&coef_re, 1ULL * num_leaves * coef_stride * sizeof(T));
-		if (cuda_error("cudaMalloc(*coef_re)", false, __FILE__, __LINE__)) return false;
-		cudaMalloc(&coef_im, 1ULL * num_leaves * coef_stride * sizeof(T));
-		if (cuda_error("cudaMalloc(*coef_im)", false, __FILE__, __LINE__)) return false;
-		cudaMalloc(&direct, 1ULL * (num_direct > 0 ? num_direct : 1) * sizeof(StarXYM<T>));
-		if (cuda_error("cudaMalloc(*direct)", false, __FILE__, __LINE__)) return false;
+		if (!reserve_buffer(buf.leaves, buf.leaves_cap, 1ULL * num_leaves, BufferKind::device, headroom, "cudaMalloc(*leaves)")) return false;
+		if (!reserve_buffer(buf.coef_re, buf.coef_re_cap, 1ULL * num_leaves * coef_stride, BufferKind::device, headroom, "cudaMalloc(*coef_re)")) return false;
+		if (!reserve_buffer(buf.coef_im, buf.coef_im_cap, 1ULL * num_leaves * coef_stride, BufferKind::device, headroom, "cudaMalloc(*coef_im)")) return false;
+		if (!reserve_buffer(buf.direct, buf.direct_cap, 1ULL * (num_direct > 0 ? num_direct : 1), BufferKind::device, headroom, "cudaMalloc(*direct)")) return false;
 
 		for (size_t i = 0; i < tree.size(); i++)
 		{
 			set_threads(threads, 256);
 			set_blocks(threads, blocks, num_nodes[i]);
-			fill_leaves_kernel<T> <<<blocks, threads, 0, stream>>> (tree[i], num_nodes[i], stars, leaves, coef_re, coef_im, coef_stride, direct);
+			fill_leaves_kernel<T> <<<blocks, threads, 0, stream>>> (tree[i], num_nodes[i], stars, buf.leaves, buf.coef_re, buf.coef_im, coef_stride, buf.direct);
 			if (cuda_error("fill_leaves_kernel", true, __FILE__, __LINE__, stream)) return false;
 		}
-
-		cudaFree(counters);
-		if (cuda_error("cudaFree(*counters)", false, __FILE__, __LINE__)) return false;
 
 		return true;
 	}

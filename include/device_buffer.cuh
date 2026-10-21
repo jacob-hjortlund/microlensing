@@ -5,6 +5,7 @@
 #include <cmath> //for std::ceil
 #include <cstddef> //for std::ptrdiff_t
 #include <new> //for std::bad_alloc
+#include <vector>
 
 #include <cuda_runtime.h>
 
@@ -92,29 +93,115 @@ bool release_buffer(P*& ptr, size_t& cap, bool return_on_error, const char* name
 
 /******************************************************************************
 Thrust allocator backed by one grow-only device buffer, so repeated Thrust
-calls don't cudaMalloc and cudaFree their temporary storage. deallocate keeps
-the buffer; release frees it
+calls don't cudaMalloc and cudaFree their temporary storage.
+
+one Thrust call can hold several temporary allocations at once
+(thrust::minmax_element holds two), so the buffer is a bump allocator:
+allocate hands out the next aligned part of the buffer, deallocate keeps it,
+and reset, called before each Thrust call, starts again at the beginning of
+the buffer (allocate does so itself when nothing is in use). a request that
+does not fit while other parts are in use gets a buffer of its own, which
+deallocate frees; once nothing is in use any more, the buffer grows to all
+that the call needed, so the next call of the same size fits. the buffer only
+grows while nothing is in use. release frees everything
 ******************************************************************************/
 struct ThrustScratch
 {
 	using value_type = char;
 
+	static constexpr size_t ALIGNMENT = 256; //alignment cudaMalloc gives
+
 	char* ptr = nullptr;
-	size_t cap = 0;
+	size_t cap = 0; //bytes
+	size_t used = 0; //bytes of ptr handed out since the last reset
+	size_t needed = 0; //bytes requested since the last reset, each rounded up to ALIGNMENT
+	int live = 0; //parts of ptr in use
+	std::vector<char*> extra; //buffers of the requests that did not fit, until their deallocate
+	std::vector<size_t> extra_cap;
+
+	bool in_use() const
+	{
+		return live != 0 || !extra.empty();
+	}
+
+	/******************************************************************************
+	start handing out the buffer from its beginning again. does nothing while a
+	part of it or an extra buffer is in use
+	******************************************************************************/
+	void reset()
+	{
+		if (in_use()) return;
+		used = 0;
+		needed = 0;
+	}
 
 	char* allocate(std::ptrdiff_t n)
 	{
-		if (!reserve_buffer(ptr, cap, static_cast<size_t>(n), BufferKind::device, 1.0, "thrust scratch"))
+		const size_t bytes = (static_cast<size_t>(n) + ALIGNMENT - 1) / ALIGNMENT * ALIGNMENT;
+		if (!in_use())
+		{
+			reset();
+			if (!reserve_buffer(ptr, cap, bytes, BufferKind::device, 1.0, "thrust scratch"))
+			{
+				throw std::bad_alloc();
+			}
+		}
+		needed += bytes;
+		if (used + bytes <= cap)
+		{
+			char* p = ptr + used;
+			used += bytes;
+			live++;
+			return p;
+		}
+
+		char* p = nullptr;
+		size_t c = 0;
+		if (!reserve_buffer(p, c, bytes, BufferKind::device, 1.0, "thrust scratch (extra)"))
 		{
 			throw std::bad_alloc();
 		}
-		return ptr;
+		extra.push_back(p);
+		extra_cap.push_back(c);
+		return p;
 	}
 
-	void deallocate(char*, size_t) {}
+	void deallocate(char* p, size_t)
+	{
+		bool was_extra = false;
+		for (size_t i = 0; i < extra.size() && !was_extra; i++)
+		{
+			if (extra[i] == p)
+			{
+				release_buffer(extra[i], extra_cap[i], false, "cudaFree(thrust scratch (extra))");
+				extra.erase(extra.begin() + i);
+				extra_cap.erase(extra_cap.begin() + i);
+				was_extra = true;
+			}
+		}
+		if (!was_extra && live > 0) live--;
+
+		//after a call that did not fit, grow to all it needed. if that fails, ptr is nullptr and the next
+		//allocate tries again
+		if (!in_use() && needed > cap)
+		{
+			reserve_buffer(ptr, cap, needed, BufferKind::device, 1.0, "thrust scratch");
+		}
+	}
 
 	bool release()
 	{
-		return release_buffer(ptr, cap, true, "cudaFree(thrust scratch)");
+		bool ok = true;
+		for (size_t i = 0; i < extra.size(); i++)
+		{
+			ok = release_buffer(extra[i], extra_cap[i], true, "cudaFree(thrust scratch (extra))") && ok;
+		}
+		extra.clear();
+		extra_cap.clear();
+		ok = release_buffer(ptr, cap, true, "cudaFree(thrust scratch)") && ok;
+		used = 0;
+		needed = 0;
+		live = 0;
+		return ok;
 	}
 };

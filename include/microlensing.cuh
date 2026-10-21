@@ -2,6 +2,7 @@
 
 #include "binomial_coefficients.cuh"
 #include "complex.cuh"
+#include "device_buffer.cuh"
 #include "fmm.cuh"
 #include "mass_functions.cuh"
 #include "mass_functions/equal.cuh"
@@ -53,6 +54,9 @@ public:
 	int write_stars = 1;
 	std::string outfile_prefix = "./";
 	int device = 0; //CUDA device this object runs on
+	//1 means run() keeps the device buffers of the previous run and grows them only when a map needs more.
+	//batch workers set it; other objects free and reallocate on every run, as before
+	int reuse_memory = 0;
 
 
 private:
@@ -110,17 +114,37 @@ protected:
 
 	T root_half_length;
 	int tree_levels;
-	std::vector<TreeNode<T>*> tree; //members of the tree will need their memory freed
+	std::vector<TreeNode<T>*> tree; //the levels of this run's tree, rebuilt every run: tree[i] = tree_pool[i]
 	std::vector<int> num_nodes;
 
 	/******************************************************************************
-	dynamic memory
+	dynamic memory, grow-only (see reserve_buffer). capacities are in elements.
+	without reuse_memory, clear_memory frees everything at the start of every
+	run, so every buffer is allocated with exactly the size the run needs
 	******************************************************************************/
 	curandState* states = nullptr;
+	size_t states_cap = 0;
 	star<T>* stars = nullptr;
+	size_t stars_cap = 0;
 	star<T>* temp_stars = nullptr;
+	size_t temp_stars_cap = 0;
 
 	long long* binomial_coeffs = nullptr;
+	size_t binomial_coeffs_cap = 0;
+
+	/******************************************************************************
+	the node arrays of the tree levels (managed). a reused object keeps the
+	levels of earlier runs here, also those deeper than its current tree
+	******************************************************************************/
+	std::vector<TreeNode<T>*> tree_pool;
+	std::vector<size_t> tree_pool_cap;
+
+	/******************************************************************************
+	counters of create_tree (managed): the maximum and minimum number of stars in
+	a node and its neighbours, and the number of nodes that get children
+	******************************************************************************/
+	int* tree_counters = nullptr;
+	size_t tree_counters_cap = 0;
 
 
 
@@ -185,8 +209,9 @@ protected:
 
 	/******************************************************************************
 	make this object's device current before its memory is freed. When there is
-	nothing to free, the device is left alone, so that destroying an object that
-	never ran makes no CUDA call
+	nothing to free, the device is left alone, and release_buffer skips null
+	pointers, so that creating and destroying an object that never ran makes no
+	CUDA call
 	******************************************************************************/
 	bool use_device_to_free(bool has_memory, bool return_on_error)
 	{
@@ -200,36 +225,53 @@ protected:
 	{
 		print_verbose("Clearing Microlensing<T> memory...\n", verbose, 3);
 
-		if (!use_device_to_free(states || stars || temp_stars || binomial_coeffs || !tree.empty(), return_on_error)) return false;
+		bool has_memory = states || stars || temp_stars || binomial_coeffs || tree_counters;
+		for (TreeNode<T>* level : tree_pool)
+		{
+			has_memory = has_memory || level;
+		}
+		if (!use_device_to_free(has_memory, return_on_error)) return false;
 		
 		/******************************************************************************
-		free memory and set variables to nullptr
+		free memory and set variables to nullptr and capacities to 0
 		******************************************************************************/
 
-		cudaFree(states);
-		if (return_on_error && cuda_error("cudaFree(*states)", false, __FILE__, __LINE__)) return false;
-		states = nullptr;
-		
-		cudaFree(stars);
-		if (return_on_error && cuda_error("cudaFree(*stars)", false, __FILE__, __LINE__)) return false;
-		stars = nullptr;
-		
-		cudaFree(temp_stars);
-		if (return_on_error && cuda_error("cudaFree(*temp_stars)", false, __FILE__, __LINE__)) return false;
-		temp_stars = nullptr;
-		
-		cudaFree(binomial_coeffs);
-		if (return_on_error && cuda_error("cudaFree(*binomial_coeffs)", false, __FILE__, __LINE__)) return false;
-		binomial_coeffs = nullptr;
+		if (!release_buffer(states, states_cap, return_on_error, "cudaFree(*states)")) return false;
+		if (!release_buffer(stars, stars_cap, return_on_error, "cudaFree(*stars)")) return false;
+		if (!release_buffer(temp_stars, temp_stars_cap, return_on_error, "cudaFree(*temp_stars)")) return false;
+		if (!release_buffer(binomial_coeffs, binomial_coeffs_cap, return_on_error, "cudaFree(*binomial_coeffs)")) return false;
 
-		for	(int i = 0; i < tree.size(); i++) //for every level in the tree, free the memory for the nodes
+		for (size_t i = 0; i < tree_pool.size(); i++) //for every level in the tree, free the memory for the nodes
 		{
-			cudaFree(tree[i]);
-			if (return_on_error && cuda_error("cudaFree(*tree[i])", false, __FILE__, __LINE__)) return false;
-			tree[i] = nullptr;
+			if (!release_buffer(tree_pool[i], tree_pool_cap[i], return_on_error, "cudaFree(*tree[i])")) return false;
 		}
+		tree_pool.clear();
+		tree_pool_cap.clear();
+		tree.clear();
+
+		if (!release_buffer(tree_counters, tree_counters_cap, return_on_error, "cudaFree(*tree_counters)")) return false;
 
 		print_verbose("Done clearing Microlensing<T> memory.\n", verbose, 3);
+		return true;
+	}
+
+	/******************************************************************************
+	make level tree.size() of the tree pool hold at least n nodes and append it to
+	the tree
+
+	\param n -- number of nodes of the level
+	\param headroom -- factor applied to n when the level grows
+	******************************************************************************/
+	bool add_tree_level(int n, double headroom)
+	{
+		const size_t i = tree.size();
+		if (tree_pool.size() <= i)
+		{
+			tree_pool.resize(i + 1, nullptr);
+			tree_pool_cap.resize(i + 1, 0);
+		}
+		if (!reserve_buffer(tree_pool[i], tree_pool_cap[i], static_cast<size_t>(n), BufferKind::managed, headroom, "cudaMallocManaged(*tree)")) return false;
+		tree.push_back(tree_pool[i]);
 		return true;
 	}
 
@@ -369,6 +411,8 @@ protected:
 				std::cerr << "Error. Unable to read star field parameters from file " << starfile << "\n";
 				return false;
 			}
+			//stars was nullptr, so read_star_file allocated exactly num_stars stars
+			stars_cap = num_stars;
 
 			set_param("num_stars", num_stars, num_stars, verbose);
 			set_param("rectangular", rectangular, rectangular, verbose);
@@ -400,23 +444,18 @@ protected:
 		stopwatch.start();
 
 		/******************************************************************************
-		allocate memory for stars
+		allocate memory for stars. a star file already allocated the stars, with
+		exactly num_stars elements
 		******************************************************************************/
-		cudaMallocManaged(&states, num_stars * sizeof(curandState));
-		if (cuda_error("cudaMallocManaged(*states)", false, __FILE__, __LINE__)) return false;
-		if (stars == nullptr) //if memory wasn't allocated already due to reading a star file
-		{
-			cudaMallocManaged(&stars, num_stars * sizeof(star<T>));
-			if (cuda_error("cudaMallocManaged(*stars)", false, __FILE__, __LINE__)) return false;
-		}
-		cudaMallocManaged(&temp_stars, num_stars * sizeof(star<T>));
-		if (cuda_error("cudaMallocManaged(*temp_stars)", false, __FILE__, __LINE__)) return false;
+		if (!reserve_buffer(states, states_cap, num_stars, BufferKind::managed, 1.0, "cudaMallocManaged(*states)")) return false;
+		if (!reserve_buffer(stars, stars_cap, num_stars, BufferKind::managed, 1.0, "cudaMallocManaged(*stars)")) return false;
+		if (!reserve_buffer(temp_stars, temp_stars_cap, num_stars, BufferKind::managed, 1.0, "cudaMallocManaged(*temp_stars)")) return false;
 
 		/******************************************************************************
 		allocate memory for binomial coefficients
 		******************************************************************************/
-		cudaMallocManaged(&binomial_coeffs, (2 * treenode::MAX_EXPANSION_ORDER * (2 * treenode::MAX_EXPANSION_ORDER + 3) / 2 + 1) * sizeof(long long));
-		if (cuda_error("cudaMallocManaged(*binomial_coeffs)", false, __FILE__, __LINE__)) return false;
+		if (!reserve_buffer(binomial_coeffs, binomial_coeffs_cap, 2 * treenode::MAX_EXPANSION_ORDER * (2 * treenode::MAX_EXPANSION_ORDER + 3) / 2 + 1,
+			BufferKind::managed, 1.0, "cudaMallocManaged(*binomial_coeffs)")) return false;
 
 		t_elapsed = stopwatch.stop();
 		print_verbose("Done allocating Microlensing<T> memory. Elapsed time: " << t_elapsed << " seconds.\n", verbose, 3);
@@ -547,18 +586,19 @@ protected:
 		}
 		set_param("root_half_length", root_half_length, root_half_length * 1.1, verbose); //slight buffer for containing all the stars
 
+		//the number of nodes per level depends on the star field: a reused object leaves room for more
+		const double headroom = reuse_memory ? 1.25 : 1.0;
+
 		//initialize variables
 		tree_levels = 0;
 		tree = {};
 		num_nodes = {};
 
 		/******************************************************************************
-		push empty pointer into tree, add 1 to number of nodes, and allocate memory
+		add 1 to number of nodes, and take the root level from the tree pool
 		******************************************************************************/
-		tree.push_back(nullptr);
 		num_nodes.push_back(1);
-		cudaMallocManaged(&tree.back(), num_nodes.back() * sizeof(TreeNode<T>));
-		if (cuda_error("cudaMallocManaged(*tree)", false, __FILE__, __LINE__)) return false;
+		if (!add_tree_level(num_nodes.back(), headroom)) return false;
 
 		/******************************************************************************
 		initialize root node
@@ -567,15 +607,10 @@ protected:
 		tree[0][0].numstars = num_stars;
 
 
-		int* max_num_stars_in_level = nullptr;
-		int* min_num_stars_in_level = nullptr;
-		int* num_nonempty_nodes = nullptr;
-		cudaMallocManaged(&max_num_stars_in_level, sizeof(int));
-		if (cuda_error("cudaMallocManaged(*max_num_stars_in_level)", false, __FILE__, __LINE__)) return false;
-		cudaMallocManaged(&min_num_stars_in_level, sizeof(int));
-		if (cuda_error("cudaMallocManaged(*min_num_stars_in_level)", false, __FILE__, __LINE__)) return false;
-		cudaMallocManaged(&num_nonempty_nodes, sizeof(int));
-		if (cuda_error("cudaMallocManaged(*num_nonempty_nodes)", false, __FILE__, __LINE__)) return false;
+		if (!reserve_buffer(tree_counters, tree_counters_cap, 3, BufferKind::managed, 1.0, "cudaMallocManaged(*tree_counters)")) return false;
+		int* max_num_stars_in_level = &tree_counters[0];
+		int* min_num_stars_in_level = &tree_counters[1];
+		int* num_nonempty_nodes = &tree_counters[2];
 
 		print_verbose("Creating children and sorting stars...\n", verbose, 1);
 		stopwatch.start();
@@ -602,10 +637,8 @@ protected:
 				print_verbose("Number of non-empty children: " << *num_nonempty_nodes * treenode::MAX_NUM_CHILDREN << "\n", verbose, 3);
 
 				print_verbose("Allocating memory for children...\n", verbose, 3);
-				tree.push_back(nullptr);
 				num_nodes.push_back(*num_nonempty_nodes * treenode::MAX_NUM_CHILDREN);
-				cudaMallocManaged(&tree.back(), num_nodes.back() * sizeof(TreeNode<T>));
-				if (cuda_error("cudaMallocManaged(*tree)", false, __FILE__, __LINE__)) return false;
+				if (!add_tree_level(num_nodes.back(), headroom)) return false;
 
 				print_verbose("Creating children...\n", verbose, 3);
 				(*num_nonempty_nodes)--; //subtract one since value is size of array, and instead needs to be the first allocatable element
@@ -632,17 +665,11 @@ protected:
 		set_param("tree_levels", tree_levels, tree_levels, verbose);
 
 
-		cudaFree(max_num_stars_in_level);
-		if (cuda_error("cudaFree(*max_num_stars_in_level)", false, __FILE__, __LINE__)) return false;
 		max_num_stars_in_level = nullptr;
-		
-		cudaFree(min_num_stars_in_level);
-		if (cuda_error("cudaFree(*min_num_stars_in_level)", false, __FILE__, __LINE__)) return false;
 		min_num_stars_in_level = nullptr;
-		
-		cudaFree(num_nonempty_nodes);
-		if (cuda_error("cudaFree(*num_nonempty_nodes)", false, __FILE__, __LINE__)) return false;
 		num_nonempty_nodes = nullptr;
+		//a reused object keeps the counters for its next run
+		if (!reuse_memory && !release_buffer(tree_counters, tree_counters_cap, true, "cudaFree(*tree_counters)")) return false;
 
 
 		t_elapsed = stopwatch.stop();
@@ -831,37 +858,65 @@ public:
 	}
 
 	/******************************************************************************
-	copy constructor sets this object's dynamic memory pointers to null
+	copy constructor sets this object's dynamic memory pointers to null and their
+	capacities to 0, and makes it a default (not reused) object
 	******************************************************************************/
 	Microlensing(const Microlensing& other)
 	{
 		states = nullptr;
+		states_cap = 0;
 		stars = nullptr;
+		stars_cap = 0;
 		temp_stars = nullptr;
+		temp_stars_cap = 0;
 
 		binomial_coeffs = nullptr;
+		binomial_coeffs_cap = 0;
 
 		tree = {};
+		tree_pool = {};
+		tree_pool_cap = {};
+		tree_counters = nullptr;
+		tree_counters_cap = 0;
+
+		reuse_memory = 0;
 
 		stream = 0;
 		owns_stream = false;
 	}
 
 	/******************************************************************************
-	copy assignment sets this object's dynamic memory pointers to null
+	copy assignment sets this object's dynamic memory pointers to null and their
+	capacities to 0, and makes it a default (not reused) object. a stream this
+	object created is destroyed
 	******************************************************************************/
 	Microlensing& operator=(const Microlensing& other)
 	{
         if (this == &other) return *this;
 
 		states = nullptr;
+		states_cap = 0;
 		stars = nullptr;
+		stars_cap = 0;
 		temp_stars = nullptr;
+		temp_stars_cap = 0;
 
 		binomial_coeffs = nullptr;
+		binomial_coeffs_cap = 0;
 
 		tree = {};
+		tree_pool = {};
+		tree_pool_cap = {};
+		tree_counters = nullptr;
+		tree_counters_cap = 0;
 
+		reuse_memory = 0;
+
+		if (owns_stream && stream != 0)
+		{
+			cudaSetDevice(device);
+			cudaStreamDestroy(stream);
+		}
 		stream = 0;
 		owns_stream = false;
 
@@ -886,6 +941,22 @@ public:
 		stream = new_stream;
 		owns_stream = true;
 		return true;
+	}
+
+	/******************************************************************************
+	device and managed memory this object holds, in bytes: the curand states, the
+	two star arrays and the binomial coefficients (star_bytes), and the tree pool
+	and its counters (tree_bytes)
+	******************************************************************************/
+	void allocated_bytes(unsigned long long& star_bytes, unsigned long long& tree_bytes) const
+	{
+		star_bytes = 1ULL * states_cap * sizeof(curandState) + 1ULL * stars_cap * sizeof(star<T>)
+			+ 1ULL * temp_stars_cap * sizeof(star<T>) + 1ULL * binomial_coeffs_cap * sizeof(long long);
+		tree_bytes = 1ULL * tree_counters_cap * sizeof(int);
+		for (size_t cap : tree_pool_cap)
+		{
+			tree_bytes += 1ULL * cap * sizeof(TreeNode<T>);
+		}
 	}
 
 	int get_num_stars()			{return num_stars;}
