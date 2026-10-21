@@ -1,4 +1,6 @@
 """Expansion of a batch description into one fully resolved parameter dict per map."""
+from collections import Counter
+
 import numpy as np
 
 from .ipm import _INPUT_NAMES
@@ -70,15 +72,10 @@ def expand(inputs, num_maps=None):
     else:
         n = 1 if num_maps is None else num_maps
 
+    shared = {name: _scalar(inputs.get(name)) for name in _INPUT_NAMES if name not in seqs}
     maps = []
     for i in range(n):
-        m = {}
-        for name in _INPUT_NAMES:
-            if name in seqs:
-                m[name] = seqs[name][i]
-            else:
-                m[name] = _scalar(inputs.get(name))
-        maps.append(m)
+        maps.append({name: seqs[name][i] if name in seqs else shared[name] for name in _INPUT_NAMES})
 
     # seeds
     if "random_seed" in seqs:
@@ -106,7 +103,7 @@ def expand(inputs, num_maps=None):
     for i, p in enumerate(prefixes):
         if p is None:
             raise ValueError(f"outfile_prefix for map {i} must not be None")
-    dups = sorted({p for p in prefixes if prefixes.count(p) > 1}, key=str)
+    dups = sorted((p for p, count in Counter(prefixes).items() if count > 1), key=str)
     if dups:
         raise ValueError(f"duplicate outfile_prefix values: {dups}")
     return maps
