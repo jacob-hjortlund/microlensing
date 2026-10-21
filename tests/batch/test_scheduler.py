@@ -199,6 +199,17 @@ class SchedulerTests(unittest.TestCase):
             self.assertEqual(sched.stats["devices"][d]["max_concurrent"], 1)
             self.assertLessEqual(fake.max_concurrency[d], 1)
 
+    def test_small_batches_spread_over_every_gpu(self):
+        # 8 GPUs of 8 slots: 8 maps of equal length run one on each GPU and 16 maps two on each, instead of
+        # filling the slots of the first GPUs. Every map is admitted long before the first one ends
+        for n, per_gpu in ((8, 1), (16, 2)):
+            fake = FakeBackend(devices=8)
+            sched = self.make(fake)
+            self.assert_successes(collect(sched, maps(n, time=0.5)), n)
+            self.assertEqual({d: dev["maps"] for d, dev in sched.stats["devices"].items()},
+                             {d: per_gpu for d in range(8)}, n)
+            self.assertEqual(fake.max_concurrency, {d: per_gpu for d in range(8)}, n)
+
     def test_devices_argument_restricts_devices(self):
         fake = FakeBackend()
         sched = self.make(fake, devices=[1])
@@ -410,16 +421,17 @@ class SchedulerTests(unittest.TestCase):
             self.assertEqual([o for o in everything if o is not rs[-1] and overlaps(o, rs[-1])], [], i)
 
     def test_always_oom_map_stays_on_its_gpu_and_gives_slots_back(self):
-        # map 3 always runs out of memory on 2 GPUs of 8 slots. Its retries stay on the GPU where it first ran
-        # out, the other GPU keeps all 8 slots, and the first GPU gets its parked slots back once map 3 fails
-        fake, seen = self.always_oom(index=3)
+        # map 15 always runs out of memory on 2 GPUs of 8 slots. It is the 16th map started, so it first runs next
+        # to 7 others on its GPU. Its retries stay on that GPU, the other GPU keeps all 8 slots, and the first GPU
+        # gets its parked slots back once map 15 fails
+        fake, seen = self.always_oom(index=15)
         sched = self.make(fake)
         out = collect(sched, maps(80, time=0.05))
-        self.assert_successes(out, 80, failed={3})
-        tries = runs(fake)[3]
+        self.assert_successes(out, 80, failed={15})
+        tries = runs(fake)[15]
         (d,) = {t[0] for t in tries}   # every try on the same GPU
         other = 1 - d
-        (err,) = [f.result for f in out if f.index == 3]
+        (err,) = [f.result for f in out if f.index == 15]
         self.assertEqual((err.cuda_error, str(err)), (2, f"out of device memory with no other map on GPU {d}"))
         self.assertGreaterEqual(len(tries), 3)
         dev, odev = sched.stats["devices"][d], sched.stats["devices"][other]
