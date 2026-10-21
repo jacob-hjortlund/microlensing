@@ -201,6 +201,7 @@ class _Run:
         self.mem_waiters = {}     # device -> slots whose latest admission attempt waited for memory
         self.checks = {}          # device -> check_device() calls in flight on it; admission on it waits for them
         self.active = {}          # device -> slots with an admitted map
+        self.holding = set()      # slots whose thread keeps a finished result until there is room in the queue
         self.attempts = [0] * len(params)   # how often each map moved off a GPU that left the batch
         self.pinned = {}          # index -> the GPU that alone may run this out-of-memory retry
         self.parks = [0] * len(params)      # how much each map's retries lowered slot_limit on its pinned GPU
@@ -630,8 +631,10 @@ class Scheduler:
                 run.stats["direct_deposit_maps"] += 1
             self._update_peaks(run, d)
             self._cond.notify_all()
+            run.holding.add(st)
             while not run.stopping and not self._room_for(run, nbytes):
                 self._cond.wait()
+            run.holding.discard(st)
             run.in_progress_bytes -= nbytes
             if not run.stopping:
                 run.waiting_bytes += nbytes
@@ -778,7 +781,8 @@ class Scheduler:
     def _taken_elsewhere(self, run, d, pos):
         """Whether another GPU that runs fewer maps than d would start pending[pos], d's next map, at once: the map
         is not pinned to d, no map ahead of it is pinned to that GPU, the GPU is below its slot limit, no memory
-        is being freed on it and it is not being checked, and one of its idle slots fits the map in its budget.
+        is being freed on it and it is not being checked, and one of its idle slots fits the map in its budget (a
+        slot whose thread keeps a finished result until the queue has room is not idle).
         Each GPU on the way to the one that starts the map runs fewer maps than the one before, so it is found."""
         i = run.pending[pos]
         e = run.estimates[i]
@@ -789,7 +793,7 @@ class Scheduler:
             if any(run.pinned.get(j) == d2 for j in itertools.islice(run.pending, pos)):
                 continue    # d2 would start a retry pinned to it first
             room = run.budget[d2] - run.committed[d2]
-            if any(not x.broken and x not in run.active[d2] and _growth(x.held, e) <= room
+            if any(not x.broken and x not in run.active[d2] and x not in run.holding and _growth(x.held, e) <= room
                    for x in self._slots[d2][:run.n_slots[d2]]):
                 return True
         return False
