@@ -1,9 +1,12 @@
 """Login-node tests (no GPU) of BatchedIPM, driven through a fake backend:
 python -m unittest tests.batch.test_batched_ipm -v"""
+import gc
 import sys
+import threading
 import time
 import unittest
 import warnings
+import weakref
 from pathlib import Path
 from unittest import mock
 
@@ -12,7 +15,7 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from fake_backend import MiB, FakeBackend  # noqa: E402
+from fake_backend import MiB, FakeBackend, FakeResult  # noqa: E402
 from microlensing.IPM.batch import BatchedIPM, SavedMap  # noqa: E402
 from microlensing.IPM.batch_scheduler import BatchMapError, MapFailed  # noqa: E402
 
@@ -139,6 +142,60 @@ class TestBatchedIPM(unittest.TestCase):
             self.assertLessEqual(b.last_run_stats["peak_result_bytes"], limit)
             self.assertGreater(b.last_run_stats["peak_result_bytes"], 0)
 
+    @staticmethod
+    def slow_first_map(b):
+        """Map 0 of b runs for 1 s and every other map for 20 ms."""
+        for i, p in enumerate(b._params):
+            p["time"] = 1.0 if i == 0 else 0.02
+
+    def test_memory_mode_keeps_no_result_the_consumer_dropped(self):
+        # 4 slots on 1 GPU, and map 0 runs for 1 s: once the consumer has dropped the other 7 results, nothing
+        # of BatchedIPM or the scheduler keeps them while map 0 still runs
+        fb = FakeBackend(devices=1)
+        with make(fb, num_maps=8, maps_per_gpu=4) as b:
+            self.slow_first_map(b)
+            gen = b.run()
+            refs = []
+            for _ in range(7):
+                index, result = next(gen)
+                self.assertNotEqual(index, 0)
+                refs.append(weakref.ref(result))
+                del result
+            gc.collect()
+            self.assertNotIn(0, [e[3] for e in fb.log_snapshot() if e[0] == "end"])   # map 0 still runs
+            self.assertEqual(sum(r() is not None for r in refs), 0)
+            self.assertEqual([i for i, _ in gen], [0])
+
+    def test_save_mode_keeps_no_written_result(self):
+        # as above in save mode: once the other 7 maps are written, nothing keeps their results while map 0 runs
+        fb = FakeBackend(devices=1)
+        refs = []
+        alive = []
+        written = threading.Event()
+
+        def save(result):   # a plain function: a mock would keep every result in its call list
+            refs.append(weakref.ref(result))
+            if len(refs) == 7:
+                written.set()
+
+        def check():
+            written.wait(5)
+            time.sleep(0.3)   # the writer releases the map after save() returns
+            gc.collect()
+            alive.append(sum(r() is not None for r in refs))
+            alive.append(0 in [e[3] for e in fb.log_snapshot() if e[0] == "end"])
+
+        with make(fb, num_maps=8, maps_per_gpu=4, write_maps=True) as b:
+            self.slow_first_map(b)
+            checker = threading.Thread(target=check)
+            with mock.patch.object(FakeResult, "save", save):
+                checker.start()
+                recs = b.run(save=True)
+            checker.join()
+        self.assertTrue(all(r.error is None for r in recs))
+        self.assertEqual(len(refs), 8)
+        self.assertEqual(alive, [0, False])   # no written result alive, and map 0 still ran at the check
+
     def test_save_without_write_flags_warns(self):
         with make(FakeBackend(), num_maps=2) as b:
             with self.assertWarnsRegex(UserWarning, "only the parameter files"):
@@ -182,6 +239,26 @@ class TestBatchedIPM(unittest.TestCase):
             self.assertEqual(recs[0].random_seed, b.params(0)["random_seed"])
             self.assertEqual(FakeIPM.instances[3].saved, 1)
             b.close()
+
+    def test_fallback_keeps_no_result_the_consumer_dropped(self):
+        # one map at a time: while map 1 runs, nothing keeps map 0, which the consumer has dropped (a fallback
+        # IPM holds its GPU memory until it is deleted)
+        class Tracked(FakeIPM):
+            def run(self):
+                alive.append(sum(r() is not None for r in refs))
+
+        alive, refs = [], []
+        with mock.patch("microlensing.IPM.batch.IPM", Tracked), warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            b = make(None, num_maps=2)
+            gen = b.run()
+            _, result = next(gen)
+            FakeIPM.instances = []
+            refs.append(weakref.ref(result))
+            del result
+            gc.collect()
+            self.assertEqual(len(list(gen)), 1)
+        self.assertEqual(alive, [0, 0])
 
     def test_close_releases_slots(self):
         fb = FakeBackend()
