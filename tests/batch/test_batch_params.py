@@ -93,6 +93,24 @@ class ExpandTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             expand({"outfile_prefix": ["a/", "a/"]})
 
+    def test_bad_seed_entries_raise(self):
+        for bad in (None, 0, -1, 2**31, 3.5, True):
+            with self.assertRaises(ValueError) as cm:
+                expand({"random_seed": [5, bad]})
+            self.assertIn("map 1", str(cm.exception))
+        maps = expand({"random_seed": [np.int64(5), SEED_MAX]})
+        self.assertEqual([m["random_seed"] for m in maps], [5, SEED_MAX])
+        self.assertTrue(all(type(m["random_seed"]) is int for m in maps))
+
+    def test_starfile_map_accepts_none_seed_entry(self):
+        maps = expand({"starfile": ["a.bin", None], "random_seed": [None, 4]})
+        self.assertEqual([m["random_seed"] for m in maps], [None, 4])
+
+    def test_none_prefix_entry_raises(self):
+        with self.assertRaises(ValueError) as cm:
+            expand({"outfile_prefix": ["a/", None]})
+        self.assertIn("map 1", str(cm.exception))
+
     def test_unknown_argument_raises(self):
         with self.assertRaises(TypeError):
             expand({"kapa": 1})

@@ -82,9 +82,12 @@ def expand(inputs, num_maps=None):
 
     # seeds
     if "random_seed" in seqs:
-        for m in maps:
-            if m["random_seed"] is not None:
-                m["random_seed"] = int(m["random_seed"])
+        for i, m in enumerate(maps):
+            if m["starfile"] is not None:
+                continue
+            v = m["random_seed"]
+            if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= SEED_MAX:
+                raise ValueError(f"random_seed for map {i} must be an integer in 1..{SEED_MAX}, got {v!r}")
     else:
         start = inputs.get("random_seed")
         start = None if start is None else int(_scalar(start))
@@ -100,6 +103,9 @@ def expand(inputs, num_maps=None):
         for i, m in enumerate(maps):
             m["outfile_prefix"] = base + f"{i}_"
     prefixes = [m["outfile_prefix"] for m in maps]
+    for i, p in enumerate(prefixes):
+        if p is None:
+            raise ValueError(f"outfile_prefix for map {i} must not be None")
     dups = sorted({p for p in prefixes if prefixes.count(p) > 1}, key=str)
     if dups:
         raise ValueError(f"duplicate outfile_prefix values: {dups}")
