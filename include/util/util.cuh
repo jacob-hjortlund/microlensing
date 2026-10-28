@@ -270,14 +270,21 @@ display info about a cuda device
 ******************************************************************************/
 void show_device_info(int num, cudaDeviceProp& prop)
 {
+	int clock_rate = 0;
+	cudaDeviceGetAttribute(&clock_rate, cudaDevAttrClockRate, num);
+	int memory_clock_rate = 0;
+	cudaDeviceGetAttribute(&memory_clock_rate, cudaDevAttrMemoryClockRate, num);
+	int perf_ratio = 0;
+	cudaDeviceGetAttribute(&perf_ratio, cudaDevAttrSingleToDoublePrecisionPerfRatio, num);
+
 	std::cout << "Device Number: " << num << "\n";
 	std::cout << "  Device name: " << prop.name << "\n";
 	std::cout << "  Compute capability (major.minor): " << prop.major << "." << prop.minor << "\n";
-	std::cout << "  Clock rate (kHz): " << prop.clockRate << "\n";
-	std::cout << "  Memory clock rate (kHz): " << prop.memoryClockRate << "\n";
+	std::cout << "  Clock rate (kHz): " << clock_rate << "\n";
+	std::cout << "  Memory clock rate (kHz): " << memory_clock_rate << "\n";
 	std::cout << "  Memory bus width (bits): " << prop.memoryBusWidth << "\n";
-	std::cout << "  Peak memory bandwidth (GB/s): " << 2 * prop.memoryClockRate * (prop.memoryBusWidth / 8) / (1024 * 1024) << "\n";
-	std::cout << "  Single to double precision performance ratio: " << prop.singleToDoublePrecisionPerfRatio << "\n";
+	std::cout << "  Peak memory bandwidth (GB/s): " << 2 * memory_clock_rate * (prop.memoryBusWidth / 8) / (1024 * 1024) << "\n";
+	std::cout << "  Single to double precision performance ratio: " << perf_ratio << "\n";
 	std::cout << "  Total global memory (GB): " << prop.totalGlobalMem / (1024 * 1024 * 1024) << "\n";
 	std::cout << "  Shared memory per multiprocessor (kbytes): " << prop.sharedMemPerMultiprocessor / 1024 << "\n";
 	std::cout << "  Shared memory per block (kbytes): " << prop.sharedMemPerBlock / 1024 << "\n";
