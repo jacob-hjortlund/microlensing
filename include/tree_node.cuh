@@ -265,43 +265,6 @@ public:
             }
         }
     }
-
-    __host__ __device__ void set_multipole_coeffs(Complex<T>* coeffs, int power)
-    {
-        for (int i = 0; i <= power; i++)
-        {
-            multipole_coeffs[i] = coeffs[i];
-        }
-        expansion_order = (expansion_order > power ? expansion_order : power);
-    }
-    
-    __host__ __device__ void add_multipole_coeffs(Complex<T>* coeffs, int power)
-    {
-        for (int i = 0; i <= power; i++)
-        {
-            multipole_coeffs[i] += coeffs[i];
-        }
-        expansion_order = (expansion_order > power ? expansion_order : power);
-    }
-
-    __host__ __device__ void set_local_coeffs(Complex<T>* coeffs, int power)
-    {
-        for (int i = 0; i <= power; i++)
-        {
-            local_coeffs[i] = coeffs[i];
-        }
-        expansion_order = (expansion_order > power ? expansion_order : power);
-    }
-
-    __host__ __device__ void add_local_coeffs(Complex<T>* coeffs, int power)
-    {
-        for (int i = 0; i <= power; i++)
-        {
-            local_coeffs[i] += coeffs[i];
-        }
-        expansion_order = (expansion_order > power ? expansion_order : power);
-    }
-
 };
 
 
