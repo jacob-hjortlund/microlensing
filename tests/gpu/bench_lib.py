@@ -16,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
-BENCH_ROOT = Path(os.environ.get("IPM_BENCH_ROOT", "/cfs/home/jahj0154/microlensing_bench"))
+BENCH_ROOT = Path(os.environ["IPM_BENCH_ROOT"]) if os.environ.get("IPM_BENCH_ROOT") else None
 SCRATCH = Path(os.environ.get("IPM_BENCH_TMP", "/tmp/ipm_bench"))
 
 RUNGS = ["R0", "R0p", "R1a", "R1b-i", "R1b-ii", "R2", "R2p", "R3", "R4", "R5"]
@@ -25,6 +25,14 @@ RUNG_LABELS = {"R0p": "R0′", "R2p": "R2′"}
 
 def rung_label(rung):
     return RUNG_LABELS.get(rung, rung)
+
+
+def bench_path(*parts):
+    """A path under $IPM_BENCH_ROOT, the directory that holds builds/, ref/ and results/."""
+    if BENCH_ROOT is None:
+        raise SystemExit("IPM_BENCH_ROOT is not set: point it at the directory that holds builds/, ref/ and results/, "
+                         "or pass the paths as arguments")
+    return BENCH_ROOT.joinpath(*parts)
 
 
 def read_map(path):

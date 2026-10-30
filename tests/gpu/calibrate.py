@@ -131,9 +131,11 @@ def calibrate(ref_root, tol):
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ref-root", default=str(bl.BENCH_ROOT / "ref"))
-    ap.add_argument("--out", default=str(bl.BENCH_ROOT / "results" / "tolerances.json"))
+    ap.add_argument("--ref-root", help="default: $IPM_BENCH_ROOT/ref")
+    ap.add_argument("--out", help="default: $IPM_BENCH_ROOT/results/tolerances.json")
     a = ap.parse_args(argv)
+    a.ref_root = a.ref_root or str(bl.bench_path("ref"))
+    a.out = a.out or str(bl.bench_path("results", "tolerances.json"))
     tol, lines, warnings = calibrate(a.ref_root, cm.load_tolerances(a.out))
     bl.write_json(a.out, tol)
     summary = Path(a.out).with_name("tolerances_summary.md")

@@ -89,15 +89,18 @@ def shift_main(a):
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument("--build", default=str(bl.BENCH_ROOT / "builds" / "R0"))
-    ap.add_argument("--ref-root", default=str(bl.BENCH_ROOT / "ref"))
+    ap.add_argument("--build", help="default: $IPM_BENCH_ROOT/builds/R0")
+    ap.add_argument("--ref-root", help="default: $IPM_BENCH_ROOT/ref")
     ap.add_argument("--scratch", default=str(bl.SCRATCH / "ref"))
-    ap.add_argument("--results", default=str(bl.BENCH_ROOT / "results" / "R0"))
+    ap.add_argument("--results", help="default: $IPM_BENCH_ROOT/results/R0")
     ap.add_argument("--only", nargs="*", help="configuration names (default: every full and truth configuration)")
     ap.add_argument("--shift", action="store_true",
                     help="instead of the matrix, run the double regression configurations with the shifted centre into ref/<config>/shift1")
     ap.add_argument("--force", action="store_true", help="re-run even if the reference exists")
     a = ap.parse_args(argv)
+    a.build = a.build or str(bl.bench_path("builds", "R0"))
+    a.ref_root = a.ref_root or str(bl.bench_path("ref"))
+    a.results = a.results or str(bl.bench_path("results", "R0"))
     if a.shift:
         return shift_main(a)
     wanted = [cf.CONFIGS[n] for n in a.only] if a.only else cf.configs_in("full") + cf.configs_in("truth")

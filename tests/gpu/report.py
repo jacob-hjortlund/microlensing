@@ -92,10 +92,10 @@ def caption(env):
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument("--results", default=str(bl.BENCH_ROOT / "results"))
+    ap.add_argument("--results", help="default: $IPM_BENCH_ROOT/results")
     ap.add_argument("--out", required=True)
     a = ap.parse_args(argv)
-    root = Path(a.results)
+    root = Path(a.results or bl.bench_path("results"))
     inter = bl.read_json(root / "ladder_interleaved.json")
     summary, rungs = inter["summary"], inter["rungs"]
     parts = ["# IPM performance ladder: result tables", "", f"All tables: {caption(inter['env'])}.", ""]

@@ -48,10 +48,13 @@ def main(argv=None):
     ap.add_argument("--build", required=True)
     ap.add_argument("--rung", required=True)
     ap.add_argument("--repeats", type=int, default=3)
-    ap.add_argument("--ref-root", default=str(bl.BENCH_ROOT / "ref"))
-    ap.add_argument("--tolerances", default=str(bl.BENCH_ROOT / "results" / "tolerances.json"))
-    ap.add_argument("--results", default=None)
+    ap.add_argument("--ref-root", help="default: $IPM_BENCH_ROOT/ref")
+    ap.add_argument("--tolerances", help="default: $IPM_BENCH_ROOT/results/tolerances.json")
+    ap.add_argument("--results", help="default: $IPM_BENCH_ROOT/results/<rung>")
     a = ap.parse_args(argv)
+    a.ref_root = a.ref_root or str(bl.bench_path("ref"))
+    a.tolerances = a.tolerances or str(bl.bench_path("results", "tolerances.json"))
+    a.results = a.results or str(bl.bench_path("results", a.rung))
     from microlensing.IPM.ipm import IPM
     import microlensing.IPM.lib_ipm as lib_f
     import microlensing.IPM.lib_ipm_double as lib_d
@@ -105,7 +108,7 @@ def main(argv=None):
         status = "PASS" if entry["verdict"]["pass"] else "FAIL " + "; ".join(entry["verdict"]["failures"])
         print(f"{name:8s} run() median {entry['median_run_wall_s']:.2f} s, t_shoot_cells "
               f"{entry['median_t_shoot_cells']:.3f} s, {status}", flush=True)
-    bl.write_json(Path(a.results or bl.BENCH_ROOT / "results" / a.rung) / "python.json", out)
+    bl.write_json(Path(a.results) / "python.json", out)
     return 0 if out["pass"] else 1
 
 

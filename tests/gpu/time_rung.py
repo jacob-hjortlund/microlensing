@@ -50,7 +50,7 @@ def main(argv=None):
     ap.add_argument("--rung", required=True)
     ap.add_argument("--set", default="ladder", choices=["ladder", "full", "memory"])
     ap.add_argument("--repeats", type=int, default=3)
-    ap.add_argument("--ref-root", default=str(bl.BENCH_ROOT / "ref"))
+    ap.add_argument("--ref-root", help="default: $IPM_BENCH_ROOT/ref")
     ap.add_argument("--results", default=None)
     ap.add_argument("--scratch", default=None)
     ap.add_argument("--only", nargs="*")
@@ -64,7 +64,8 @@ def main(argv=None):
     if unknown or not cfgs:
         print("unknown or empty configuration selection", file=sys.stderr)
         return 2
-    results_dir = Path(a.results or bl.BENCH_ROOT / "results" / a.rung)
+    a.ref_root = a.ref_root or str(bl.bench_path("ref"))
+    results_dir = Path(a.results or bl.bench_path("results", a.rung))
     out_path = results_dir / f"timing_{a.set}.json"
     if out_path.exists() and not a.force:
         print(f"{out_path} exists; use --force to re-time")

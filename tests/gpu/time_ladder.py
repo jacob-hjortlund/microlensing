@@ -14,13 +14,16 @@ from time_rung import summarize, warm_up  # noqa: E402
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--rungs", nargs="+", default=bl.RUNGS)
-    ap.add_argument("--builds-root", default=str(bl.BENCH_ROOT / "builds"))
+    ap.add_argument("--builds-root", help="default: $IPM_BENCH_ROOT/builds")
     ap.add_argument("--repeats", type=int, default=3)
-    ap.add_argument("--ref-root", default=str(bl.BENCH_ROOT / "ref"))
-    ap.add_argument("--out", default=str(bl.BENCH_ROOT / "results" / "ladder_interleaved.json"))
+    ap.add_argument("--ref-root", help="default: $IPM_BENCH_ROOT/ref")
+    ap.add_argument("--out", help="default: $IPM_BENCH_ROOT/results/ladder_interleaved.json")
     ap.add_argument("--scratch", default=str(bl.SCRATCH / "ladder"))
     ap.add_argument("--no-warmup", action="store_true")
     a = ap.parse_args(argv)
+    a.builds_root = a.builds_root or str(bl.bench_path("builds"))
+    a.ref_root = a.ref_root or str(bl.bench_path("ref"))
+    a.out = a.out or str(bl.bench_path("results", "ladder_interleaved.json"))
     builds = {r: Path(a.builds_root) / r for r in a.rungs}
     missing = [str(b) for b in builds.values() if not (b / "ipm_gpu").exists()]
     if missing:

@@ -1349,6 +1349,12 @@ class CalibrateTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(sorted(p.name for p in (Path(d) / "results").iterdir()), ["tolerances.json", "tolerances_summary.md"])
 
+    def test_main_without_a_bench_root_asks_for_one(self):
+        with mock.patch.object(bench_lib, "BENCH_ROOT", None):
+            with self.assertRaises(SystemExit) as ctx:
+                run_quietly(calibrate.main, [])
+        self.assertIn("IPM_BENCH_ROOT is not set", str(ctx.exception))
+
     def test_parity_floor_has_a_slot_for_each_run_and_the_double_twin(self):
         with tempfile.TemporaryDirectory() as d:
             ref = f"{d}/ref"

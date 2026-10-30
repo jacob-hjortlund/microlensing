@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Out-of-tree build of the four IPM targets with the flags of ./compile plus -Xptxas -v.
 # usage: build_rung.sh <src_dir> <out_dir> [extra nvcc flags...]
-# Needs nvcc on PATH and (on this cluster) NVCC_PREPEND_FLAGS, see bench_env.sh.
+# Needs nvcc on PATH. Extra host-compiler or linker flags can be passed through NVCC_PREPEND_FLAGS.
 set -euo pipefail
 src=$(cd "$1" && pwd)
 mkdir -p "$2"
 out=$(cd "$2" && pwd)
 shift 2
 extra=("$@")
-command -v nvcc >/dev/null || { echo "nvcc not on PATH (module load cuda/12.2)" >&2; exit 1; }
+command -v nvcc >/dev/null || { echo "nvcc not on PATH" >&2; exit 1; }
 flags=(-std=c++20 -arch=compute_80 -code="sm_80,compute_80" --use_fast_math -I "$src/include" -O3 -Xptxas -v)
 # provenance first: a source that is not a git checkout fails here, before the long builds
 rev=$(git -C "$src" rev-parse HEAD)

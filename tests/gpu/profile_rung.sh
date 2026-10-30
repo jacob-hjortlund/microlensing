@@ -4,7 +4,7 @@
 set -euo pipefail
 build=$1; rung=$2; shift 2
 if [ $# -eq 0 ]; then set -- nb_f hm100_f; fi
-root=${IPM_BENCH_ROOT:-/cfs/home/jahj0154/microlensing_bench}
+root=${IPM_BENCH_ROOT:?set IPM_BENCH_ROOT to the directory that holds builds/, ref/ and results/}
 scratch=${IPM_BENCH_TMP:-/tmp/ipm_bench}/$rung/nsys
 out=$root/results/$rung/nsys
 mkdir -p "$out" "$scratch"
