@@ -257,9 +257,6 @@ private:
 
 	bool calculate_num_caustic_crossings(int verbose)
 	{
-		set_threads(threads, 16, 16);
-		set_blocks(threads, blocks, num_cols - 1, num_rows);
-
 		unsigned long long int* percentage = nullptr;
 		cudaMallocManaged(&percentage, sizeof(unsigned long long int));
 		if (cuda_error("cudaMallocManaged(*percentage)", false, __FILE__, __LINE__)) return false;
@@ -271,6 +268,8 @@ private:
 		******************************************************************************/
 		print_verbose("Calculating number of caustic crossings...\n", verbose, 1);
 		stopwatch.start();
+		threads = get_threads(find_num_caustic_crossings_kernel<T>, num_cols - 1, num_rows);
+		blocks = get_blocks(threads, num_cols - 1, num_rows);
 		find_num_caustic_crossings_kernel<T> <<<blocks, threads>>> (caustics, num_rows, num_cols, center_y, half_length_y, num_crossings, num_pixels_y, percentage, verbose);
 		if (cuda_error("find_num_caustic_crossings_kernel", true, __FILE__, __LINE__)) return false;
 		t_ncc = stopwatch.stop();
@@ -294,20 +293,19 @@ private:
 			num_pixels_y.re >>= 1;
 			num_pixels_y.im >>= 1;
 
-			set_threads(threads, 16, 16);
-			set_blocks(threads, blocks, num_pixels_y.re, num_pixels_y.im);
-
+			threads = get_threads(reduce_pix_array_kernel<T>, num_pixels_y.re, num_pixels_y.im);
+			blocks = get_blocks(threads, num_pixels_y.re, num_pixels_y.im);
 			reduce_pix_array_kernel<T> <<<blocks, threads>>> (num_crossings, num_pixels_y);
 			if (cuda_error("reduce_pix_array_kernel", true, __FILE__, __LINE__)) return false;
 
-			set_threads(threads, 512);
-			set_blocks(threads, blocks, num_pixels_y.im);
+			threads = get_threads(shift_pix_column_kernel<T>, cuda_device_prop.maxThreadsPerBlock);
+			blocks = get_blocks(threads, num_pixels_y.im);
 			for (int j = 1; j < num_pixels_y.re; j++)
 			{
 				shift_pix_column_kernel<T> <<<blocks, threads>>> (num_crossings, num_pixels_y, j);
 			}
-			set_threads(threads, 512);
-			set_blocks(threads, blocks, num_pixels_y.re);
+			threads = get_threads(shift_pix_row_kernel<T>, cuda_device_prop.maxThreadsPerBlock);
+			blocks = get_blocks(threads, num_pixels_y.re);
 			for (int j = 1; j < num_pixels_y.im; j++)
 			{
 				shift_pix_row_kernel<T> <<<blocks, threads>>> (num_crossings, num_pixels_y, j);
@@ -348,9 +346,8 @@ private:
 
 			thrust::fill(thrust::device, histogram, histogram + histogram_length, 0);
 
-			set_threads(threads, 16, 16);
-			set_blocks(threads, blocks, num_pixels_y.re, num_pixels_y.im);
-
+			threads = get_threads(histogram_kernel<T>, num_pixels_y.re, num_pixels_y.im);
+			blocks = get_blocks(threads, num_pixels_y.re, num_pixels_y.im);
 			histogram_kernel<int> <<<blocks, threads>>> (num_crossings, num_pixels_y, min_num, histogram);
 			if (cuda_error("histogram_kernel", true, __FILE__, __LINE__)) return false;
 

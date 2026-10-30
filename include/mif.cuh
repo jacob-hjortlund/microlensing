@@ -62,6 +62,7 @@ private:
 	using Microlensing<T>::num_stars;
 	using Microlensing<T>::outfile_type;
 	using Microlensing<T>::MAX_TAYLOR_SMOOTH;
+	using Microlensing<T>::cuda_device_prop;
 	using Microlensing<T>::threads;
 	using Microlensing<T>::blocks;
 	using Microlensing<T>::mean_mass;
@@ -302,8 +303,8 @@ private:
         T dt = 1;
 
         thrust::universal_vector<int> use_star(num_stars, 1);
-        set_threads(threads, 256);
-        set_blocks(threads, blocks, num_stars);
+		threads = get_threads(use_star_kernel<T>, cuda_device_prop.maxThreadsPerBlock);
+		blocks = get_blocks(threads, num_stars);
 		if (write_image_lines)
 		{
         	use_star_kernel<T> <<<blocks, threads>>> (stars, num_stars, kappa_tot, shear, w0, v, max_r, &use_star[0]);
@@ -508,12 +509,10 @@ private:
         t_elapsed = stopwatch.stop();
         print_verbose("Done copying image lines. Elapsed time: " << t_elapsed << " seconds.\n", verbose, 2);
 
-
-        set_threads(threads, 256);
-        set_blocks(threads, blocks, total_image_lines_lengths);
-
         print_verbose("Mapping image lines...\n", verbose, 2);
         stopwatch.start();
+		threads = get_threads(image_to_source_kernel<T>, cuda_device_prop.maxThreadsPerBlock);
+		blocks = get_blocks(threads, total_image_lines_lengths);
         image_to_source_kernel<T> <<<blocks, threads>>> (image_lines, total_image_lines_lengths, kappa_tot, shear, theta_star, stars, kappa_star, tree[0],
             rectangular, corner, approx, taylor_smooth, source_lines);
         if (cuda_error("image_to_source_kernel", true, __FILE__, __LINE__)) return false;
@@ -522,6 +521,8 @@ private:
 
         print_verbose("Calculating magnifications...\n", verbose, 2);
         stopwatch.start();
+		threads = get_threads(magnifications_kernel<T>, cuda_device_prop.maxThreadsPerBlock);
+		blocks = get_blocks(threads, total_image_lines_lengths);
         magnifications_kernel<T> <<<blocks, threads>>> (image_lines, total_image_lines_lengths, kappa_tot, shear, theta_star, stars, kappa_star, tree[0],
             rectangular, corner, approx, taylor_smooth, image_lines_mags);
         if (cuda_error("magnifications_kernel", true, __FILE__, __LINE__)) return false;

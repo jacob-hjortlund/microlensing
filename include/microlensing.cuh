@@ -81,6 +81,7 @@ protected:
 	cudaDeviceProp cuda_device_prop;
 	dim3 threads;
 	dim3 blocks;
+	int max_threads_xyz;
 
 	/******************************************************************************
 	derived variables
@@ -399,9 +400,6 @@ protected:
 		BEGIN populating star array
 		******************************************************************************/
 
-		set_threads(threads, 512);
-		set_blocks(threads, blocks, num_stars);
-
 		if (starfile == "")
 		{
 			print_verbose("Generating star field...\n", verbose, 1);
@@ -418,6 +416,8 @@ protected:
 			/******************************************************************************
 			generate random star field if no star file has been given
 			******************************************************************************/
+			threads = get_threads(initialize_curand_states_kernel<T>, cuda_device_prop.maxThreadsPerBlock);
+			blocks = get_blocks(threads, num_stars);
 			initialize_curand_states_kernel<T> <<<blocks, threads>>> (states, num_stars, random_seed);
 			if (cuda_error("initialize_curand_states_kernel", true, __FILE__, __LINE__)) return false;
 
@@ -427,22 +427,32 @@ protected:
 			******************************************************************************/
 			if (mass_function_str == "equal")
 			{
+				threads = get_threads(generate_star_field_kernel<T, massfunctions::Equal<T>>, cuda_device_prop.maxThreadsPerBlock);
+				blocks = get_blocks(threads, num_stars);
 				generate_star_field_kernel<T, massfunctions::Equal<T>> <<<blocks, threads>>> (states, stars, num_stars, rectangular, corner, m_lower, m_upper, m_solar);
 			}
 			else if (mass_function_str == "uniform")
 			{
+				threads = get_threads(generate_star_field_kernel<T, massfunctions::Uniform<T>>, cuda_device_prop.maxThreadsPerBlock);
+				blocks = get_blocks(threads, num_stars);
 				generate_star_field_kernel<T, massfunctions::Uniform<T>> <<<blocks, threads>>> (states, stars, num_stars, rectangular, corner, m_lower, m_upper, m_solar);
 			}
 			else if (mass_function_str == "salpeter")
 			{
+				threads = get_threads(generate_star_field_kernel<T, massfunctions::Salpeter<T>>, cuda_device_prop.maxThreadsPerBlock);
+				blocks = get_blocks(threads, num_stars);
 				generate_star_field_kernel<T, massfunctions::Salpeter<T>> <<<blocks, threads>>> (states, stars, num_stars, rectangular, corner, m_lower, m_upper, m_solar);
 			}
 			else if (mass_function_str == "kroupa")
 			{
+				threads = get_threads(generate_star_field_kernel<T, massfunctions::Kroupa<T>>, cuda_device_prop.maxThreadsPerBlock);
+				blocks = get_blocks(threads, num_stars);
 				generate_star_field_kernel<T, massfunctions::Kroupa<T>> <<<blocks, threads>>> (states, stars, num_stars, rectangular, corner, m_lower, m_upper, m_solar);
 			}
 			else if (mass_function_str == "optical_depth")
 			{
+				threads = get_threads(generate_star_field_kernel<T, massfunctions::OpticalDepth<T>>, cuda_device_prop.maxThreadsPerBlock);
+				blocks = get_blocks(threads, num_stars);
 				generate_star_field_kernel<T, massfunctions::OpticalDepth<T>> <<<blocks, threads>>> (states, stars, num_stars, rectangular, corner, m_lower, m_upper, m_solar);
 			}
 			else
@@ -557,8 +567,8 @@ protected:
 			*min_num_stars_in_level = num_stars;
 			*num_nonempty_nodes = 0;
 
-			set_threads(threads, 512);
-			set_blocks(threads, blocks, num_nodes[tree_levels]);
+			threads = get_threads(treenode::get_node_star_info_kernel<T>, cuda_device_prop.maxThreadsPerBlock);
+			blocks = get_blocks(threads, num_nodes[tree_levels]);
 			treenode::get_node_star_info_kernel<T> <<<blocks, threads>>> (tree[tree_levels], num_nodes[tree_levels],
 				num_nonempty_nodes, min_num_stars_in_level, max_num_stars_in_level);
 			if (cuda_error("get_node_star_info_kernel", true, __FILE__, __LINE__)) return false;
@@ -578,22 +588,45 @@ protected:
 
 				print_verbose("Creating children...\n", verbose, 3);
 				(*num_nonempty_nodes)--; //subtract one since value is size of array, and instead needs to be the first allocatable element
-				set_threads(threads, 512);
-				set_blocks(threads, blocks, num_nodes[tree_levels]);
+				threads = get_threads(treenode::create_children_kernel<T>, cuda_device_prop.maxThreadsPerBlock);
+				blocks = get_blocks(threads, num_nodes[tree_levels]);
 				treenode::create_children_kernel<T> <<<blocks, threads>>> (tree[tree_levels], num_nodes[tree_levels], num_nonempty_nodes, tree[tree_levels + 1]);
 				if (cuda_error("create_children_kernel", true, __FILE__, __LINE__)) return false;
 
 				print_verbose("Sorting stars...\n", verbose, 3);
-				set_threads(threads, std::ceil(1.0 * 512 / *max_num_stars_in_level), std::min(512, *max_num_stars_in_level));
-				set_blocks(threads, blocks, num_nodes[tree_levels], std::min(512, *max_num_stars_in_level));
-				treenode::sort_stars_kernel<T> <<<blocks, threads, (threads.x + threads.x + threads.x * treenode::MAX_NUM_CHILDREN) * sizeof(int)>>> (tree[tree_levels], num_nodes[tree_levels], stars, temp_stars);
+				max_threads_xyz = get_max_num_threads(
+					treenode::sort_stars_kernel<T>, 
+					cuda_device_prop.maxThreadsPerBlock * (1 + 1 + treenode::MAX_NUM_CHILDREN) * sizeof(int)
+				);
+				if (*max_num_stars_in_level >= max_threads_xyz)
+				{
+					threads.x = max_threads_xyz;
+					threads.y = 1;
+				}
+				else
+				{
+					threads.x = *max_num_stars_in_level;
+					// keep block saturated in the x dimension for stars as long as possible
+					if (threads.x * 2 >= max_threads_xyz)
+					{
+						threads.y = 1;
+					}
+					// but once there's room for the y dimension, use it
+					else
+					{
+						threads.y = max_threads_xyz / threads.x;
+					}
+				}
+				threads.z = 1;
+				blocks = get_blocks(threads, threads.x, num_nodes[tree_levels]);
+				treenode::sort_stars_kernel<T> <<<blocks, threads, threads.y * (1 + 1 + treenode::MAX_NUM_CHILDREN) * sizeof(int)>>> (tree[tree_levels], num_nodes[tree_levels], stars, temp_stars);
 				if (cuda_error("sort_stars_kernel", true, __FILE__, __LINE__)) return false;
 
 				tree_levels++;
 
 				print_verbose("Setting neighbors...\n", verbose, 3);
-				set_threads(threads, 512);
-				set_blocks(threads, blocks, num_nodes[tree_levels]);
+				threads = get_threads(treenode::set_neighbors_kernel<T>, cuda_device_prop.maxThreadsPerBlock);
+				blocks = get_blocks(threads, num_nodes[tree_levels]);
 				treenode::set_neighbors_kernel<T> <<<blocks, threads>>> (tree[tree_levels], num_nodes[tree_levels]);
 				if (cuda_error("set_neighbors_kernel", true, __FILE__, __LINE__)) return false;
 			}
@@ -637,6 +670,14 @@ protected:
 			return false;
 		}
 
+		for (int i = 0; i <= tree_levels; i++)
+		{
+			for (int j = 0; j < num_nodes[i]; j++)
+			{
+				tree[i][j].expansion_order = expansion_order;
+			}
+		}
+
 		print_verbose("Calculating binomial coefficients...\n", verbose, 3);
 		calculate_binomial_coeffs(binomial_coeffs, 2 * expansion_order);
 		print_verbose("Done calculating binomial coefficients.\n", verbose, 3);
@@ -651,13 +692,75 @@ protected:
 
 		for (int i = tree_levels; i >= 0; i--)
 		{
-			set_threads(threads, 16, expansion_order + 1);
-			set_blocks(threads, blocks, num_nodes[i], (expansion_order + 1));
-			fmm::calculate_multipole_coeffs_kernel<T> <<<blocks, threads, 16 * (expansion_order + 1) * sizeof(Complex<T>)>>> (tree[i], num_nodes[i], expansion_order, stars);
+			max_threads_xyz = get_max_num_threads(fmm::calculate_multipole_coeffs_kernel<T>);
+			if ((expansion_order + 1) >= max_threads_xyz)
+			{
+				threads.x = max_threads_xyz;
+				threads.y = 1;
+			}
+			else
+			{
+				threads.x = (expansion_order + 1);
+				// keep block saturated in the x dimension for expansion order as long as possible
+				if (threads.x * 2 >= max_threads_xyz)
+				{
+					threads.y = 1;
+				}
+				// but once there's room for the y dimension, use it
+				else
+				{
+					threads.y = max_threads_xyz / threads.x;
+				}
+			}
+			threads.z = 1;
+			blocks = get_blocks(threads, threads.x, num_nodes[i]);
+			fmm::calculate_multipole_coeffs_kernel<T> <<<blocks, threads>>> (tree[i], num_nodes[i], expansion_order, stars);
 
-			set_threads(threads, 4, expansion_order + 1, treenode::MAX_NUM_CHILDREN);
-			set_blocks(threads, blocks, num_nodes[i], (expansion_order + 1), treenode::MAX_NUM_CHILDREN);
-			fmm::calculate_M2M_coeffs_kernel<T> <<<blocks, threads, 4 * treenode::MAX_NUM_CHILDREN * (expansion_order + 1) * sizeof(Complex<T>)>>> (tree[i], num_nodes[i], expansion_order, binomial_coeffs);
+			max_threads_xyz = get_max_num_threads(
+				fmm::calculate_M2M_coeffs_kernel<T>, 
+				cuda_device_prop.maxThreadsPerBlock * sizeof(Complex<T>)
+			);
+			if ((expansion_order + 1) >= max_threads_xyz)
+			{
+				threads.x = max_threads_xyz;
+				threads.y = 1;
+				threads.z = 1;
+			}
+			else
+			{
+				threads.x = (expansion_order + 1);
+				// keep block saturated in the x dimension for expansion order as long as possible
+				if (threads.x * 2 >= max_threads_xyz)
+				{
+					threads.y = 1;
+					threads.z = 1;
+				}
+				// but once there's room for the y dimension, use it
+				else
+				{
+					int max_threads_yz = max_threads_xyz / threads.x;
+
+					if (max_threads_yz < treenode::MAX_NUM_CHILDREN)
+					{
+						threads.y = max_threads_yz;
+						threads.z = 1;
+					}
+					else
+					{
+						threads.y = treenode::MAX_NUM_CHILDREN;
+						if (threads.x * threads.y * 2 >= max_threads_xyz)
+						{
+							threads.z = 1;
+						}
+						else
+						{
+							threads.z = max_threads_xyz / (threads.x * threads.y);
+						}
+					}
+				}
+			}
+			blocks = get_blocks(threads, threads.x, threads.y, num_nodes[i]);
+			fmm::calculate_M2M_coeffs_kernel<T> <<<blocks, threads, threads.x * threads.y * threads.z * sizeof(Complex<T>)>>> (tree[i], num_nodes[i], expansion_order, binomial_coeffs);
 		}
 
 		/******************************************************************************
@@ -665,17 +768,121 @@ protected:
 		******************************************************************************/
 		for (int i = 2; i <= tree_levels; i++)
 		{
-			set_threads(threads, 16, expansion_order + 1);
-			set_blocks(threads, blocks, num_nodes[i], (expansion_order + 1));
-			fmm::calculate_L2L_coeffs_kernel<T> <<<blocks, threads, 16 * (expansion_order + 1) * sizeof(Complex<T>)>>> (tree[i], num_nodes[i], expansion_order, binomial_coeffs);
+			max_threads_xyz = get_max_num_threads(fmm::calculate_L2L_coeffs_kernel<T>);
+			if ((expansion_order + 1) >= max_threads_xyz)
+			{
+				threads.x = max_threads_xyz;
+				threads.y = 1;
+			}
+			else
+			{
+				threads.x = (expansion_order + 1);
+				// keep block saturated in the x dimension for expansion order as long as possible
+				if (threads.x * 2 >= max_threads_xyz)
+				{
+					threads.y = 1;
+				}
+				// but once there's room for the y dimension, use it
+				else
+				{
+					threads.y = max_threads_xyz / threads.x;
+				}
+			}
+			threads.z = 1;
+			blocks = get_blocks(threads, threads.x, num_nodes[i]);
+			fmm::calculate_L2L_coeffs_kernel<T> <<<blocks, threads>>> (tree[i], num_nodes[i], expansion_order, binomial_coeffs);
 
-			set_threads(threads, 1, expansion_order + 1, treenode::MAX_NUM_SAME_LEVEL_INTERACTION_LIST);
-			set_blocks(threads, blocks, num_nodes[i], (expansion_order + 1), treenode::MAX_NUM_SAME_LEVEL_INTERACTION_LIST);
-			fmm::calculate_M2L_coeffs_kernel<T> <<<blocks, threads, 1 * treenode::MAX_NUM_SAME_LEVEL_INTERACTION_LIST * (expansion_order + 1) * sizeof(Complex<T>)>>> (tree[i], num_nodes[i], expansion_order, binomial_coeffs);
+			max_threads_xyz = get_max_num_threads(
+				fmm::calculate_M2L_coeffs_kernel<T>, 
+				cuda_device_prop.maxThreadsPerBlock * sizeof(Complex<T>)
+			);
+			if ((expansion_order + 1) >= max_threads_xyz)
+			{
+				threads.x = max_threads_xyz;
+				threads.y = 1;
+				threads.z = 1;
+			}
+			else
+			{
+				threads.x = (expansion_order + 1);
+				// keep block saturated in the x dimension for expansion order as long as possible
+				if (threads.x * 2 >= max_threads_xyz)
+				{
+					threads.y = 1;
+					threads.z = 1;
+				}
+				// but once there's room for the y dimension, use it
+				else
+				{
+					int max_threads_yz = max_threads_xyz / threads.x;
 
-			set_threads(threads, 4, expansion_order + 1, treenode::MAX_NUM_DIFFERENT_LEVEL_INTERACTION_LIST);
-			set_blocks(threads, blocks, num_nodes[i], (expansion_order + 1), treenode::MAX_NUM_DIFFERENT_LEVEL_INTERACTION_LIST);
-			fmm::calculate_P2L_coeffs_kernel<T> <<<blocks, threads, 4 * treenode::MAX_NUM_DIFFERENT_LEVEL_INTERACTION_LIST * (expansion_order + 1) * sizeof(Complex<T>)>>> (tree[i], num_nodes[i], expansion_order, binomial_coeffs, stars);
+					if (max_threads_yz < treenode::MAX_NUM_SAME_LEVEL_INTERACTION_LIST)
+					{
+						threads.y = max_threads_yz;
+						threads.z = 1;
+					}
+					else
+					{
+						threads.y = treenode::MAX_NUM_SAME_LEVEL_INTERACTION_LIST;
+						if (threads.x * threads.y * 2 >= max_threads_xyz)
+						{
+							threads.z = 1;
+						}
+						else
+						{
+							threads.z = max_threads_xyz / (threads.x * threads.y);
+						}
+					}
+				}
+			}
+			blocks = get_blocks(threads, threads.x, threads.y, num_nodes[i]);
+			fmm::calculate_M2L_coeffs_kernel<T> <<<blocks, threads, threads.x * threads.y * threads.z * sizeof(Complex<T>)>>> (tree[i], num_nodes[i], expansion_order, binomial_coeffs);
+
+			max_threads_xyz = get_max_num_threads(
+				fmm::calculate_P2L_coeffs_kernel<T>, 
+				cuda_device_prop.maxThreadsPerBlock * sizeof(Complex<T>)
+			);
+			if ((expansion_order + 1) >= max_threads_xyz)
+			{
+				threads.x = max_threads_xyz;
+				threads.y = 1;
+				threads.z = 1;
+			}
+			else
+			{
+				threads.x = (expansion_order + 1);
+				// keep block saturated in the x dimension for expansion order as long as possible
+				if (threads.x * 2 >= max_threads_xyz)
+				{
+					threads.y = 1;
+					threads.z = 1;
+				}
+				// but once there's room for the y dimension, use it
+				else
+				{
+					int max_threads_yz = max_threads_xyz / threads.x;
+
+					if (max_threads_yz < treenode::MAX_NUM_DIFFERENT_LEVEL_INTERACTION_LIST)
+					{
+						threads.y = max_threads_yz;
+						threads.z = 1;
+					}
+					else
+					{
+						threads.y = treenode::MAX_NUM_DIFFERENT_LEVEL_INTERACTION_LIST;
+						if (threads.x * threads.y * 2 >= max_threads_xyz)
+						{
+							threads.z = 1;
+						}
+						else
+						{
+							threads.z = max_threads_xyz / (threads.x * threads.y);
+						}
+					}
+				}
+			}
+			blocks = get_blocks(threads, threads.x, threads.y, num_nodes[i]);
+			fmm::calculate_P2L_coeffs_kernel<T> <<<blocks, threads, threads.x * threads.y * threads.z * sizeof(Complex<T>)>>> (tree[i], num_nodes[i], expansion_order, binomial_coeffs, stars);
 		}
 		if (cuda_error("calculate_coeffs_kernels", true, __FILE__, __LINE__)) return false;
 
