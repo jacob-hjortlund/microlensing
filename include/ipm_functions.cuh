@@ -93,7 +93,7 @@ __global__ void shoot_cells_kernel(T kappa, T gamma, T theta, star<T>* stars, T 
 				y[a].im = npixels.im - y[a].im;
 			}
 
-			Polygon<T> y_poly;
+			polygon::Polygon<T> y_poly;
 
 			T image_plane_area = 2 * ray_half_sep.re * ray_half_sep.im * npixels.re * npixels.im / (2 * hly.re * 2 * hly.im);
 

@@ -184,82 +184,138 @@ bool cuda_error(const char* name, bool sync, const char* file, const int line)
 }
 
 /******************************************************************************
-set the number of threads per block for the kernel
+get the maximum number of threads allowed per block for a kernel
 
-\param threads -- reference to threads
-\param x -- number of threads per block in x dimension
-\param y -- number of threads per block in y dimension
-\param z -- number of threads per block in z dimension
+\param kernel -- kernel we want the maximum number of threads for
+\param shared_mem -- shared memory used during the kernel launch
+
+\return num_threads
 ******************************************************************************/
-void set_threads(dim3& threads, int x = 1, int y = 1, int z = 1)
+template <typename T>
+int get_max_num_threads(T kernel, int shared_mem = 0)
 {
-	cudaDeviceProp prop;
-	int device;
-	cudaGetDevice(&device);
-	cudaGetDeviceProperties(&prop, device);
+	int ideal_grid_size;
+	int ideal_block_size;
 
-	threads.x = x;
-	threads.y = y;
-	threads.z = z;
-
-	if (threads.x * threads.y * threads.z > prop.maxThreadsPerBlock)
-	{
-		int t_x;
-		int t_y;
-		int t_z;
-		do
-		{
-			t_x = threads.x;
-			t_y = threads.y;
-			t_z = threads.z;
-
-			double factor = std::cbrt((1.0 * prop.maxThreadsPerBlock) / (t_x * t_y * t_z));
-
-			threads.x = std::ceil(factor * t_x);
-			threads.y = std::ceil(factor * t_y);
-			threads.z = std::ceil(factor * t_z);
-		} while (threads.x != t_x || threads.y != t_y || threads.z != t_z);
-	}
+	cudaOccupancyMaxPotentialBlockSize(&ideal_grid_size, &ideal_block_size, kernel, shared_mem);
+	return ideal_block_size;
 }
 
 /******************************************************************************
-set the number of blocks for the kernel
+get the number of threads per block for the kernel
 
-\param threads -- reference to threads
-\param blocks -- reference to blocks
+\param kernel -- kernel whose maximum number of allowed threads limits the
+                 desired number
+\param x -- desired number of threads per block in x dimension
+\param y -- desired number of threads per block in y dimension
+\param z -- desired number of threads per block in z dimension
+\param shared_mem -- shared memory used during the kernel launch
+
+\return threads
+******************************************************************************/
+template <typename T>
+dim3 get_threads(T kernel, int x = 1, int y = 1, int z = 1, int shared_mem = 0)
+{
+	int max_num_threads = get_max_num_threads(kernel, shared_mem);
+
+	dim3 threads(x, y, z);
+
+	if (threads.x * threads.y * threads.z > max_num_threads)
+	{
+		double factor = std::cbrt((1.0 * max_num_threads) / (threads.x * threads.y * threads.z));
+
+		threads.x = std::ceil(factor * threads.x);
+		threads.y = std::ceil(factor * threads.y);
+		threads.z = std::ceil(factor * threads.z);
+
+		while (threads.x * threads.y * threads.z > max_num_threads)
+		{
+			// A distinct maximum
+			if (threads.x > threads.y && threads.x > threads.z)
+			{
+				threads.x -= 1;
+			}
+			else if (threads.y > threads.x && threads.y > threads.z)
+			{
+				threads.y -= 1;
+			}
+			else if (threads.z > threads.x && threads.z > threads.y)
+			{
+				threads.z -= 1;
+			}
+			// A tied maximum
+			else if (threads.z == threads.y || threads.z == threads.x)
+			{
+				threads.z -= 1;
+			}
+			else if (threads.x == threads.y)
+			{
+				threads.y -= 1;
+			}
+		}
+	}
+
+	return threads;
+}
+
+/******************************************************************************
+get the number of blocks for the provided threads per block and total number of
+threads
+
+\param threads -- threads per block
 \param x -- number of total threads in x dimension
 \param y -- number of total threads in y dimension
 \param z -- number of total threads in z dimension
 ******************************************************************************/
-void set_blocks(dim3& threads, dim3& blocks, int x = 1, int y = 1, int z = 1)
+dim3 get_blocks(dim3 threads, int x = 1, int y = 1, int z = 1)
 {
-	cudaDeviceProp prop;
 	int device;
 	cudaGetDevice(&device);
+	cudaDeviceProp prop;
 	cudaGetDeviceProperties(&prop, device);
 
-	blocks.x = (x - 1) / threads.x + 1;
-	blocks.y = (y - 1) / threads.y + 1;
-	blocks.z = (z - 1) / threads.z + 1;
+	dim3 blocks(
+		(x - 1) / threads.x + 1,
+		(y - 1) / threads.y + 1,
+		(z - 1) / threads.z + 1
+	);
 
 	if (blocks.x * blocks.y * blocks.z > prop.multiProcessorCount)
 	{
-		int b_x;
-		int b_y;
-		int b_z;
-		do
+		double factor = std::cbrt((1.0 * prop.multiProcessorCount) / (blocks.x * blocks.y * blocks.z));
+
+		blocks.x = std::ceil(factor * blocks.x);
+		blocks.y = std::ceil(factor * blocks.y);
+		blocks.z = std::ceil(factor * blocks.z);
+
+		while (blocks.x * blocks.y * blocks.z > prop.multiProcessorCount)
 		{
-			b_x = blocks.x;
-			b_y = blocks.y;
-			b_z = blocks.z;
-
-			double factor = std::cbrt((1.0 * prop.multiProcessorCount) / (b_x * b_y * b_z));
-
-			blocks.x = std::ceil(factor * b_x);
-			blocks.y = std::ceil(factor * b_y);
-			blocks.z = std::ceil(factor * b_z);
-		} while (blocks.x != b_x || blocks.y != b_y || blocks.z != b_z);
+			// A distinct maximum
+			if (blocks.x > blocks.y && blocks.x > blocks.z)
+			{
+				blocks.x -= 1;
+			}
+			else if (blocks.y > blocks.x && blocks.y > blocks.z)
+			{
+				blocks.y -= 1;
+			}
+			else if (blocks.z > blocks.x && blocks.z > blocks.y)
+			{
+				blocks.z -= 1;
+			}
+			// A tied maximum
+			else if (blocks.z == blocks.y || blocks.z == blocks.x)
+			{
+				blocks.z -= 1;
+			}
+			else if (blocks.x == blocks.y)
+			{
+				blocks.y -= 1;
+			}
+		}
 	}
+
+	return blocks;
 }
 
 /******************************************************************************
@@ -270,14 +326,21 @@ display info about a cuda device
 ******************************************************************************/
 void show_device_info(int num, cudaDeviceProp& prop)
 {
+	int clock_rate = 0;
+	cudaDeviceGetAttribute(&clock_rate, cudaDevAttrClockRate, num);
+	int memory_clock_rate = 0;
+	cudaDeviceGetAttribute(&memory_clock_rate, cudaDevAttrMemoryClockRate, num);
+	int perf_ratio = 0;
+	cudaDeviceGetAttribute(&perf_ratio, cudaDevAttrSingleToDoublePrecisionPerfRatio, num);
+
 	std::cout << "Device Number: " << num << "\n";
 	std::cout << "  Device name: " << prop.name << "\n";
 	std::cout << "  Compute capability (major.minor): " << prop.major << "." << prop.minor << "\n";
-	std::cout << "  Clock rate (kHz): " << prop.clockRate << "\n";
-	std::cout << "  Memory clock rate (kHz): " << prop.memoryClockRate << "\n";
+	std::cout << "  Clock rate (kHz): " << clock_rate << "\n";
+	std::cout << "  Memory clock rate (kHz): " << memory_clock_rate << "\n";
 	std::cout << "  Memory bus width (bits): " << prop.memoryBusWidth << "\n";
-	std::cout << "  Peak memory bandwidth (GB/s): " << 2 * prop.memoryClockRate * (prop.memoryBusWidth / 8) / (1024 * 1024) << "\n";
-	std::cout << "  Single to double precision performance ratio: " << prop.singleToDoublePrecisionPerfRatio << "\n";
+	std::cout << "  Peak memory bandwidth (GB/s): " << 2 * memory_clock_rate * (prop.memoryBusWidth / 8) / (1024 * 1024) << "\n";
+	std::cout << "  Single to double precision performance ratio: " << perf_ratio << "\n";
 	std::cout << "  Total global memory (GB): " << prop.totalGlobalMem / (1024 * 1024 * 1024) << "\n";
 	std::cout << "  Shared memory per multiprocessor (kbytes): " << prop.sharedMemPerMultiprocessor / 1024 << "\n";
 	std::cout << "  Shared memory per block (kbytes): " << prop.sharedMemPerBlock / 1024 << "\n";

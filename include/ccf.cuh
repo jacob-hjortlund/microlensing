@@ -56,6 +56,7 @@ private:
 	//must include microlensing variables to put them into scope since class is a template
 	using Microlensing<T>::outfile_type;
 	using Microlensing<T>::MAX_TAYLOR_SMOOTH;
+	using Microlensing<T>::cuda_device_prop;
 	using Microlensing<T>::threads;
 	using Microlensing<T>::blocks;
 	using Microlensing<T>::mean_mass;
@@ -392,9 +393,6 @@ private:
 		******************************************************************************/
 		int num_iters = 30;
 
-		set_threads(threads, 256);
-		set_blocks(threads, blocks, num_roots, 2, num_branches);
-
 		/******************************************************************************
 		begin finding initial roots and calculate time taken in seconds
 		******************************************************************************/
@@ -407,6 +405,8 @@ private:
 		ideally, the number of loop iterations is enough to ensure that all roots are
 		found to the desired accuracy
 		******************************************************************************/
+		threads = get_threads(find_critical_curve_roots_kernel<T>, cuda_device_prop.maxThreadsPerBlock);
+		blocks = get_blocks(threads, num_roots, 2, num_branches);
 		for (int i = 0; i < num_iters; i++)
 		{
 			/******************************************************************************
@@ -430,14 +430,15 @@ private:
 		/******************************************************************************
 		calculate errors in 1/mu for initial roots
 		******************************************************************************/
-		set_threads(threads, 512);
-		set_blocks(threads, blocks, (num_phi + num_branches) * num_roots);
-
 		print_verbose("Calculating maximum error in 1/mu...\n", verbose, 3);
+		threads = get_threads(find_errors_kernel<T>, cuda_device_prop.maxThreadsPerBlock);
+		blocks = get_blocks(threads, (num_phi + num_branches) * num_roots);
 		find_errors_kernel<T> <<<blocks, threads>>> (ccs_init, num_roots, kappa_tot, shear, theta_star, stars, kappa_star, tree[0],
 			rectangular, corner, approx, taylor_smooth, 0, num_phi, num_branches, errs);
 		if (cuda_error("find_errors_kernel", false, __FILE__, __LINE__)) return false;
 
+		threads = get_threads(has_nan_err_kernel<T>, cuda_device_prop.maxThreadsPerBlock);
+		blocks = get_blocks(threads, (num_phi + num_branches) * num_roots);
 		has_nan_err_kernel<T> <<<blocks, threads>>> (errs, (num_phi + num_branches) * num_roots, has_nan);
 		if (cuda_error("has_nan_err_kernel", true, __FILE__, __LINE__)) return false;
 
@@ -465,9 +466,6 @@ private:
 		******************************************************************************/
 		int num_iters = 20;
 
-		set_threads(threads, 256);
-		set_blocks(threads, blocks, num_roots, 2, num_branches);
-
 		/******************************************************************************
 		begin finding critical curves and calculate time taken in seconds
 		******************************************************************************/
@@ -485,12 +483,16 @@ private:
 			set critical curve array elements to be equal to last roots
 			fin array is reused each time
 			******************************************************************************/
+			threads = get_threads(prepare_roots_kernel<T>, cuda_device_prop.maxThreadsPerBlock);
+			blocks = get_blocks(threads, num_roots, 2, num_branches);
 			prepare_roots_kernel<T> <<<blocks, threads>>> (ccs_init, num_roots, j, num_phi, num_branches, fin);
 			if (cuda_error("prepare_roots_kernel", false, __FILE__, __LINE__)) return false;
 
 			/******************************************************************************
 			calculate roots for current values of j
 			******************************************************************************/
+			threads = get_threads(find_critical_curve_roots_kernel<T>, cuda_device_prop.maxThreadsPerBlock);
+			blocks = get_blocks(threads, num_roots, 2, num_branches);
 			for (int i = 0; i < num_iters; i++)
 			{
 				find_critical_curve_roots_kernel<T> <<<blocks, threads>>> (kappa_tot, shear, theta_star, stars, kappa_star, tree[0],
@@ -525,11 +527,9 @@ private:
 		/******************************************************************************
 		find max error in 1/mu over whole critical curve array and print
 		******************************************************************************/
-		set_threads(threads, 512);
-		set_blocks(threads, blocks, (num_phi + num_branches) * num_roots);
-
 		print_verbose("Finding maximum error in 1/mu over all calculated critical curve positions...\n", verbose, 3);
-
+		threads = get_threads(find_errors_kernel<T>, cuda_device_prop.maxThreadsPerBlock);
+		blocks = get_blocks(threads, (num_phi + num_branches) * num_roots);
 		for (int j = 0; j <= num_phi / (2 * num_branches); j++)
 		{
 			find_errors_kernel<T> <<<blocks, threads>>> (ccs_init, num_roots, kappa_tot, shear, theta_star, stars, kappa_star, tree[0],
@@ -537,6 +537,8 @@ private:
 			if (cuda_error("find_errors_kernel", false, __FILE__, __LINE__)) return false;
 		}
 
+		threads = get_threads(has_nan_err_kernel<T>, cuda_device_prop.maxThreadsPerBlock);
+		blocks = get_blocks(threads, (num_phi + num_branches) * num_roots);
 		has_nan_err_kernel<T> <<<blocks, threads>>> (errs, (num_phi + num_branches) * num_roots, has_nan);
 		if (cuda_error("has_nan_err_kernel", true, __FILE__, __LINE__)) return false;
 
@@ -549,12 +551,10 @@ private:
 		max_error = *thrust::max_element(thrust::device, errs, errs + (num_phi + num_branches) * num_roots);
 		print_verbose("Maximum error in 1/mu: " << max_error << "\n", verbose, 1);
 
-
-		set_threads(threads, 512);
-		set_blocks(threads, blocks, num_roots * (num_phi + num_branches));
-
 		print_verbose("Transposing critical curve array...\n", verbose, 3);
 		stopwatch.start();
+		threads = get_threads(transpose_array_kernel<T>, cuda_device_prop.maxThreadsPerBlock);
+		blocks = get_blocks(threads, (num_phi + num_branches) * num_roots);
 		transpose_array_kernel<Complex<T>> <<<blocks, threads>>> (ccs_init, (num_phi + num_branches), num_roots, ccs);
 		if (cuda_error("transpose_array_kernel", true, __FILE__, __LINE__)) return false;
 		t_elapsed = stopwatch.stop();
@@ -565,11 +565,10 @@ private:
 
 	bool find_caustics(int verbose)
 	{
-		set_threads(threads, 256);
-		set_blocks(threads, blocks, num_roots * (num_phi + num_branches));
-
 		print_verbose("Finding caustic positions...\n", verbose, 2);
 		stopwatch.start();
+		threads = get_threads(find_caustics_kernel<T>, cuda_device_prop.maxThreadsPerBlock);
+		blocks = get_blocks(threads, (num_phi + num_branches) * num_roots);
 		find_caustics_kernel<T> <<<blocks, threads>>> (ccs, (num_phi + num_branches) * num_roots, kappa_tot, shear, theta_star, stars, kappa_star, tree[0],
 			rectangular, corner, approx, taylor_smooth, caustics);
 		if (cuda_error("find_caustics_kernel", true, __FILE__, __LINE__)) return false;
@@ -583,11 +582,10 @@ private:
 	{
 		if (write_mu_length_scales)
 		{
-			set_threads(threads, 256);
-			set_blocks(threads, blocks, num_roots * (num_phi + num_branches));
-
 			print_verbose("Finding magnification length scales...\n", verbose, 2);
 			stopwatch.start();
+			threads = get_threads(find_mu_length_scales_kernel<T>, cuda_device_prop.maxThreadsPerBlock);
+			blocks = get_blocks(threads, (num_phi + num_branches) * num_roots);
 			find_mu_length_scales_kernel<T> <<<blocks, threads>>> (ccs, (num_phi + num_branches) * num_roots, kappa_tot, shear, theta_star, stars, kappa_star, tree[0],
 				rectangular, corner, approx, taylor_smooth, mu_length_scales);
 			if (cuda_error("find_mu_length_scales_kernel", true, __FILE__, __LINE__)) return false;

@@ -412,9 +412,6 @@ private:
 
 	bool shoot_cells(int verbose)
 	{
-		set_threads(threads, 16, 16);
-		set_blocks(threads, blocks, num_ray_threads.re, num_ray_threads.im);
-
 		unsigned long long int* percentage = nullptr;
 		cudaMallocManaged(&percentage, sizeof(unsigned long long int));
 		if (cuda_error("cudaMallocManaged(*percentage)", false, __FILE__, __LINE__)) return false;
@@ -426,6 +423,8 @@ private:
 		******************************************************************************/
 		print_verbose("Shooting cells...\n", verbose, 1);
 		stopwatch.start();
+		threads = get_threads(shoot_cells_kernel<T>, num_ray_threads.re, num_ray_threads.im);
+		blocks = get_blocks(threads, num_ray_threads.re, num_ray_threads.im);
 		shoot_cells_kernel<T> <<<blocks, threads>>> (kappa_tot, shear, theta_star, stars, kappa_star, tree[0],
 			rectangular, corner, approx, taylor_smooth, ray_half_sep, num_ray_threads, center_x, half_length_x,
 			center_y, half_length_y, pixels_minima, pixels_saddles, pixels, num_pixels_y, percentage, verbose);
@@ -534,9 +533,8 @@ private:
 			}
 
 
-			set_threads(threads, 16, 16);
-			set_blocks(threads, blocks, num_pixels_y.re, num_pixels_y.im);
-
+			threads = get_threads(histogram_kernel<T>, num_pixels_y.re, num_pixels_y.im);
+			blocks = get_blocks(threads, num_pixels_y.re, num_pixels_y.im);
 			histogram_kernel<T> <<<blocks, threads>>> (pixels, num_pixels_y, min_mag, histogram, factor);
 			if (cuda_error("histogram_kernel", true, __FILE__, __LINE__)) return false;
 			if (write_parities)
@@ -588,9 +586,8 @@ private:
 			}
 
 
-			set_threads(threads, 16, 16);
-			set_blocks(threads, blocks, num_pixels_y.re, num_pixels_y.im);
-
+			threads = get_threads(log_histogram_kernel<T>, num_pixels_y.re, num_pixels_y.im);
+			blocks = get_blocks(threads, num_pixels_y.re, num_pixels_y.im);
 			log_histogram_kernel<T> <<<blocks, threads>>> (pixels, num_pixels_y, min_log_mag, log_histogram, factor);
 			if (cuda_error("log_histogram_kernel", true, __FILE__, __LINE__)) return false;
 			if (write_parities)
