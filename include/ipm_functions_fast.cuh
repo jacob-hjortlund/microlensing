@@ -289,7 +289,8 @@ namespace ipm_fast
 
 		const int tiles_x = (num_ray_threads.re + TILE - 1) / TILE;
 		const int tiles_y = (num_ray_threads.im + TILE - 1) / TILE;
-		const int num_tiles = tiles_x * tiles_y;
+		//64 bit: a large shooting region at a high ray density has more than 2^31 tiles
+		const long long num_tiles = 1LL * tiles_x * tiles_y;
 		const int tid = threadIdx.y * TILE + threadIdx.x;
 
 		const T theta2 = theta * theta;
@@ -303,10 +304,10 @@ namespace ipm_fast
 		const P factor = static_cast<P>(image_plane_area);
 		const bool parities = (pixmin != nullptr && pixsad != nullptr);
 
-		for (int tile = blockIdx.x; tile < num_tiles; tile += gridDim.x)
+		for (long long tile = blockIdx.x; tile < num_tiles; tile += gridDim.x)
 		{
-			const int i0 = (tile % tiles_x) * TILE;
-			const int j0 = (tile / tiles_x) * TILE;
+			const int i0 = static_cast<int>(tile % tiles_x) * TILE;
+			const int j0 = static_cast<int>(tile / tiles_x) * TILE;
 
 			/******************************************************************************
 			leaf of the tile centre
@@ -450,7 +451,8 @@ namespace ipm_fast
 			if (tid == 0)
 			{
 				unsigned long long int p = atomicAdd(percentage, 1);
-				if (p * 100 / num_tiles > (p - 1) * 100 / num_tiles)
+				const unsigned long long int n = num_tiles;
+				if (p * 100 / n > (p - 1) * 100 / n)
 				{
 					print_progress(verbose, p, num_tiles);
 				}
