@@ -3,6 +3,7 @@ from . import lib_ipm_double
 from microlensing.Stars.stars import Stars
 
 import ctypes
+import inspect
 import numpy as np
 import matplotlib.axes
 
@@ -58,47 +59,62 @@ class IPM(object):
         self.obj = self.lib.IPM_init()
         self.verbose = verbose
 
-        self.kappa_tot = kappa_tot
-        self.shear = shear
+        self._host_only = False
 
-        if starfile is None:
-            if smooth_fraction is not None and kappa_star is None:
-                self.kappa_star = (1 - smooth_fraction) * self.kappa_tot
-            self.kappa_star = kappa_star
-            self.theta_star = theta_star
-            self.mass_function = mass_function
-            self.m_solar = m_solar
-            self.m_lower = m_lower
-            self.m_upper = m_upper
+        self._apply_inputs(**{name: value for name, value in locals().items() if name in _INPUT_NAMES})
+
+    def _apply_inputs(self, **inputs) -> None:
+        '''
+        Set the inputs on the underlying object. Takes the parameters of __init__ except verbose and is_double, as
+        keyword arguments; those not given take __init__'s defaults
+        '''
+        unknown = [name for name in inputs if name not in _INPUT_NAMES]
+        if unknown:
+            raise TypeError(f"unknown IPM input {unknown[0]!r}")
+        value = {**_INPUT_DEFAULTS, **inputs}
+
+        self.kappa_tot = value["kappa_tot"]
+        self.shear = value["shear"]
+
+        if value["starfile"] is None:
+            if value["smooth_fraction"] is not None and value["kappa_star"] is None:
+                self.kappa_star = (1 - value["smooth_fraction"]) * self.kappa_tot
+            self.kappa_star = value["kappa_star"]
+            self.theta_star = value["theta_star"]
+            self.mass_function = value["mass_function"]
+            self.m_solar = value["m_solar"]
+            self.m_lower = value["m_lower"]
+            self.m_upper = value["m_upper"]
             if self.m_lower > self.m_upper:
                 raise ValueError("m_lower must be <= m_upper")
-            self.rectangular = rectangular
-            self.random_seed = random_seed
+            self.rectangular = value["rectangular"]
+            self.random_seed = value["random_seed"]
 
-        self.light_loss = light_loss
-        self.approx = approx
-        self.safety_scale = safety_scale
+        self.light_loss = value["light_loss"]
+        self.approx = value["approx"]
+        self.safety_scale = value["safety_scale"]
         
-        self.starfile = starfile
+        self.starfile = value["starfile"]
         
-        self.center_y1 = center_y1
-        self.center_y2 = center_y2
-        self.half_length_y1 = half_length_y1
-        self.half_length_y2 = half_length_y2
-        self.num_pixels_y1 = num_pixels_y1
-        self.num_pixels_y2 = num_pixels_y2
+        self.center_y1 = value["center_y1"]
+        self.center_y2 = value["center_y2"]
+        self.half_length_y1 = value["half_length_y1"]
+        self.half_length_y2 = value["half_length_y2"]
+        self.num_pixels_y1 = value["num_pixels_y1"]
+        self.num_pixels_y2 = value["num_pixels_y2"]
         
-        self.num_rays_y = num_rays_y
+        self.num_rays_y = value["num_rays_y"]
             
-        self.write_stars = write_stars
-        self.write_maps = write_maps
-        self.write_parities = write_parities
-        self.write_histograms = write_histograms
+        self.write_stars = value["write_stars"]
+        self.write_maps = value["write_maps"]
+        self.write_parities = value["write_parities"]
+        self.write_histograms = value["write_histograms"]
         
-        self.outfile_prefix = outfile_prefix
+        self.outfile_prefix = value["outfile_prefix"]
 
     def __del__(self):
-        self.lib.IPM_delete(self.obj)
+        if hasattr(self, "obj"):   # an __init__ that failed early (an unknown argument, say) made no object
+            self.lib.IPM_delete(self.obj)
         
     @property
     def kappa_tot(self):
@@ -415,17 +431,25 @@ class IPM(object):
         if not self.lib.run(self.obj, self.verbose):
             raise Exception("Error running IPM")
 
+        self._copy_maps(self.obj)
+        self._set_stars()
+        self._host_only = False
+
+    def _copy_maps(self, src_obj) -> None:
+        '''
+        Fill the magnification maps (and the parity maps, or None) from the object src_obj of this library
+        '''
         shape = (self.num_pixels_y2, self.num_pixels_y1)
         if getattr(self.lib, "copy_pixels", None) is None:
             # a library without the copy exports (such as the precompiled ones in microlensing/lib/): copy the host map that get_pixels returns
             def get_map(get_pixels):
-                return np.ctypeslib.as_array(get_pixels(self.obj), shape=shape).copy()
+                return np.ctypeslib.as_array(get_pixels(src_obj), shape=shape).copy()
             exports = (self.lib.get_pixels, self.lib.get_pixels_minima, self.lib.get_pixels_saddles)
         else:
             # copy each map from the device straight into a new array
             def get_map(copy_pixels):
                 arr = np.empty(shape, dtype=self._map_dtype)
-                if not copy_pixels(self.obj, arr.ctypes.data_as(ctypes.POINTER(self._map_ctype))):
+                if not copy_pixels(src_obj, arr.ctypes.data_as(ctypes.POINTER(self._map_ctype))):
                     raise Exception("Error copying magnification map")
                 return arr
             exports = (self.lib.copy_pixels, self.lib.copy_pixels_minima, self.lib.copy_pixels_saddles)
@@ -438,10 +462,34 @@ class IPM(object):
             self.magnifications_minima = None
             self.magnifications_saddles = None
 
+    def _set_stars(self) -> None:
         self.stars = Stars(np.ctypeslib.as_array(self.lib.get_stars(self.obj),
                                                  shape=(self.num_stars, 3)).copy(),
                            self.rectangular, self.corner, self.theta_star)
         
+
+    @classmethod
+    def _from_worker(cls, worker: "IPM", maps: bool = True) -> "IPM":
+        '''
+        Make an IPM object holding numpy maps and stars, and no GPU memory, from a snapshot of a worker that has run
+        (with maps=False the maps are not copied and are None, and save() works only with write_maps=False)
+        '''
+        snapshot = worker.lib.IPM_snapshot(worker.obj)
+        if not snapshot:
+            raise Exception("Error copying the IPM state")
+        res = cls.__new__(cls)
+        res.lib = worker.lib
+        res._map_ctype, res._map_dtype = worker._map_ctype, worker._map_dtype
+        res.verbose = worker.verbose
+        res.obj = snapshot
+        res._host_only = True
+        if maps:
+            res._copy_maps(worker.obj)
+        else:
+            res.magnifications = res.magnifications_minima = res.magnifications_saddles = None
+        res._set_stars()
+        return res
+
     @property
     def t_shoot_cells(self):
         return self.lib.get_t_shoot_cells(self.obj)
@@ -470,7 +518,28 @@ class IPM(object):
                           (self.center[1] + self.half_length[1])]])
     
     def save(self):
-        if not self.lib.save(self.obj, self.verbose):
+        '''
+        Write the files that the write_* flags select. A result of a batch has no map on the GPU: it writes its arrays
+        magnifications, magnifications_minima and magnifications_saddles as they are now, so changes made to them in
+        place are written too
+        '''
+        if self._host_only:
+            shape = (self.num_pixels_y2, self.num_pixels_y1)
+            ptr_t = ctypes.POINTER(self._map_ctype)
+
+            def data_ptr(arr):
+                if arr is None:
+                    return None
+                if (not isinstance(arr, np.ndarray) or arr.dtype != self._map_dtype or arr.shape != shape
+                        or not arr.flags['C_CONTIGUOUS']):
+                    raise ValueError(f"maps must be C-contiguous numpy arrays of dtype {np.dtype(self._map_dtype)} and shape {shape}")
+                return arr.ctypes.data_as(ptr_t)
+
+            ok = self.lib.save_host(self.obj, data_ptr(self.magnifications), data_ptr(self.magnifications_minima),
+                                    data_ptr(self.magnifications_saddles), self.verbose)
+        else:
+            ok = self.lib.save(self.obj, self.verbose)
+        if not ok:
             raise Exception("Error saving IPM")
 
     def plot(self, ax: matplotlib.axes.Axes, cmap='viridis', plot_magnitudes=False, parity=None, **kwargs):
@@ -574,3 +643,9 @@ class IPM(object):
             else:
                 ax.set_xlabel('$\\log(\\mu_\\text{microsaddles})$')
                 ax.set_ylabel('p($\\log(\\mu_\\text{microsaddles})$)')
+
+
+# the inputs of IPM() and their defaults, listed once: the parameters of IPM.__init__ but verbose and is_double
+_INPUT_DEFAULTS = {name: p.default for name, p in inspect.signature(IPM.__init__).parameters.items()
+                   if name not in ("self", "verbose", "is_double")}
+_INPUT_NAMES = tuple(_INPUT_DEFAULTS)

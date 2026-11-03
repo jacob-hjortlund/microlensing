@@ -31,6 +31,7 @@
 #include <limits> //for std::numeric_limits
 #include <new> //for std::nothrow, std::bad_alloc
 #include <numbers>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -44,7 +45,8 @@ public:
 	using Microlensing<T>::reuse_memory;
 	using Microlensing<T>::use_device;
 	/******************************************************************************
-	default input variables
+	default input variables. a map input added here must also be copied in
+	copy_inputs_from
 	******************************************************************************/
 	//must include microlensing variables to put them into scope since class is a template
 	using Microlensing<T>::kappa_tot;
@@ -123,7 +125,8 @@ private:
 	double t_shoot_cells;
 
 	/******************************************************************************
-	derived variables
+	derived variables. a member set by a run, here or further down, that
+	write_files or a getter reads must also be copied in copy_derived_from
 	******************************************************************************/
 	T num_rays_x; //number density of rays per unit area in the image plane
 	Complex<T> ray_half_sep; //distance from center of cell to corner
@@ -173,6 +176,17 @@ private:
 	******************************************************************************/
 	bool have_parity_maps = false;
 	bool have_histograms = false;
+
+	/******************************************************************************
+	a snapshot holds host copies of the histograms (and of the stars, see
+	Microlensing<T>::host_stars) instead of device memory, and saves with save_host
+	******************************************************************************/
+	bool is_snapshot = false;
+	std::vector<int> h_histogram, h_histogram_minima, h_histogram_saddles;
+	std::vector<int> h_log_histogram, h_log_histogram_minima, h_log_histogram_saddles;
+
+	//whether the last shoot_cells used the step buffer of the perimeter deposit
+	bool perimeter_deposit_used = false;
 
 	/******************************************************************************
 	step buffer of the perimeter deposit and the clamp statistics of its row sums
@@ -314,6 +328,53 @@ private:
 		have_histograms = false;
 		if (starfile != "" && !release_buffer(stars, stars_cap, true, "cudaFree(*stars)")) return false;
 		return true;
+	}
+
+	/******************************************************************************
+	copy the input parameters of another object (see Microlensing<T>::copy_inputs_from).
+	every input of IPM<T> must be copied here
+	******************************************************************************/
+	void copy_inputs_from(const IPM<T>& o)
+	{
+		Microlensing<T>::copy_inputs_from(o);
+		light_loss = o.light_loss;
+		center_y = o.center_y;
+		half_length_y = o.half_length_y;
+		num_pixels_y = o.num_pixels_y;
+		num_rays_y = o.num_rays_y;
+		write_maps = o.write_maps;
+		write_parities = o.write_parities;
+		write_histograms = o.write_histograms;
+		deposit = o.deposit;
+	}
+
+	/******************************************************************************
+	copy the values derived from the input parameters of another object's run, and
+	whether its parity maps and histograms are those of the run (see
+	Microlensing<T>::copy_derived_from). every member of IPM<T> that a run sets
+	and write_files or a getter reads must be copied here, or by snapshot()
+	itself (the device and the host copies of the stars and histograms)
+	******************************************************************************/
+	void copy_derived_from(const IPM<T>& o)
+	{
+		Microlensing<T>::copy_derived_from(o);
+		t_shoot_cells = o.t_shoot_cells;
+		num_rays_x = o.num_rays_x;
+		ray_half_sep = o.ray_half_sep;
+		center_x = o.center_x;
+		half_length_x = o.half_length_x;
+		num_ray_threads = o.num_ray_threads;
+		num_leaves = o.num_leaves;
+		num_direct = o.num_direct;
+		min_mag = o.min_mag;
+		max_mag = o.max_mag;
+		histogram_length = o.histogram_length;
+		min_log_mag = o.min_log_mag;
+		max_log_mag = o.max_log_mag;
+		log_histogram_length = o.log_histogram_length;
+		perimeter_deposit_used = o.perimeter_deposit_used;
+		have_parity_maps = o.have_parity_maps;
+		have_histograms = o.have_histograms;
 	}
 
 	bool check_input_params(int verbose)
@@ -600,6 +661,7 @@ private:
 
 	bool shoot_cells(int verbose)
 	{
+		perimeter_deposit_used = false;
 		/******************************************************************************
 		one block per TILE x TILE tile of cells; launch as many blocks as the device
 		can keep resident (occupancy API), not one per SM as get_blocks() does, so
@@ -738,6 +800,8 @@ private:
 				print_verbose("Perimeter deposit for bounding boxes above " << ipm_functions::EDGE_MIN_BBOX << " pixels.\n", verbose, 2);
 			}
 		}
+
+		perimeter_deposit_used = perimeter;
 
 		/******************************************************************************
 		shoot rays and calculate time taken in seconds (including the row sums of
@@ -1024,7 +1088,13 @@ private:
 		return true;
 	}
 
-	bool write_files(int verbose)
+	/******************************************************************************
+	write the output files. With host_maps (a snapshot: the total, minima and
+	saddle maps in host memory), the histograms come from the host copies and the
+	maps are written from host memory, with no CUDA call. Otherwise they are
+	copied from the device
+	******************************************************************************/
+	bool write_files(int verbose, const T* const* host_maps = nullptr)
 	{
 		/******************************************************************************
 		stream for writing output files
@@ -1034,7 +1104,7 @@ private:
 		outfile.precision(9);
 		std::string fname;
 
-		if (!use_device()) return false;
+		if (host_maps == nullptr && !use_device()) return false;
 
 		if (!Microlensing<T>::write_files(verbose, "ipm")) return false;
 
@@ -1075,12 +1145,18 @@ private:
 		{
 			print_verbose("Writing magnification histograms...\n", verbose, 2);
 
-			//the histograms are in device memory: each one is copied into h_hist before it is written.
-			//a failed allocation returns false: it must not throw through the C interface (save)
+			//the histograms are in device memory: each one is copied into h_hist and written from there.
+			//a failed allocation returns nullptr: it must not throw through the C interface (save)
+			//a snapshot has host copies of them (h_vec), which are written as they are
 			std::vector<int> h_hist;
-			auto copy_histogram = [&](const int* d_hist, int n)
+			auto host_histogram = [&](const int* d_hist, const std::vector<int>& h_vec, int n) -> const int*
 			{
-				if (!have_histograms || d_hist == nullptr || n < 1) return false;
+				if (host_maps != nullptr)
+				{
+					if (!have_histograms || n < 1 || h_vec.size() != static_cast<size_t>(n)) return nullptr;
+					return h_vec.data();
+				}
+				if (!have_histograms || d_hist == nullptr || n < 1) return nullptr;
 				try
 				{
 					h_hist.resize(n);
@@ -1088,16 +1164,18 @@ private:
 				catch (const std::bad_alloc&)
 				{
 					std::cerr << "Error. Unable to allocate a host copy of a histogram.\n";
-					return false;
+					return nullptr;
 				}
 				cudaMemcpyAsync(h_hist.data(), d_hist, n * sizeof(int), cudaMemcpyDeviceToHost, stream);
-				if (cuda_error("cudaMemcpyAsync(*h_hist)", false, __FILE__, __LINE__)) return false;
+				if (cuda_error("cudaMemcpyAsync(*h_hist)", false, __FILE__, __LINE__)) return nullptr;
 				cudaStreamSynchronize(stream);
-				return !cuda_error("cudaStreamSynchronize", false, __FILE__, __LINE__);
+				if (cuda_error("cudaStreamSynchronize", false, __FILE__, __LINE__)) return nullptr;
+				return h_hist.data();
 			};
+			const int* h = nullptr;
 
 			fname = outfile_prefix + "ipm_mags_numpixels.txt";
-			if (!copy_histogram(histogram, histogram_length) || !write_histogram<int>(h_hist.data(), histogram_length, min_mag, fname))
+			if (!(h = host_histogram(histogram, h_histogram, histogram_length)) || !write_histogram<int>(h, histogram_length, min_mag, fname))
 			{
 				std::cerr << "Error. Unable to write magnification histogram to file " << fname << "\n";
 				return false;
@@ -1105,7 +1183,7 @@ private:
 			print_verbose("Done writing magnification histogram to file " << fname << "\n", verbose, 1);
 
 			fname = outfile_prefix + "ipm_log_mags_numpixels.txt";
-			if (!copy_histogram(log_histogram, log_histogram_length) || !write_histogram<int>(h_hist.data(), log_histogram_length, min_log_mag, fname))
+			if (!(h = host_histogram(log_histogram, h_log_histogram, log_histogram_length)) || !write_histogram<int>(h, log_histogram_length, min_log_mag, fname))
 			{
 				std::cerr << "Error. Unable to write magnification histogram to file " << fname << "\n";
 				return false;
@@ -1115,7 +1193,7 @@ private:
 			if (write_parities)
 			{
 				fname = outfile_prefix + "ipm_mags_numpixels_minima.txt";
-				if (!copy_histogram(have_parity_maps ? histogram_minima : nullptr, histogram_length) || !write_histogram<int>(h_hist.data(), histogram_length, min_mag, fname))
+				if (!(h = host_histogram(have_parity_maps ? histogram_minima : nullptr, h_histogram_minima, histogram_length)) || !write_histogram<int>(h, histogram_length, min_mag, fname))
 				{
 					std::cerr << "Error. Unable to write magnification histogram to file " << fname << "\n";
 					return false;
@@ -1123,7 +1201,7 @@ private:
 				print_verbose("Done writing magnification histogram to file " << fname << "\n", verbose, 1);
 
 				fname = outfile_prefix + "ipm_log_mags_numpixels_minima.txt";
-				if (!copy_histogram(have_parity_maps ? log_histogram_minima : nullptr, log_histogram_length) || !write_histogram<int>(h_hist.data(), log_histogram_length, min_log_mag, fname))
+				if (!(h = host_histogram(have_parity_maps ? log_histogram_minima : nullptr, h_log_histogram_minima, log_histogram_length)) || !write_histogram<int>(h, log_histogram_length, min_log_mag, fname))
 				{
 					std::cerr << "Error. Unable to write magnification histogram to file " << fname << "\n";
 					return false;
@@ -1131,7 +1209,7 @@ private:
 				print_verbose("Done writing magnification histogram to file " << fname << "\n", verbose, 1);
 
 				fname = outfile_prefix + "ipm_mags_numpixels_saddles.txt";
-				if (!copy_histogram(have_parity_maps ? histogram_saddles : nullptr, histogram_length) || !write_histogram<int>(h_hist.data(), histogram_length, min_mag, fname))
+				if (!(h = host_histogram(have_parity_maps ? histogram_saddles : nullptr, h_histogram_saddles, histogram_length)) || !write_histogram<int>(h, histogram_length, min_mag, fname))
 				{
 					std::cerr << "Error. Unable to write magnification histogram to file " << fname << "\n";
 					return false;
@@ -1139,7 +1217,7 @@ private:
 				print_verbose("Done writing magnification histogram to file " << fname << "\n", verbose, 1);
 
 				fname = outfile_prefix + "ipm_log_mags_numpixels_saddles.txt";
-				if (!copy_histogram(have_parity_maps ? log_histogram_saddles : nullptr, log_histogram_length) || !write_histogram<int>(h_hist.data(), log_histogram_length, min_log_mag, fname))
+				if (!(h = host_histogram(have_parity_maps ? log_histogram_saddles : nullptr, h_log_histogram_saddles, log_histogram_length)) || !write_histogram<int>(h, log_histogram_length, min_log_mag, fname))
 				{
 					std::cerr << "Error. Unable to write magnification histogram to file " << fname << "\n";
 					return false;
@@ -1151,15 +1229,24 @@ private:
 
 		/******************************************************************************
 		write magnifications for minima, saddle, and combined maps, streamed from
-		device memory through one writer, so that they share its pinned buffers
+		device memory through one writer, so that they share its pinned buffers.
+		a snapshot writes them from the host maps
 		******************************************************************************/
 		if (write_maps)
 		{
 			print_verbose("Writing magnifications...\n", verbose, 2);
-			DeviceArrayWriter<T> writer;
+			//a snapshot makes no CUDA call, not even the one of the writer's release
+			std::unique_ptr<DeviceArrayWriter<T>> writer;
+			if (host_maps == nullptr) writer.reset(new DeviceArrayWriter<T>());
+			//the maps of this run: the device maps, or the host maps of a snapshot
+			auto write_map = [&](const T* device_map, int which, const std::string& file)
+			{
+				if (host_maps != nullptr) return host_maps[which] != nullptr && write_array<T>(host_maps[which], num_pixels_y.im, num_pixels_y.re, file);
+				return writer->write(device_map, num_pixels_y.im, num_pixels_y.re, file);
+			};
 
 			fname = outfile_prefix + "ipm_magnifications" + outfile_type;
-			if (!writer.write(d_pixels, num_pixels_y.im, num_pixels_y.re, fname))
+			if (!write_map(d_pixels, 0, fname))
 			{
 				std::cerr << "Error. Unable to write magnifications to file " << fname << "\n";
 				return false;
@@ -1168,7 +1255,7 @@ private:
 			if (write_parities)
 			{
 				fname = outfile_prefix + "ipm_magnifications_minima" + outfile_type;
-				if (!writer.write(pixels_minima(), num_pixels_y.im, num_pixels_y.re, fname))
+				if (!write_map(pixels_minima(), 1, fname))
 				{
 					std::cerr << "Error. Unable to write magnifications to file " << fname << "\n";
 					return false;
@@ -1176,14 +1263,14 @@ private:
 				print_verbose("Done writing magnifications to file " << fname << "\n", verbose, 1);
 
 				fname = outfile_prefix + "ipm_magnifications_saddles" + outfile_type;
-				if (!writer.write(pixels_saddles(), num_pixels_y.im, num_pixels_y.re, fname))
+				if (!write_map(pixels_saddles(), 2, fname))
 				{
 					std::cerr << "Error. Unable to write magnifications to file " << fname << "\n";
 					return false;
 				}
 				print_verbose("Done writing magnifications to file " << fname << "\n", verbose, 1);
 			}
-			if (!writer.release())
+			if (writer && !writer->release())
 			{
 				std::cerr << "Error. CUDA error while releasing the buffers used to write the magnifications.\n";
 				return false;
@@ -1370,6 +1457,132 @@ public:
 	}
 
 	/******************************************************************************
+	set every input parameter to its default, as in a new object, to start the
+	next map of a reused object. device, reuse_memory, the stream and every buffer
+	stay as they are
+	******************************************************************************/
+	void reset_inputs()
+	{
+		const IPM<T> d;
+		copy_inputs_from(d);
+	}
+
+	/******************************************************************************
+	a new object that holds this object's last map: its input parameters, derived
+	values and device, a host copy of the stars and of the histograms, and no
+	device memory. save_host writes the files of save() from it, with the maps
+	the caller copied (copy_pixels*). the caller owns the object (delete)
+
+	\return IPM<T>* -- the snapshot, or nullptr if this object has not run or a
+	                   copy or allocation fails
+	******************************************************************************/
+	IPM<T>* snapshot() const
+	{
+		if (stars == nullptr || num_stars < 1 || is_snapshot) return nullptr;
+		IPM<T>* s = new (std::nothrow) IPM<T>();
+		if (s == nullptr) return nullptr;
+		s->copy_inputs_from(*this);
+		s->copy_derived_from(*this);
+		s->device = device;
+		s->is_snapshot = true;
+
+		bool ok = use_device();
+		try
+		{
+			s->host_stars.resize(num_stars);
+			if (write_histograms && have_histograms)
+			{
+				auto copy_histogram = [&](const int* d_hist, std::vector<int>& h_vec, int n)
+				{
+					if (d_hist == nullptr || n < 1) return false;
+					h_vec.resize(n);
+					cudaMemcpyAsync(h_vec.data(), d_hist, n * sizeof(int), cudaMemcpyDeviceToHost, stream);
+					return !cuda_error("cudaMemcpyAsync(*h_hist)", false, __FILE__, __LINE__);
+				};
+				ok = ok && copy_histogram(histogram, s->h_histogram, histogram_length)
+					&& copy_histogram(log_histogram, s->h_log_histogram, log_histogram_length);
+				if (write_parities && have_parity_maps)
+				{
+					ok = ok && copy_histogram(histogram_minima, s->h_histogram_minima, histogram_length)
+						&& copy_histogram(histogram_saddles, s->h_histogram_saddles, histogram_length)
+						&& copy_histogram(log_histogram_minima, s->h_log_histogram_minima, log_histogram_length)
+						&& copy_histogram(log_histogram_saddles, s->h_log_histogram_saddles, log_histogram_length);
+				}
+			}
+		}
+		catch (const std::bad_alloc&)
+		{
+			std::cerr << "Error. Unable to allocate the host copies of a snapshot.\n";
+			ok = false;
+		}
+		if (ok)
+		{
+			cudaMemcpyAsync(s->host_stars.data(), stars, 1ULL * num_stars * sizeof(star<T>), cudaMemcpyDeviceToHost, stream);
+			ok = !cuda_error("cudaMemcpyAsync(*host_stars)", false, __FILE__, __LINE__);
+		}
+		if (ok)
+		{
+			//the copies are pageable and the stream is not the legacy stream: wait for them
+			cudaStreamSynchronize(stream);
+			ok = !cuda_error("cudaStreamSynchronize", false, __FILE__, __LINE__);
+		}
+		if (!ok)
+		{
+			delete s;
+			return nullptr;
+		}
+		return s;
+	}
+
+	/******************************************************************************
+	write the files of save() from host data, with no CUDA call. only for a
+	snapshot
+
+	\param pixels, minima, saddles -- host copies of the total, minima and saddle
+	                                  maps (num_pixels_y.re * num_pixels_y.im values
+	                                  each). the parity maps are needed with write_parities
+	\param verbose -- verbosity level
+
+	\return bool -- false (with an error message) for an object that is not a
+	                snapshot or a needed map that is null, or a file that cannot
+	                be written
+	******************************************************************************/
+	bool save_host(const T* pixels, const T* minima, const T* saddles, int verbose)
+	{
+		if (!is_snapshot)
+		{
+			std::cerr << "Error. save_host is only available for a snapshot.\n";
+			return false;
+		}
+		if (write_maps && (pixels == nullptr || (write_parities && (minima == nullptr || saddles == nullptr))))
+		{
+			std::cerr << "Error. save_host needs every map that is to be written.\n";
+			return false;
+		}
+		const T* const host_maps[3] = {pixels, minima, saddles};
+		return write_files(verbose, host_maps);
+	}
+
+	/******************************************************************************
+	whether the last run's shoot_cells used the step buffer of the perimeter
+	deposit (false when every triangle took the direct deposit)
+	******************************************************************************/
+	bool get_perimeter_deposit_used() const	{return perimeter_deposit_used;}
+
+	/******************************************************************************
+	the bytes of the host copies of the last run's histograms that snapshot()
+	makes (and that a snapshot holds): with write_histograms, the histogram and
+	the log histogram of the total map, and with write_parities those of the
+	minima and saddle maps too. 0 if the last run made no histograms
+	******************************************************************************/
+	unsigned long long host_histogram_bytes() const
+	{
+		if (!write_histograms || !have_histograms) return 0;
+		const unsigned long long n_kinds = (write_parities && have_parity_maps) ? 3 : 1;
+		return n_kinds * (1ULL * histogram_length + log_histogram_length) * sizeof(int);
+	}
+
+	/******************************************************************************
 	copy a map (num_pixels_y.re * num_pixels_y.im values) from the device into
 	dst. false if the map does not exist (before run(), or the parity maps without
 	write_parities) or the copy fails
@@ -1407,6 +1620,96 @@ public:
 			+ 1ULL * leaf_buffers.counters_cap * sizeof(int)
 			+ 1ULL * d_clamp_count_cap * sizeof(unsigned long long) + 1ULL * d_clamp_total_cap * sizeof(double)
 			+ 1ULL * d_percentage_cap * sizeof(unsigned long long) + scratch.cap;
+	}
+
+	/******************************************************************************
+	bytes per star of the tree pool, its counters, the compact tree and the leaf
+	buffers: a rough figure fitted to four maps, the largest tree allocation per
+	star of the four times 1.1, rounded up to a multiple of 64. Each map ran once
+	on a new reused object, and its tree bytes (allocated_bytes) were divided by
+	its number of stars. The maps: kappa_tot 0.4, shear 0.4, kappa_star 0.2 and
+	half-lengths 25 at 1000^2 and at 5000^2 pixels; kappa_tot 0.5, shear 0.49,
+	kappa_star 0.1, rectangular and approximate, half-lengths 12.5 at 1000^2
+	pixels; and kappa_tot 0.3, shear 0.3, kappa_star 0.27 and half-lengths 505 at
+	5000^2 pixels. The bytes per star differ by a factor of 1.3 between the maps,
+	so the estimate of the last map is about 1.45 times its allocation, close to
+	1.5 times, the bound the estimate is tested against (a margin of 1.5 instead
+	of 1.1 would put it above). A map unlike these can need more bytes per star.
+	Per-star values in the order of the maps, measured on an A100:
+	float:  1416.10, 1432.86, 1724.50, 1323.65 -> 1920
+	double: 2313.98, 2354.55, 2798.78, 2175.06 -> 3136
+	******************************************************************************/
+	static constexpr unsigned long long tree_bytes_per_star = sizeof(T) == 8 ? 3136 : 1920;
+
+	/******************************************************************************
+	the magnification range (max - min over the maps of a run) whose histograms
+	estimate_memory counts. The maps the estimate was tested on have ranges of up
+	to about 5e3
+	******************************************************************************/
+	static constexpr unsigned long long HIST_RANGE_BOUND = 10000;
+
+	/******************************************************************************
+	estimate the device memory a run of this object's inputs needs, in bytes, and
+	the host memory its saved results need. This object is not changed: the
+	estimate is made on a copy of the inputs. A star file is read onto this
+	object's device, and the calling thread's current device is kept; for a map
+	without a star file no CUDA call is made. Not counted: the local memory that
+	the CUDA runtime reserves for the kernels, once per CUDA context rather than
+	per object (about 35 MB for double on an A100).
+
+	\param pixel_bytes  -- maps, step buffer and histograms. A reused object keeps
+	                       the step buffer and the histograms between runs, so both
+	                       are counted. The histograms of each map kind are counted
+	                       for a magnification range of HIST_RANGE_BOUND, at 1000
+	                       bins of 4 bytes per unit of magnification and with the
+	                       1.25 headroom a reused object grows them by (the log
+	                       histograms, 1000 bins per decade, are not counted). A
+	                       map with a larger range still allocates its histograms;
+	                       if that runs out of device memory, the run fails like
+	                       any other allocation, and a batch retries the map with
+	                       fewer maps on its GPU
+	\param star_bytes   -- curand states, two star arrays and binomial coefficients
+	\param tree_bytes   -- tree pool and compact tree, from tree_bytes_per_star
+	\param result_bytes -- the maps, the stars and the histograms of a finished map
+	                       held on the host. The stars are counted twice: a
+	                       snapshot holds a host copy of them, and the Python
+	                       result made from it (IPM._from_worker) a numpy copy
+	                       of that. The histograms are counted as in
+	                       pixel_bytes, but without the headroom: the host copies
+	                       have their exact size. A map with a larger range has
+	                       larger host copies, which a batch counts once the map
+	                       has run (host_histogram_bytes)
+
+	\return bool -- true if the inputs are valid, false if not
+	******************************************************************************/
+	bool estimate_memory(unsigned long long& pixel_bytes, unsigned long long& star_bytes,
+		unsigned long long& tree_bytes, unsigned long long& result_bytes) const
+	{
+		//made before the probe, so that the caller's device is made current again after the probe's destructor
+		//freed the stars on this object's device
+		std::optional<DeviceGuard> guard;
+		if (starfile != "") guard.emplace();
+		IPM<T> probe;
+		probe.device = device;
+		probe.copy_inputs_from(*this);
+		if (starfile != "" && !probe.use_device()) return false;
+		if (!probe.check_input_params(0)) return false;
+		if (!probe.calculate_derived_params(0)) return false;
+
+		unsigned long long npix = 1ULL * probe.num_pixels_y.re * probe.num_pixels_y.im;
+		unsigned long long n_maps = probe.write_parities ? 3 : 1;
+		unsigned long long n_stars = probe.num_stars;
+
+		const unsigned long long host_hist_bytes_per_kind = HIST_RANGE_BOUND * 1000 * sizeof(int);
+		const unsigned long long hist_bytes_per_kind = host_hist_bytes_per_kind * 5 / 4;
+		pixel_bytes = npix * sizeof(T) * (n_maps + 1) + (probe.write_histograms ? n_maps * hist_bytes_per_kind : 0);
+		star_bytes = n_stars * (sizeof(curandState) + 2 * sizeof(star<T>))
+			+ 1ULL * (2 * treenode::MAX_EXPANSION_ORDER * (2 * treenode::MAX_EXPANSION_ORDER + 3) / 2 + 1) * sizeof(long long);
+		tree_bytes = n_stars * tree_bytes_per_star + (1ULL << 20);
+		result_bytes = npix * sizeof(T) * n_maps + n_stars * 2 * sizeof(star<T>)
+			+ (probe.write_histograms ? n_maps * host_hist_bytes_per_kind : 0);
+
+		return true;
 	}
 
 	/******************************************************************************

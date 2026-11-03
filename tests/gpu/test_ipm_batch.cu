@@ -6,9 +6,15 @@
 //     map or histogram of an earlier map, and release_memory() gives every buffer back; a default object keeps
 //     the footprint before batching and makes no CUDA call when it never runs;
 //   - thrust::minmax_element holds two temporary allocations at once; ThrustScratch, reset before each call, gives
-//     them parts of its buffer that do not overlap and, once warmed up, allocates nothing.
-// Needs the GPU; with one visible GPU all objects share device 0. The timing cases occupy the legacy stream of
-// device 0 with a spin kernel: a call that synchronizes the device would wait for it.
+//     them parts of its buffer that do not overlap and, once warmed up, allocates nothing;
+//   - a reused object holds no more device memory than estimate_memory() gives for its map, after its first run and
+//     after a second one;
+//   - the library's exports (src/lib_ipm.cu) that make another device current give the calling thread its own
+//     device back, and estimate_memory() reads a star file on its object's device: an estimate for device 1 makes
+//     no context on device 0.
+// Needs the GPU; with one visible GPU all objects share device 0, and the cases of the last item, which need two,
+// are skipped. The timing cases occupy the legacy stream of device 0 with a spin kernel: a call that synchronizes
+// the device would wait for it.
 // The invalid-device case prints an error message to stderr, which is expected output.
 // float and double cannot share one program: the kernels of fmm.cuh declare their extern shared array with the
 // same name for both types. This file therefore tests float; tests/gpu/test_ipm_batch_double.cu defines
@@ -19,19 +25,31 @@
 #include "ipm.cuh"
 #include "spin.cuh"
 
+//the library's exports, for the type this program tests
+#ifdef IPM_BATCH_TEST_DOUBLE
+#define is_double
+#else
+#define is_float
+#endif
+#include "../../src/lib_ipm.cu"
+
 #include <thrust/device_ptr.h>
 #include <thrust/execution_policy.h>
 #include <thrust/extrema.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
-#include <unistd.h> //for mkdtemp
+#include <thread>
+#include <unistd.h> //for mkdtemp, getpid
 #include <utility>
 #include <vector>
 
@@ -136,6 +154,25 @@ static void set_map_b(IPM<T>& ipm)
 	ipm.rectangular = 1;
 	ipm.approx = 1;
 	ipm.random_seed = 12;
+}
+
+// a high-magnification map: kappa 0.7252, shear 0.27435 (mean magnification about 4000), kappa_star 0.1, a
+// rectangular star field with the exact deflection of its smooth matter, half-lengths 12.5, 1000x1000 pixels,
+// parities, seed 3. its magnification range is about 5300, so each histogram takes about 25 MiB with headroom
+template <typename T>
+static void set_map_high_magnification(IPM<T>& ipm)
+{
+	set_default_inputs(ipm);
+	ipm.kappa_tot = static_cast<T>(0.7252);
+	ipm.shear = static_cast<T>(0.27435);
+	ipm.kappa_star = static_cast<T>(0.1);
+	ipm.rectangular = 1;
+	ipm.approx = 0;
+	ipm.half_length_y = Complex<T>(static_cast<T>(12.5), static_cast<T>(12.5));
+	ipm.num_pixels_y = Complex<int>(1000, 1000);
+	ipm.write_parities = 1;
+	ipm.write_stars = 0;
+	ipm.random_seed = 3;
 }
 
 // the order of the stars inside the tree is not reproducible even for two default objects (the star sort
@@ -453,6 +490,43 @@ static void release_memory_frees_everything()
 	report(name, again, "run after release_memory failed");
 }
 
+// a reused object's device memory (allocated_bytes) is at most the estimate of its map, component by component,
+// after its first run of the high-magnification map and after a second run with another seed, which keeps the
+// buffers of the first
+template <typename T>
+static void reused_object_stays_within_estimate()
+{
+	const std::string name = case_name<T>("reused_object_stays_within_estimate");
+	IPM<T> w;
+	w.reuse_memory = 1;
+	if (!w.create_stream()) { report(name, false, "create_stream failed"); return; }
+	const char* components[3] = {"pixel", "star", "tree"};
+	const int seeds[2] = {3, 5};
+	for (int k = 0; k < 2; k++)
+	{
+		const std::string run_name = k == 0 ? "first run" : "second run";
+		set_map_high_magnification(w);
+		w.random_seed = seeds[k];
+		unsigned long long est[4] = {};
+		if (!w.estimate_memory(est[0], est[1], est[2], est[3])) { report(name, false, run_name + ": estimate_memory failed"); return; }
+		if (!w.run(0)) { report(name, false, run_name + " failed"); return; }
+		unsigned long long held[3] = {};
+		w.allocated_bytes(held[0], held[1], held[2]);
+		std::printf("INFO %s: %s, held / estimate: pixel %llu / %llu, star %llu / %llu, tree %llu / %llu\n", name.c_str(),
+			run_name.c_str(), held[0], est[0], held[1], est[1], held[2], est[2]);
+		for (int c = 0; c < 3; c++)
+		{
+			if (held[c] > est[c])
+			{
+				report(name, false, run_name + ": " + components[c] + " " + std::to_string(held[c])
+					+ " bytes held, " + std::to_string(est[c]) + " estimated");
+				return;
+			}
+		}
+	}
+	report(name, true);
+}
+
 // thrust allocator that counts the calls and the live allocations, checks that no two live allocations overlap,
 // and passes them on to a ThrustScratch
 struct CountingScratch
@@ -545,18 +619,421 @@ static void thrust_minmax_scratch_allocations()
 	report(name, ok, detail);
 }
 
+// a worker with every write_* flag set, running the 600x600 map; w.device is the last visible device
+template <typename T>
+static bool make_snapshot_worker(IPM<T>& w)
+{
+	int n_devices = 0;
+	cudaGetDeviceCount(&n_devices);
+	w.device = n_devices - 1;
+	w.reuse_memory = 1;
+	if (!w.create_stream()) return false;
+	set_default_inputs(w);
+	configure(w);
+	w.write_stars = 1;
+	w.write_maps = 1;
+	w.write_parities = 1;
+	w.write_histograms = 1;
+	return w.run(0);
+}
+
+static std::string slurp(const std::filesystem::path& p)
+{
+	std::ifstream f(p, std::ios::binary);
+	return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
+// the three maps of a worker, copied for save_host
+template <typename T>
+static bool copy_three_maps(const IPM<T>& w, std::vector<T> maps[3])
+{
+	for (int m = 0; m < 3; m++)
+	{
+		if (!copy_map(w, m, maps[m])) return false;
+	}
+	return true;
+}
+
+// save() of a worker and save_host() of its snapshot write the same files, byte for byte (one run's data against
+// itself, so the star order is the same). 11 files: the parameter info (one file), the stars, three maps, six histograms
+template <typename T>
+static void snapshot_save_host_matches_save()
+{
+	const std::string name = case_name<T>("snapshot_save_host_matches_save");
+	IPM<T> w;
+	if (!make_snapshot_worker(w)) { report(name, false, "worker run failed"); return; }
+	char tmpl[] = "/tmp/ipm_snapshot_XXXXXX";
+	if (mkdtemp(tmpl) == nullptr) { report(name, false, "mkdtemp failed"); return; }
+	const std::string dir = tmpl;
+	std::filesystem::create_directory(dir + "/a");
+	std::filesystem::create_directory(dir + "/b");
+	w.outfile_prefix = dir + "/a/";
+	bool ok = w.save(0);
+	std::string detail = ok ? "" : "save failed";
+	IPM<T>* s = ok ? w.snapshot() : nullptr;
+	std::vector<T> maps[3];
+	if (ok && (s == nullptr || !copy_three_maps(w, maps))) { ok = false; detail = "snapshot or map copy failed"; }
+	if (ok)
+	{
+		s->outfile_prefix = dir + "/b/";
+		ok = s->save_host(maps[0].data(), maps[1].data(), maps[2].data(), 0);
+		if (!ok) detail = "save_host failed";
+	}
+	if (ok)
+	{
+		int n_a = 0, n_b = 0;
+		for (const auto& e : std::filesystem::directory_iterator(dir + "/b")) { n_b++; (void)e; }
+		for (const auto& e : std::filesystem::directory_iterator(dir + "/a"))
+		{
+			n_a++;
+			const auto twin = std::filesystem::path(dir + "/b") / e.path().filename();
+			if (!std::filesystem::exists(twin) || slurp(e.path()) != slurp(twin))
+			{
+				ok = false;
+				detail = "file " + e.path().filename().string() + " differs or is missing";
+				break;
+			}
+		}
+		if (ok && (n_a != n_b || n_a != 11)) { ok = false; detail = "file counts " + std::to_string(n_a) + " and " + std::to_string(n_b); }
+	}
+	delete s;
+	std::filesystem::remove_all(dir);
+	report(name, ok, detail);
+}
+
+// creating a snapshot and saving from it must not wait for the spin kernel on the legacy stream of device 0
+template <typename T>
+static void snapshot_and_save_host_make_no_device_sync()
+{
+	const std::string name = case_name<T>("snapshot_and_save_host_make_no_device_sync");
+	IPM<T> w;
+	if (!make_snapshot_worker(w)) { report(name, false, "worker run failed"); return; }
+	std::vector<T> maps[3];
+	if (!copy_three_maps(w, maps)) { report(name, false, "map copy failed"); return; }
+	char tmpl[] = "/tmp/ipm_snapshot_XXXXXX";
+	if (mkdtemp(tmpl) == nullptr) { report(name, false, "mkdtemp failed"); return; }
+	const std::string dir = tmpl;
+	//the first snapshot, outside the timed region, loads whatever the copies need
+	{
+		IPM<T>* warm = w.snapshot();
+		delete warm;
+	}
+	warm_up_spin();
+	launch_spin(1.5, 0);
+	const auto start = std::chrono::steady_clock::now();
+	IPM<T>* s2 = w.snapshot();
+	bool ok = s2 != nullptr;
+	if (ok)
+	{
+		s2->outfile_prefix = dir + "/";
+		ok = s2->save_host(maps[0].data(), maps[1].data(), maps[2].data(), 0);
+	}
+	delete s2;
+	const double t = seconds_since(start);
+	cudaDeviceSynchronize();
+	std::filesystem::remove_all(dir);
+	std::printf("INFO %s: snapshot + save_host + delete %.3f s while the spin kernel ran\n", name.c_str(), t);
+	report(name, ok && t < 0.5, !ok ? "snapshot or save_host failed" : "took " + std::to_string(t) + " s");
+}
+
+template <typename T>
+static void snapshot_getters_match()
+{
+	const std::string name = case_name<T>("snapshot_getters_match");
+	IPM<T> w;
+	if (!make_snapshot_worker(w)) { report(name, false, "worker run failed"); return; }
+	w.mass_function_str = "salpeter";
+	w.m_lower = static_cast<T>(0.1);
+	w.m_solar = static_cast<T>(0.5);
+	if (!w.run(0)) { report(name, false, "second run failed"); return; }
+	IPM<T>* s = w.snapshot();
+	if (s == nullptr) { report(name, false, "snapshot failed"); return; }
+	const Complex<T> cw = w.get_corner(), cs = s->get_corner();
+	const star<T>* sw = w.get_stars();
+	const star<T>* ss = s->get_stars();
+	const bool stars_ok = sw != nullptr && ss != nullptr && ss != sw
+		&& std::memcmp(sw, ss, 1ULL * w.get_num_stars() * sizeof(star<T>)) == 0;
+	const bool ok = s->get_num_stars() == w.get_num_stars() && cw.re == cs.re && cw.im == cs.im
+		&& s->get_t_shoot_cells() == w.get_t_shoot_cells() && s->random_seed == w.random_seed
+		&& s->kappa_star == w.kappa_star && s->m_lower == w.m_lower && s->device == w.device
+		&& s->get_perimeter_deposit_used() == w.get_perimeter_deposit_used();
+	delete s;
+	report(name, ok && stars_ok, !stars_ok ? "the snapshot's stars differ from the worker's" : "a getter or input differs");
+}
+
+template <typename T>
+static void reset_inputs_restores_defaults()
+{
+	const std::string name = case_name<T>("reset_inputs_restores_defaults");
+	IPM<T> w;
+	w.reuse_memory = 1;
+	w.device = 0;
+	w.kappa_tot = 0.9; w.shear = 0.1; w.kappa_star = 0.5; w.theta_star = 2;
+	w.mass_function_str = "kroupa"; w.m_solar = 3; w.m_lower = 0.2; w.m_upper = 20;
+	w.rectangular = 1; w.approx = 0; w.safety_scale = 2; w.starfile = "x.bin"; w.random_seed = 99;
+	w.write_stars = 0; w.outfile_prefix = "/nowhere/";
+	w.light_loss = 0.005; w.center_y = Complex<T>(1, 2); w.half_length_y = Complex<T>(3, 4);
+	w.num_pixels_y = Complex<int>(7, 9); w.num_rays_y = 5;
+	w.write_maps = 0; w.write_parities = 1; w.write_histograms = 0;
+	w.deposit = IPM<T>::Deposit::direct;
+	w.reset_inputs();
+	const IPM<T> d;
+	const bool ok = w.kappa_tot == d.kappa_tot && w.shear == d.shear && w.kappa_star == d.kappa_star
+		&& w.theta_star == d.theta_star && w.mass_function_str == d.mass_function_str && w.m_solar == d.m_solar
+		&& w.m_lower == d.m_lower && w.m_upper == d.m_upper && w.rectangular == d.rectangular && w.approx == d.approx
+		&& w.safety_scale == d.safety_scale && w.starfile == d.starfile && w.random_seed == d.random_seed
+		&& w.write_stars == d.write_stars && w.outfile_prefix == d.outfile_prefix && w.light_loss == d.light_loss
+		&& w.center_y.re == d.center_y.re && w.center_y.im == d.center_y.im
+		&& w.half_length_y.re == d.half_length_y.re && w.half_length_y.im == d.half_length_y.im
+		&& w.num_pixels_y.re == d.num_pixels_y.re && w.num_pixels_y.im == d.num_pixels_y.im
+		&& w.num_rays_y == d.num_rays_y && w.write_maps == d.write_maps && w.write_parities == d.write_parities
+		&& w.write_histograms == d.write_histograms && w.deposit == d.deposit;
+	report(name, ok && w.reuse_memory == 1 && w.device == 0, ok ? "reuse_memory or device changed" : "an input is not the default");
+}
+
+template <typename T>
+static void save_host_refuses_non_snapshot()
+{
+	const std::string name = case_name<T>("save_host_refuses_non_snapshot");
+	IPM<T> w;
+	if (!make_snapshot_worker(w)) { report(name, false, "worker run failed"); return; }
+	std::vector<T> maps[3];
+	if (!copy_three_maps(w, maps)) { report(name, false, "map copy failed"); return; }
+	char tmpl[] = "/tmp/ipm_snapshot_XXXXXX";
+	if (mkdtemp(tmpl) == nullptr) { report(name, false, "mkdtemp failed"); return; }
+	const std::string dir = tmpl;
+	w.outfile_prefix = dir + "/";
+	const bool refused = !w.save_host(maps[0].data(), nullptr, nullptr, 0);
+	//a snapshot refuses a missing map too
+	IPM<T>* s = w.snapshot();
+	bool refused_null = false;
+	if (s != nullptr)
+	{
+		s->outfile_prefix = dir + "/";
+		refused_null = !s->save_host(maps[0].data(), nullptr, maps[2].data(), 0);
+	}
+	delete s;
+	std::filesystem::remove_all(dir);
+	report(name, refused && refused_null, refused ? "a snapshot accepted a null map" : "a non-snapshot saved");
+}
+
+// shoot_cells sets the flag: the perimeter deposit is used by default and not with Deposit::direct, even when the
+// reused object still holds the step buffer of its first run
+template <typename T>
+static void perimeter_flag()
+{
+	const std::string name = case_name<T>("perimeter_flag");
+	IPM<T> w;
+	w.reuse_memory = 1;
+	if (!w.create_stream()) { report(name, false, "create_stream failed"); return; }
+	configure(w);
+	bool ok = w.run(0);
+	const bool normal = ok && w.get_perimeter_deposit_used();
+	w.deposit = IPM<T>::Deposit::direct;
+	configure(w);
+	ok = ok && w.run(0);
+	const bool forced_off = ok && !w.get_perimeter_deposit_used();
+	report(name, normal && forced_off, !ok ? "a run failed" : !normal ? "flag not set by a normal run" : "flag set by a forced direct deposit run");
+}
+
+// the visible CUDA devices that nvidia-smi lists this process on, matched by PCI address (reading a device's PCI
+// address makes no context). false if nvidia-smi or an address cannot be read
+static bool devices_of_this_process(std::vector<int>& devices)
+{
+	devices.clear();
+	int n_devices = 0;
+	if (cudaGetDeviceCount(&n_devices) != cudaSuccess) return false;
+	std::vector<std::array<unsigned, 3>> addresses(n_devices);
+	for (int d = 0; d < n_devices; d++)
+	{
+		char bus_id[32] = {};
+		unsigned domain = 0, bus = 0, slot = 0, function = 0;
+		if (cudaDeviceGetPCIBusId(bus_id, sizeof(bus_id), d) != cudaSuccess
+			|| std::sscanf(bus_id, "%x:%x:%x.%x", &domain, &bus, &slot, &function) != 4) return false;
+		addresses[d] = {domain, bus, slot};
+	}
+	FILE* listing = popen("nvidia-smi --query-compute-apps=pid,gpu_bus_id --format=csv,noheader 2>/dev/null", "r");
+	if (listing == nullptr) return false;
+	const long pid = static_cast<long>(getpid());
+	char line[256];
+	while (std::fgets(line, sizeof(line), listing) != nullptr)
+	{
+		long app = 0;
+		unsigned domain = 0, bus = 0, slot = 0, function = 0;
+		if (std::sscanf(line, "%ld, %x:%x:%x.%x", &app, &domain, &bus, &slot, &function) != 5 || app != pid) continue;
+		for (int d = 0; d < n_devices; d++)
+		{
+			if (addresses[d] == std::array<unsigned, 3>{domain, bus, slot}) devices.push_back(d);
+		}
+	}
+	return pclose(listing) == 0;
+}
+
+static bool contains(const std::vector<int>& v, int x)
+{
+	return std::find(v.begin(), v.end(), x) != v.end();
+}
+
+// a star file (.txt) of 900 stars of mass 0.2 spread over a disk of radius 30 (kappa_star about 0.2), large enough
+// for the map of set_starfile_map
+static std::string write_star_file(const std::string& dir)
+{
+	const std::string path = dir + "/stars.txt";
+	std::ofstream f(path);
+	for (int k = 0; k < 900; k++)
+	{
+		const double r = 30 * std::sqrt((k + 0.5) / 900);
+		const double phi = 2.399963229728653 * k; //the golden angle
+		f << r * std::cos(phi) << " " << r * std::sin(phi) << " 0.2\n";
+	}
+	return path;
+}
+
+// a map whose stars come from starfile: kappa 0.4, shear 0.1, half-lengths 1, 100x100 pixels
+template <typename T>
+static void set_starfile_map(IPM<T>& ipm, const std::string& starfile)
+{
+	set_default_inputs(ipm);
+	ipm.kappa_tot = static_cast<T>(0.4);
+	ipm.shear = static_cast<T>(0.1);
+	ipm.half_length_y = Complex<T>(1, 1);
+	ipm.num_pixels_y = Complex<int>(100, 100);
+	ipm.starfile = starfile;
+	ipm.write_stars = 0;
+}
+
+// on a new thread, which has no device yet, estimate_memory() of a star-file map on device 1, get_device_info(1) and
+// check_device(1) make a context on device 1 only: nvidia-smi lists this process on device 1 and not on device 0.
+// runs before every other case, as they use device 0
+template <typename T>
+static void estimate_with_starfile_on_device1_creates_no_context_on_device0()
+{
+	const std::string name = case_name<T>("estimate_with_starfile_on_device1_creates_no_context_on_device0");
+	int n_devices = 0;
+	cudaGetDeviceCount(&n_devices);
+	if (n_devices < 2) { std::printf("SKIP %s: needs 2 devices, found %d\n", name.c_str(), n_devices); return; }
+	char tmpl[] = "/tmp/ipm_starfile_XXXXXX";
+	if (mkdtemp(tmpl) == nullptr) { report(name, false, "mkdtemp failed"); return; }
+	const std::string dir = tmpl;
+	const std::string starfile = write_star_file(dir);
+	bool estimated = false;
+	bool info = false;
+	int checked = -1;
+	std::thread([&]
+	{
+		IPM<T> w;
+		w.device = 1;
+		set_starfile_map(w, starfile);
+		unsigned long long est[4] = {};
+		estimated = w.estimate_memory(est[0], est[1], est[2], est[3]);
+		unsigned long long mem[2] = {};
+		int concurrent_managed = 0;
+		info = get_device_info(1, mem, &concurrent_managed);
+		checked = check_device(1);
+	}).join();
+	std::filesystem::remove_all(dir);
+	std::vector<int> listed;
+	if (!devices_of_this_process(listed) || listed.empty())
+	{
+		std::printf("SKIP %s: nvidia-smi lists no device for this process\n", name.c_str());
+		return;
+	}
+	report(name, estimated && info && checked == 0 && !contains(listed, 0) && contains(listed, 1),
+		!estimated ? "estimate_memory failed" : !info ? "get_device_info failed"
+		: checked != 0 ? "check_device returned " + std::to_string(checked)
+		: contains(listed, 0) ? "this process has a context on device 0" : "nvidia-smi does not list this process on device 1");
+}
+
+// with device 1 current, get_device_info(0) and check_device(0) leave device 1 current
+template <typename T>
+static void device_info_keeps_current_device()
+{
+	const std::string name = case_name<T>("device_info_keeps_current_device");
+	int n_devices = 0;
+	cudaGetDeviceCount(&n_devices);
+	if (n_devices < 2) { std::printf("SKIP %s: needs 2 devices, found %d\n", name.c_str(), n_devices); return; }
+	unsigned long long mem[2] = {};
+	int concurrent_managed = -1;
+	cudaSetDevice(1);
+	const bool info = get_device_info(0, mem, &concurrent_managed);
+	int after_info = -1;
+	cudaGetDevice(&after_info);
+	cudaSetDevice(1);
+	const int checked = check_device(0);
+	int after_check = -1;
+	cudaGetDevice(&after_check);
+	cudaSetDevice(0);
+	report(name, info && checked == 0 && after_info == 1 && after_check == 1,
+		!info ? "get_device_info failed" : checked != 0 ? "check_device returned " + std::to_string(checked)
+		: "device " + std::to_string(after_info) + " current after get_device_info, " + std::to_string(after_check)
+			+ " after check_device (want 1)");
+}
+
+// with device 1 current, the exports estimate_memory (a star-file map), release_memory and IPM_delete of an object
+// on device 0 that holds device memory leave device 1 current
+template <typename T>
+static void worker_exports_keep_current_device()
+{
+	const std::string name = case_name<T>("worker_exports_keep_current_device");
+	int n_devices = 0;
+	cudaGetDeviceCount(&n_devices);
+	if (n_devices < 2) { std::printf("SKIP %s: needs 2 devices, found %d\n", name.c_str(), n_devices); return; }
+	char tmpl[] = "/tmp/ipm_starfile_XXXXXX";
+	if (mkdtemp(tmpl) == nullptr) { report(name, false, "mkdtemp failed"); return; }
+	const std::string dir = tmpl;
+	IPM<T>* w = IPM_init();
+	set_starfile_map(*w, write_star_file(dir));
+	const char* calls[3] = {"estimate_memory", "release_memory", "IPM_delete"};
+	int after[3] = {-1, -1, -1};
+	unsigned long long est[4] = {};
+	cudaSetDevice(1);
+	const bool estimated = estimate_memory(w, est);
+	cudaGetDevice(&after[0]);
+	std::filesystem::remove_all(dir);
+	configure(*w);
+	w->starfile = "";
+	bool ran = w->run(0);
+	cudaSetDevice(1);
+	const bool released = ran && release_memory(w);
+	cudaGetDevice(&after[1]);
+	ran = ran && w->run(0);
+	cudaSetDevice(1);
+	IPM_delete(w);
+	cudaGetDevice(&after[2]);
+	cudaSetDevice(0);
+	std::string changed;
+	for (int k = 0; k < 3; k++)
+	{
+		if (after[k] != 1) changed += std::string(changed.empty() ? "" : ", ") + "device " + std::to_string(after[k]) + " after " + calls[k];
+	}
+	report(name, estimated && ran && released && changed.empty(),
+		!estimated ? "estimate_memory failed" : !ran ? "a run failed" : !released ? "release_memory failed"
+		: "the current device is not 1: " + changed);
+}
+
 template <typename T>
 static void run_cases()
 {
+	estimate_with_starfile_on_device1_creates_no_context_on_device0<T>(); //first: no case has used device 0 yet
+	device_info_keeps_current_device<T>();
+	worker_exports_keep_current_device<T>();
 	own_stream_on_last_device_matches_default<T>();
 	thrust_minmax_scratch_allocations<T>();
 	default_object_keeps_footprint_before_batching<T>();
 	release_memory_frees_everything<T>();
+	reused_object_stays_within_estimate<T>();
 	reused_worker_matches_fresh_objects<T>();
 	warm_up_spin();
 	warm_worker_run_makes_no_device_sync<T>(false);
 	warm_worker_run_makes_no_device_sync<T>(true);
 	default_object_makes_no_cuda_call<T>();
+	snapshot_save_host_matches_save<T>();
+	snapshot_getters_match<T>();
+	reset_inputs_restores_defaults<T>();
+	save_host_refuses_non_snapshot<T>();
+	perimeter_flag<T>();
+	warm_up_spin();
+	snapshot_and_save_host_make_no_device_sync<T>();
 }
 
 int main()
