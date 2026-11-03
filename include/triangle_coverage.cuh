@@ -2,6 +2,7 @@
 
 #include "complex.cuh"
 
+#include <cfloat>
 #include <cmath>
 
 /******************************************************************************
@@ -15,7 +16,8 @@ Green's theorem gives
         sign(dy_e) * ∫_{y in [j,j+1] ∩ y-range(e)} ( clamp(x_e(y), i, i+1) - i ) dy
 
 x_e(y) is linear, so the integral of the clamped linear function has a closed
-form built from two "integral of max(u,0)" terms. Everything is straight-line
+form built from two "integral of max(u,0)" terms, each evaluated without a
+division (see int_max0; the reciprocal slope is computed once per edge). Everything is straight-line
 arithmetic on a handful of registers: no dynamic indexing, no modulo, no
 polygon copies, no log/exp.
 
@@ -39,34 +41,34 @@ namespace tri_cov
 	/******************************************************************************
 	∫_0^L max(u(t), 0) dt for u linear from a to b over an interval of length L
 	= L * (max(a,0) + max(b,0))^2 / (2 * (|a| + |b|))
-	(exact for same-sign and mixed-sign endpoints; 0/0 guarded)
+
+	the division is avoided. if a and b are both positive the integral is the
+	trapezoid 0.5 * L * (a + b). otherwise (one endpoint <= 0) we have
+	|a| + |b| = |a - b| = L * |slope|, so the integral equals
+	(max(a,0) + max(b,0))^2 / (2 * |slope|), and 1 / (2 |slope|) is precomputed
+	once per edge (inv2s, 0 for a vertical or horizontal edge). when both
+	endpoints are <= 0 the numerator is 0, so the result is 0 as long as inv2s
+	is finite. make_edge keeps it finite: a subnormal slope, whose reciprocal
+	can overflow, counts as 0 (its integral is below the smallest normal number)
+
+	\param inv2s -- 1 / (2 |slope|) of the edge, or 0 when |slope| is 0 or subnormal
 	******************************************************************************/
 	template <typename P>
-	__host__ __device__ __forceinline__ P int_max0(P a, P b, P L)
+	__host__ __device__ __forceinline__ P int_max0(P a, P b, P L, P inv2s)
 	{
 		P pa = a > 0 ? a : P(0);
 		P pb = b > 0 ? b : P(0);
-		P num = pa + pb;
-		P den = fabs(a) + fabs(b);
-		if constexpr (sizeof(P) == 8)
-		{
-			//a zero numerator skips the division: the FP64 division routes it through its slow path
-			P t = L * num * num;
-			return t > 0 ? t / (2 * den) : P(0);
-		}
-		else
-		{
-			return den > 0 ? L * num * num / (2 * den) : P(0);
-		}
+		P sum = pa + pb;
+		return (a > 0 && b > 0) ? P(0.5) * L * sum : sum * sum * inv2s;
 	}
 
 	/******************************************************************************
 	∫_0^L clamp(u(t), 0, 1) dt
 	******************************************************************************/
 	template <typename P>
-	__host__ __device__ __forceinline__ P int_clamp01(P a, P b, P L)
+	__host__ __device__ __forceinline__ P int_clamp01(P a, P b, P L, P inv2s)
 	{
-		return int_max0(a, b, L) - int_max0(a - 1, b - 1, L);
+		return int_max0(a, b, L, inv2s) - int_max0(a - 1, b - 1, L, inv2s);
 	}
 
 	template <typename P>
@@ -75,6 +77,7 @@ namespace tri_cov
 		P xa, ya, xb, yb; //oriented so that ya <= yb
 		P slope;          //dx/dy
 		P sgn;            //+1 if the edge pointed upward before the endpoints were swapped (pre-swap orientation), -1 if downward, 0 if horizontal
+		P inv2s;          //1 / (2 |slope|), 0 for a vertical or horizontal edge (or a subnormal slope)
 	};
 
 	template <typename P>
@@ -92,6 +95,9 @@ namespace tri_cov
 		P dy = e.yb - e.ya;
 		e.slope = dy > 0 ? (e.xb - e.xa) / dy : P(0);
 		if (!(dy > 0)) e.sgn = 0;
+		//the smallest normal number: below it 1 / (2 |slope|) can overflow (float and double alike)
+		const P min_normal = sizeof(P) == sizeof(float) ? P(FLT_MIN) : P(DBL_MIN);
+		e.inv2s = fabs(e.slope) >= min_normal ? P(1) / (2 * fabs(e.slope)) : P(0);
 		return e;
 	}
 
@@ -217,9 +223,9 @@ namespace tri_cov
 			for (int ix = ix0 + ca; ix <= ix0 + cb; ix++)
 			{
 				P col = static_cast<P>(ix - ix0);
-				P cov = e0.sgn * int_clamp01(xra0 - col, xrb0 - col, L0)
-					  + e1.sgn * int_clamp01(xra1 - col, xrb1 - col, L1)
-					  + e2.sgn * int_clamp01(xra2 - col, xrb2 - col, L2);
+				P cov = e0.sgn * int_clamp01(xra0 - col, xrb0 - col, L0, e0.inv2s)
+					  + e1.sgn * int_clamp01(xra1 - col, xrb1 - col, L1, e1.inv2s)
+					  + e2.sgn * int_clamp01(xra2 - col, xrb2 - col, L2, e2.inv2s);
 				P to_add = cov * scale;
 				/******************************************************************************
 				guard against rounding (and degenerate slivers) producing values outside

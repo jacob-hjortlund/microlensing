@@ -1,5 +1,6 @@
 /******************************************************************************
-Host test of tri_cov::allocate_triangle against exact clipping (exact_clip.h).
+Host test of tri_cov: int_max0 and int_clamp01 against their closed form in
+long double, and allocate_triangle against exact clipping (exact_clip.h).
 It compiles with nvcc, or as plain C++ through tests/run_cuda_tests.sh --host.
 Each case runs for the two instantiations the IPM kernel uses: float vertices
 with float pixel arithmetic, and double with double. One PASS/FAIL line per
@@ -30,6 +31,133 @@ static void report(const std::string& name, bool ok, const std::string& detail)
 {
 	if (ok) std::printf("PASS %s\n", name.c_str());
 	else { std::printf("FAIL %s: %s\n", name.c_str(), detail.c_str()); n_fail++; }
+}
+
+/******************************************************************************
+the 1D integrals against their closed form, evaluated in long double from the
+same inputs: for u linear from a to b over an interval of length L,
+∫ max(u, 0) = L * (max(a,0) + max(b,0))^2 / (2 * (|a| + |b|)), 0 if a = b = 0
+******************************************************************************/
+static long double closed_form_max0(long double a, long double b, long double L)
+{
+	const long double pa = a > 0 ? a : 0, pb = b > 0 ? b : 0;
+	const long double den = std::fabs(a) + std::fabs(b);
+	return den > 0 ? L * (pa + pb) * (pa + pb) / (2 * den) : 0;
+}
+
+/******************************************************************************
+tolerance of an integral: 16 * eps(P) times the magnitude of its int_max0
+terms, |int_max0(a, b)| for int_max0 and |int_max0(a, b)| + |int_max0(a - 1, b - 1)|
+for int_clamp01, whose two terms can cancel. each term is a product of a few
+rounded factors. where one endpoint is <= 0, the code multiplies by
+1 / (2 |slope|) where the closed form divides by 2 (|a| + |b|) / L; the two
+differ by the rounding of b = a + L * slope, which relative to |a| + |b| >= |b|
+is a few eps. a term with no positive endpoint has magnitude 0, so the
+tolerance is 0 and the result must be exactly 0
+******************************************************************************/
+template <typename P>
+static double integral_tolerance(long double magnitude)
+{
+	return 16 * std::numeric_limits<P>::epsilon() * (double)magnitude;
+}
+
+//sign pattern of the endpoints of an int_max0 term: both positive (the trapezoid), one (the division-free form), none (0)
+static int sign_pattern(long double a, long double b)
+{
+	return a > 0 && b > 0 ? 0 : (a > 0 || b > 0 ? 1 : 2);
+}
+static const char* const pattern_names[3] = {"both", "one", "none"};
+
+/******************************************************************************
+1e6 segments: a in [-3, 3], L in (1e-9, 1], slope in [-50, 50] (one in ten 0,
+one in ten 1e-6, one in ten -1e-6) and b = a + L * slope in precision P. inv2s
+is make_edge's, for the edge from (0, 0) to (slope, 1), whose slope is
+exactly `slope`. the samples are counted by the sign patterns of their
+int_max0 terms (for int_clamp01 the pairs of patterns of (a, b) and
+(a - 1, b - 1) that can occur), and the case fails if a pattern has none.
+without tolerance: a result whose terms have no positive endpoint is exactly 0
+******************************************************************************/
+template <typename P, bool CLAMP>
+static void test_integral(const char* name, const char* ptag)
+{
+	std::mt19937_64 gen(12345);
+	std::uniform_real_distribution<double> da(-3, 3), dL(1e-9, 1), ds(-50, 50);
+	long count[9] = {}, bad = 0, bad_zero = 0;
+	double worst = 0;
+	std::string first;
+	char buf[300];
+	for (int i = 0; i < 1000000; i++)
+	{
+		const P a = static_cast<P>(da(gen));
+		const P L = static_cast<P>(dL(gen));
+		double sd = ds(gen);
+		if (i % 10 == 0) sd = 0;
+		else if (i % 10 == 1) sd = 1e-6;
+		else if (i % 10 == 2) sd = -1e-6;
+		const P slope = static_cast<P>(sd);
+		const P b = a + L * slope;
+		const P inv2s = tri_cov::make_edge<P>(P(0), P(0), slope, P(1)).inv2s;
+		const P got = CLAMP ? tri_cov::int_clamp01<P>(a, b, L, inv2s) : tri_cov::int_max0<P>(a, b, L, inv2s);
+
+		const long double am1 = (long double)a - 1, bm1 = (long double)b - 1;
+		const long double t0 = closed_form_max0(a, b, L), t1 = CLAMP ? closed_form_max0(am1, bm1, L) : 0;
+		const int p0 = sign_pattern(a, b), p1 = CLAMP ? sign_pattern(am1, bm1) : 2;
+		count[3 * p0 + p1]++;
+		const double tol = integral_tolerance<P>(std::fabs(t0) + std::fabs(t1));
+		const double err = (double)std::fabs((long double)got - (t0 - t1));
+		if (!(err <= tol))
+		{
+			if (bad == 0)
+			{
+				std::snprintf(buf, sizeof buf, "a=%.9g b=%.9g L=%.9g slope=%.9g closed form=%.12Lg got=%.12g tol=%.3g",
+					(double)a, (double)b, (double)L, (double)slope, t0 - t1, (double)got, tol);
+				first = buf;
+			}
+			bad++;
+		}
+		if (tol > 0 && !(err / tol <= worst)) worst = err / tol;
+		if (p0 == 2 && p1 == 2 && got != 0) bad_zero++;
+	}
+
+	//the patterns that can occur: for int_max0 those of (a, b); for int_clamp01 the pairs with a - 1 < a
+	static const int max0_patterns[] = {2, 5, 8};
+	static const int clamp_patterns[] = {0, 1, 2, 4, 5, 8};
+	const int* pats = CLAMP ? clamp_patterns : max0_patterns;
+	const int npats = CLAMP ? 6 : 3;
+	std::string info, missing;
+	for (int k = 0; k < npats; k++)
+	{
+		const int pat = pats[k];
+		if (CLAMP) std::snprintf(buf, sizeof buf, " %s/%s %ld", pattern_names[pat / 3], pattern_names[pat % 3], count[pat]);
+		else std::snprintf(buf, sizeof buf, " %s %ld", pattern_names[pat / 3], count[pat]);
+		info += buf;
+		if (count[pat] == 0) missing += buf;
+	}
+	std::printf("INFO %s_%s samples per number of positive endpoints%s:%s; worst err/tol %.3g\n",
+		name, ptag, CLAMP ? " of (a, b)/(a - 1, b - 1)" : "", info.c_str(), worst);
+	std::snprintf(buf, sizeof buf, "%ld of 1e6 outside tolerance, %ld with no positive endpoint not exactly 0, patterns without samples:%s; first: ",
+		bad, bad_zero, missing.empty() ? " none" : missing.c_str());
+	report(std::string(name) + "_" + ptag, bad == 0 && bad_zero == 0 && missing.empty(), buf + first);
+}
+
+/******************************************************************************
+an edge with a subnormal slope: 1 / (2 |slope|) overflows, so make_edge must
+give a finite inv2s (0), and the integrals must not become NaN
+******************************************************************************/
+template <typename P>
+static void test_subnormal_slope(const char* ptag)
+{
+	const P tiny = std::numeric_limits<P>::denorm_min();
+	const tri_cov::Edge<P> e = tri_cov::make_edge<P>(P(0), P(0), tiny, P(1));
+	const P both_nonpos = tri_cov::int_max0<P>(P(-0.25), P(-0.25) + e.slope, P(1), e.inv2s);
+	const P mixed = tri_cov::int_max0<P>(P(0), e.slope, P(1), e.inv2s);
+	const P clamped = tri_cov::int_clamp01<P>(P(0.5), P(0.5) + e.slope, P(1), e.inv2s);
+	const bool ok = e.slope > 0 && std::isfinite(e.inv2s) && both_nonpos == 0
+		&& std::isfinite(mixed) && std::fabs(mixed) <= tiny && clamped == P(0.5);
+	char buf[300];
+	std::snprintf(buf, sizeof buf, "slope=%.3g inv2s=%.3g int_max0(both<=0)=%.3g int_max0(mixed)=%.3g int_clamp01=%.9g",
+		(double)e.slope, (double)e.inv2s, (double)both_nonpos, (double)mixed, (double)clamped);
+	report(std::string("inv2s_finite_for_subnormal_slope_") + ptag, ok, buf);
 }
 
 /******************************************************************************
@@ -413,6 +541,12 @@ static void test_far_reaching(const char* ptag)
 
 int main()
 {
+	test_integral<double, false>("int_max0_matches_reference", "double");
+	test_integral<float, false>("int_max0_matches_reference", "float");
+	test_integral<double, true>("int_clamp01_matches_reference", "double");
+	test_integral<float, true>("int_clamp01_matches_reference", "float");
+	test_subnormal_slope<double>("double");
+	test_subnormal_slope<float>("float");
 	test_against_exact_clipping<double, double>("double");
 	test_against_exact_clipping<float, float>("float");
 	test_off_map<double, double>("double");
