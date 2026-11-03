@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cuda.h> //for CUcontext and CUresult
+#include <cudaTypedefs.h> //for PFN_cuCtxGetCurrent_v4000 and PFN_cuCtxSetCurrent_v4000
+
 #include <algorithm> //for std::find, std::transform
 #include <cctype> //for std::tolower
 #include <cmath> //for std::cbrt, std::ceil
@@ -138,16 +141,39 @@ __host__ __device__ void print_progress(int verbose, unsigned long long int icur
 }
 
 /******************************************************************************
+code of the last error reported by cuda_error on this thread, 0 if none
+******************************************************************************/
+inline thread_local int last_cuda_error_code = 0;
+
+/******************************************************************************
+return the code of the last error cuda_error reported on this thread (a
+cudaError_t as an int, 0 if none since the last call) and reset it to 0
+
+\return int -- the stored error code
+******************************************************************************/
+int take_last_cuda_error()
+{
+	int code = last_cuda_error_code;
+	last_cuda_error_code = 0;
+	return code;
+}
+
+/******************************************************************************
 CUDA error checking
 
 \param name -- to print in error msg
-\param sync -- boolean of whether device needs synchronized or not
+\param sync -- boolean of whether to synchronize or not
 \param file -- the file being run
 \param line -- line number of the source code where the error is given
+\param stream -- stream to synchronize if sync is true. the default, 0,
+				synchronizes the whole device
+\param quiet -- whether to store the error without printing it
+
+every error reported is also stored for take_last_cuda_error
 
 \return bool -- true for error, false for no error
 ******************************************************************************/
-bool cuda_error(const char* name, bool sync, const char* file, const int line)
+bool cuda_error(const char* name, bool sync, const char* file, const int line, cudaStream_t stream = 0, bool quiet = false)
 {
 	cudaError_t err = cudaGetLastError();
 
@@ -157,26 +183,34 @@ bool cuda_error(const char* name, bool sync, const char* file, const int line)
 	******************************************************************************/
 	if (err != cudaSuccess)
 	{
-		const char* errMsg = cudaGetErrorString(err);
-		std::cerr << "CUDA error check for " << name << " failed at " << file << ":" << line << "\n";
-		std::cerr << "Error code: " << err << " (" << errMsg << ")\n";
+		last_cuda_error_code = static_cast<int>(err);
+		if (!quiet)
+		{
+			const char* errMsg = cudaGetErrorString(err);
+			std::cerr << "CUDA error check for " << name << " failed at " << file << ":" << line << "\n";
+			std::cerr << "Error code: " << err << " (" << errMsg << ")\n";
+		}
 		return true;
 	}
 
 	/******************************************************************************
-	if a device synchronization is also to be done
+	if a synchronization is also to be done
 	******************************************************************************/
 	if (sync)
 	{
 		/******************************************************************************
 		perform the same error checking as initially
 		******************************************************************************/
-		err = cudaDeviceSynchronize();
+		err = (stream == 0) ? cudaDeviceSynchronize() : cudaStreamSynchronize(stream);
 		if (err != cudaSuccess)
 		{
-			const char* errMsg = cudaGetErrorString(err);
-			std::cerr << "CUDA error check for cudaDeviceSynchronize failed at " << file << ":" << line << "\n";
-			std::cerr << "Error code: " << err << " (" << errMsg << ")\n";
+			last_cuda_error_code = static_cast<int>(err);
+			if (!quiet)
+			{
+				const char* errMsg = cudaGetErrorString(err);
+				std::cerr << "CUDA error check for " << ((stream == 0) ? "cudaDeviceSynchronize" : "cudaStreamSynchronize") << " failed at " << file << ":" << line << "\n";
+				std::cerr << "Error code: " << err << " (" << errMsg << ")\n";
+			}
 			return true;
 		}
 	}
@@ -184,15 +218,16 @@ bool cuda_error(const char* name, bool sync, const char* file, const int line)
 }
 
 /******************************************************************************
-get the properties of the current cuda device, queried once per device
+properties of the current device, cached per thread because
+cudaGetDeviceProperties costs ~0.5-1 ms and the tree/FMM loops called it
+hundreds of times. refreshed when the thread's current device changes
 
-\return reference to the device properties
+\return const cudaDeviceProp& -- reference to this thread's cached properties
 ******************************************************************************/
 const cudaDeviceProp& cached_device_prop()
 {
-	//cudaGetDeviceProperties costs ~0.5-1 ms; the tree/FMM loops called it hundreds of times
-	static cudaDeviceProp prop;
-	static int cached_device = -1;
+	static thread_local cudaDeviceProp prop;
+	static thread_local int cached_device = -1;
 	int device;
 	cudaGetDevice(&device);
 	if (device != cached_device)
@@ -202,6 +237,84 @@ const cudaDeviceProp& cached_device_prop()
 	}
 	return prop;
 }
+
+/******************************************************************************
+the driver functions that read and set the calling thread's current CUDA
+context, looked up once through the runtime, so that the driver library need
+not be linked. both are nullptr if the lookup failed (with no driver or no
+device, for example)
+******************************************************************************/
+struct DriverContextFunctions
+{
+	PFN_cuCtxGetCurrent_v4000 get = nullptr;
+	PFN_cuCtxSetCurrent_v4000 set = nullptr;
+};
+
+const DriverContextFunctions& driver_context_functions()
+{
+	static const DriverContextFunctions functions = []()
+	{
+		DriverContextFunctions f;
+		void* get = nullptr;
+		void* set = nullptr;
+		cudaDriverEntryPointQueryResult get_found = cudaDriverEntryPointSymbolNotFound;
+		cudaDriverEntryPointQueryResult set_found = cudaDriverEntryPointSymbolNotFound;
+#if CUDART_VERSION >= 12050
+		//4000: the version of both functions, unchanged since CUDA 4.0
+		cudaError_t err = cudaGetDriverEntryPointByVersion("cuCtxGetCurrent", &get, 4000, cudaEnableDefault, &get_found);
+		if (err == cudaSuccess) err = cudaGetDriverEntryPointByVersion("cuCtxSetCurrent", &set, 4000, cudaEnableDefault, &set_found);
+#else
+		cudaError_t err = cudaGetDriverEntryPoint("cuCtxGetCurrent", &get, cudaEnableDefault, &get_found);
+		if (err == cudaSuccess) err = cudaGetDriverEntryPoint("cuCtxSetCurrent", &set, cudaEnableDefault, &set_found);
+#endif
+		if (err != cudaSuccess)
+		{
+			cudaGetLastError(); //a failed lookup is no error of the caller
+		}
+		else if (get_found == cudaDriverEntryPointSuccess && set_found == cudaDriverEntryPointSuccess && get != nullptr && set != nullptr)
+		{
+			f.get = reinterpret_cast<PFN_cuCtxGetCurrent_v4000>(get);
+			f.set = reinterpret_cast<PFN_cuCtxSetCurrent_v4000>(set);
+		}
+		return f;
+	}();
+	return functions;
+}
+
+/******************************************************************************
+keeps the calling thread's current device: when it goes out of scope, the CUDA
+context that was current when it was made is made current again. a thread that
+had no current context is left with none, rather than given a context on
+device 0 (which cudaSetDevice(0) would make); this library's runtime then
+reports a stale device to cudaGetDevice until its next cudaSetDevice, which
+every entry point makes first. does nothing if the driver functions cannot be
+looked up
+******************************************************************************/
+struct DeviceGuard
+{
+	CUcontext prev = nullptr;
+	bool saved = false;
+
+	DeviceGuard()
+	{
+		const DriverContextFunctions& f = driver_context_functions();
+		saved = f.get != nullptr && f.get(&prev) == CUDA_SUCCESS;
+	}
+
+	~DeviceGuard()
+	{
+		if (!saved) return;
+		const DriverContextFunctions& f = driver_context_functions();
+		CUcontext current = nullptr;
+		if (f.get(&current) == CUDA_SUCCESS && current != prev)
+		{
+			f.set(prev);
+		}
+	}
+
+	DeviceGuard(const DeviceGuard&) = delete;
+	DeviceGuard& operator=(const DeviceGuard&) = delete;
+};
 
 /******************************************************************************
 get the maximum number of threads allowed per block for a kernel
