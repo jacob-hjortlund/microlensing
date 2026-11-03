@@ -28,7 +28,7 @@ even for maps with 10^5 pixels per side. The double build nevertheless uses
 P = T: single-precision pixel arithmetic changes its maps at the 1e-7 (mean)
 to 1e-5 (p99.9) relative level, far above its 1e-13 rounding floor.
 
-The original code adds factor*|piece|/|whole| per pixel; summing the signed
+Each pixel receives factor*|piece|/|whole|; summing the signed
 coverage and scaling by factor/area (signed) is identical.
 ******************************************************************************/
 namespace tri_cov
@@ -74,7 +74,7 @@ namespace tri_cov
 	{
 		P xa, ya, xb, yb; //oriented so that ya <= yb
 		P slope;          //dx/dy
-		P sgn;            //+1 if the original edge went upward, -1 if downward, 0 if horizontal
+		P sgn;            //+1 if the edge pointed upward before the endpoints were swapped (pre-swap orientation), -1 if downward, 0 if horizontal
 	};
 
 	template <typename P>
@@ -148,7 +148,7 @@ namespace tri_cov
 
 		/******************************************************************************
 		fast path: the whole triangle lies inside one pixel (the common case in
-		magnified regions). same behaviour as the original for zero-width slivers.
+		magnified regions). zero-width slivers also take this path.
 		******************************************************************************/
 		if (ix0 == ix1 && iy0 == iy1)
 		{

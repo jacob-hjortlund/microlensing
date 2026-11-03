@@ -3,6 +3,7 @@
 #include "array_functions.cuh"
 #include "complex.cuh"
 #include "ipm_functions.cuh"
+#include "ipm_leaf.cuh"
 #include "microlensing.cuh"
 #include "star.cuh"
 #include "stopwatch.hpp"
@@ -66,6 +67,7 @@ private:
 	using Microlensing<T>::MAX_TAYLOR_SMOOTH;
 	using Microlensing<T>::threads;
 	using Microlensing<T>::blocks;
+	using Microlensing<T>::cuda_device_prop;
 	using Microlensing<T>::mean_mass;
 	using Microlensing<T>::mean_mass2;
 	using Microlensing<T>::mean_mass2_ln_mass;
@@ -83,6 +85,7 @@ private:
 	using Microlensing<T>::root_half_length;
 	using Microlensing<T>::tree_levels;
 	using Microlensing<T>::tree;
+	using Microlensing<T>::num_nodes;
 	using Microlensing<T>::stars;
 
 	/******************************************************************************
@@ -103,6 +106,13 @@ private:
 	Complex<int> num_ray_threads; //number of threads in x1 and x2 directions
 
 	/******************************************************************************
+	precision of the pixel-allocation arithmetic: the map precision. single
+	precision would suffice for the origin-shifted coordinates in the float build,
+	but in the double build it changes the maps beyond their rounding floor
+	******************************************************************************/
+	using pixel_arith_t = T;
+
+	/******************************************************************************
 	dynamic memory
 	the maps live in plain device memory (cudaMalloc) while they are being built
 	and are copied once into pinned host memory afterwards. the host copies are
@@ -116,6 +126,16 @@ private:
 	T* d_pixels = nullptr;        //device
 	T* d_pixels_minima = nullptr; //device
 	T* d_pixels_saddles = nullptr; //device
+
+	/******************************************************************************
+	compact tree for the shooting kernel (device)
+	******************************************************************************/
+	ipm_leaf::LeafRecord<T>* leaves = nullptr;
+	T* leaf_coef_re = nullptr;
+	T* leaf_coef_im = nullptr;
+	ipm_leaf::StarXYM<T>* direct_stars = nullptr;
+	int num_leaves = 0;
+	int num_direct = 0;
 
 	int min_mag;
 	int max_mag;
@@ -167,6 +187,22 @@ private:
 		cudaFree(d_pixels_saddles);
 		if (return_on_error && cuda_error("cudaFree(*d_pixels_saddles)", false, __FILE__, __LINE__)) return false;
 		d_pixels_saddles = nullptr;
+
+		cudaFree(leaves);
+		if (return_on_error && cuda_error("cudaFree(*leaves)", false, __FILE__, __LINE__)) return false;
+		leaves = nullptr;
+
+		cudaFree(leaf_coef_re);
+		if (return_on_error && cuda_error("cudaFree(*leaf_coef_re)", false, __FILE__, __LINE__)) return false;
+		leaf_coef_re = nullptr;
+
+		cudaFree(leaf_coef_im);
+		if (return_on_error && cuda_error("cudaFree(*leaf_coef_im)", false, __FILE__, __LINE__)) return false;
+		leaf_coef_im = nullptr;
+
+		cudaFree(direct_stars);
+		if (return_on_error && cuda_error("cudaFree(*direct_stars)", false, __FILE__, __LINE__)) return false;
+		direct_stars = nullptr;
 		
 		cudaFree(histogram);
 		if (return_on_error && cuda_error("cudaFree(*histogram)", false, __FILE__, __LINE__)) return false;
@@ -436,33 +472,66 @@ private:
 		return true;
 	}
 
+	bool build_compact_tree(int verbose)
+	{
+		print_verbose("Building compact leaf records...\n", verbose, 2);
+		stopwatch.start();
+		if (!ipm_leaf::build_leaf_records<T>(tree, num_nodes, stars, expansion_order,
+			leaves, leaf_coef_re, leaf_coef_im, direct_stars, num_leaves, num_direct, verbose)) return false;
+		t_elapsed = stopwatch.stop();
+		print_verbose("Done building compact leaf records. Elapsed time: " << t_elapsed << " seconds.\n", verbose, 2);
+		return true;
+	}
+
 	bool shoot_cells(int verbose)
 	{
+		/******************************************************************************
+		one block per TILE x TILE tile of cells; launch as many blocks as the device
+		can keep resident (occupancy API), not one per SM as get_blocks() does, so
+		the latency of the tree walk, star loads and atomics can be hidden
+		******************************************************************************/
+		const int tiles_x = (num_ray_threads.re + ipm_functions::TILE - 1) / ipm_functions::TILE;
+		const int tiles_y = (num_ray_threads.im + ipm_functions::TILE - 1) / ipm_functions::TILE;
+		const long long num_tiles = 1LL * tiles_x * tiles_y;
+
+		int blocks_per_sm = 0;
+		cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, ipm_functions::shoot_cells_tiled_kernel<T, pixel_arith_t>, ipm_functions::TILE * ipm_functions::TILE, 0);
+		if (cuda_error("cudaOccupancyMaxActiveBlocksPerMultiprocessor", false, __FILE__, __LINE__)) return false;
+		if (blocks_per_sm < 1) blocks_per_sm = 1;
+		long long grid = 1LL * blocks_per_sm * cuda_device_prop.multiProcessorCount;
+		if (grid > num_tiles) grid = num_tiles;
+		print_verbose("Shooting " << num_tiles << " tiles of " << ipm_functions::TILE << "x" << ipm_functions::TILE << " cells with " << grid
+			<< " blocks (" << blocks_per_sm << " resident blocks per SM)\n", verbose, 2);
+
 		unsigned long long int* percentage = nullptr;
 		cudaMallocManaged(&percentage, sizeof(unsigned long long int));
 		if (cuda_error("cudaMallocManaged(*percentage)", false, __FILE__, __LINE__)) return false;
-
 		*percentage = 1;
+
+		ipm_functions::SmoothConst<T> smooth_const = ipm_functions::make_smooth_const<T>(corner);
 
 		/******************************************************************************
 		shoot rays and calculate time taken in seconds
 		******************************************************************************/
 		print_verbose("Shooting cells...\n", verbose, 1);
 		stopwatch.start();
-		threads = get_threads(shoot_cells_kernel<T>, num_ray_threads.re, num_ray_threads.im);
-		blocks = get_blocks(threads, num_ray_threads.re, num_ray_threads.im);
-		shoot_cells_kernel<T> <<<blocks, threads>>> (kappa_tot, shear, theta_star, stars, kappa_star, tree[0],
-			rectangular, corner, approx, taylor_smooth, ray_half_sep, num_ray_threads, center_x, half_length_x,
+		ipm_functions::shoot_cells_tiled_kernel<T, pixel_arith_t> <<<static_cast<unsigned int>(grid), dim3(ipm_functions::TILE, ipm_functions::TILE)>>> (
+			kappa_tot, shear, theta_star, stars, kappa_star, tree[0],
+			leaves, leaf_coef_re, leaf_coef_im, expansion_order + 1, direct_stars,
+			rectangular, corner, approx, taylor_smooth, smooth_const,
+			ray_half_sep, num_ray_threads, center_x, half_length_x,
 			center_y, half_length_y, d_pixels_minima, d_pixels_saddles, d_pixels, num_pixels_y, percentage, verbose);
-		if (cuda_error("shoot_rays_kernel", true, __FILE__, __LINE__)) return false;
+		if (cuda_error("shoot_cells_tiled_kernel", true, __FILE__, __LINE__))
+		{
+			cudaFree(percentage);
+			return false;
+		}
 		t_shoot_cells = stopwatch.stop();
 		print_verbose("\nDone shooting cells. Elapsed time: " << t_shoot_cells << " seconds.\n", verbose, 1);
-
 
 		cudaFree(percentage);
 		if (cuda_error("cudaFree(*percentage)", false, __FILE__, __LINE__)) return false;
 		percentage = nullptr;
-
 
 		if (write_parities)
 		{
@@ -850,6 +919,10 @@ public:
 		d_pixels = nullptr;
 		d_pixels_minima = nullptr;
 		d_pixels_saddles = nullptr;
+		leaves = nullptr;
+		leaf_coef_re = nullptr;
+		leaf_coef_im = nullptr;
+		direct_stars = nullptr;
 
 		histogram = nullptr;
 		histogram_minima = nullptr;
@@ -875,6 +948,10 @@ public:
 		d_pixels = nullptr;
 		d_pixels_minima = nullptr;
 		d_pixels_saddles = nullptr;
+		leaves = nullptr;
+		leaf_coef_re = nullptr;
+		leaf_coef_im = nullptr;
+		direct_stars = nullptr;
 
 		histogram = nullptr;
 		histogram_minima = nullptr;
@@ -896,6 +973,7 @@ public:
 		if (!allocate_initialize_memory(verbose)) return false;
 		if (!Microlensing<T>::populate_star_array(verbose)) return false;
 		if (!Microlensing<T>::create_tree(verbose)) return false;
+		if (!build_compact_tree(verbose)) return false;
 		if (!shoot_cells(verbose)) return false;
 		if (!create_histograms(verbose)) return false;
 		if (!copy_maps_to_host(verbose)) return false;
