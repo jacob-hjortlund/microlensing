@@ -26,7 +26,7 @@ setup(
     author='Luke Weisenbach',
     author_email='weisluke@alum.mit.edu',
     url="https://github.com/weisluke/microlensing/",
-    packages=find_namespace_packages(),
+    packages=find_namespace_packages(include=["microlensing*"]),
     license="GNU AFFERO GENERAL PUBLIC LICENSE",
     platforms=['Linux', 'Windows'],
     package_data={"microlensing.lib": ["*.so", "*.dll"]},
