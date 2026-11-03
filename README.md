@@ -65,3 +65,68 @@ If you just want the python capabilities (as I suspect is the case for most peop
 
 The `examples` directory contains *very* brief examples of the python packages I've written to create microlensing magnification maps, calculate critical curves and caustics, calculate number of caustic crossings maps, and locate microimages. There are additional examples showing how to generate lightcurves, and a note on units for the magnification maps. The `view_output.ipynb` example shows how to read the output of the IPM executable.
 
+
+### Batches of IPM maps
+
+`microlensing.IPM.batch.BatchedIPM` generates many IPM maps from one description, on one or more GPUs, and hands them back as they finish.
+
+Describing the maps:
+- It takes the arguments of `IPM`, plus `num_maps`. Each argument is either a single value shared by every map or a sequence with one value per map; sequences are paired element by element (use `itertools.product` for a grid).
+- The number of maps is `num_maps` if given, otherwise the common length of the sequences (which must all agree, and must match `num_maps`), otherwise one. A string argument (`mass_function`, `starfile`, `outfile_prefix`) counts as a single value.
+- Mismatches and invalid inputs (a negative `kappa_tot`, say) raise `ValueError` in the constructor, before any GPU work; the message names the first invalid map, as `map 1: ...`. A map with a `starfile` gets only the host-side checks there; its file is checked when the map runs. This full check needs libraries with the batch exports: with others (see the last item of this section), the constructor makes only the checks of `IPM`'s Python setters, and the other checks fail the map when it runs.
+- `params(i)` returns the resolved inputs of map `i`.
+
+Seeds and output prefixes:
+- Seeds are fixed before any GPU work and are reported on each result as `random_seed`.
+- A sequence of seeds is used as given. A single `random_seed` is one map's seed, as with `IPM`, so it is accepted only when at most one map has no `starfile`; with more maps it raises `ValueError`.
+- `seed_start=s`, an integer, gives each map a distinct seed in `1 ... 2**31 - 1` through `numpy.random.default_rng(s)`, and map `i`'s seed does not depend on `num_maps`; it cannot be combined with `random_seed`. With neither, distinct seeds are drawn.
+- Seed and prefix sequences must not contain `None`, and given seeds must lie in `1 ... 2**31 - 1`. Maps with a `starfile` get seed 0, as with `IPM`.
+- A single `outfile_prefix` (or none, meaning `"./"`) gives map `i` the prefix `prefix + f"{i}_"`; a sequence is used as given, and duplicate prefixes raise `ValueError`.
+- The prefixes name files only when maps are saved (`ipm.save()` on a result, or `run(save=True)` with `write_*` flags set); nothing is written otherwise, and, as with `IPM.save()`, the output directory must already exist.
+
+```python
+from microlensing.IPM.batch import BatchedIPM
+
+# N maps, same lens, different seeds
+with BatchedIPM(kappa_tot=0.4, shear=0.4, smooth_fraction=0.5,
+                random_seed=range(1, 1001),                # or seed_start=42 and num_maps=1000
+                half_length_y1=25, half_length_y2=25,
+                num_pixels_y1=5000, num_pixels_y2=5000,
+                outfile_prefix="run1/") as batch:           # names files only when maps are saved: run1/0_ipm_..., run1/1_ipm_...
+    for index, ipm in batch.run():                         # as maps finish, in any order
+        if isinstance(ipm, Exception):                     # a BatchMapError: this map failed, the rest go on
+            print(index, ipm); continue
+        ...                                                # ipm is an ordinary IPM holding its map
+
+# sweep: one value per map; the maps are written to disk as they finish
+with BatchedIPM(kappa_tot=[0.3, 0.4, 0.5], shear=[0.2, 0.4, 0.4], smooth_fraction=[0.0, 0.5, 0.9],
+                random_seed=[11, 12, 13], write_maps=True, write_stars=True, ...) as batch:
+    records = batch.run(save=True)    # a list of SavedMap(index, outfile_prefix, random_seed, error)
+```
+
+Results:
+- `run()` yields `(index, ipm)` in completion order. `ipm` is an ordinary `IPM` in the state `IPM.run()` leaves it, with its star arrays sorted by the tree, as with `IPM`.
+- `save()` works on it and writes the same files as `IPM.save()`, taking the maps from its current `magnifications`, `magnifications_minima` and `magnifications_saddles` arrays, so changes made to them in place are written too.
+- Results hold no GPU memory, so the GPUs' buffers are reused for the next map; `close()`, or leaving the `with` block, frees the workers' GPU memory. Calling `run()` on a result runs its map again on the GPU of the worker that made it, not on GPU 0 as a new `IPM` does, and the result then holds GPU memory there, as an `IPM` does.
+- `run(save=True)` blocks, writes each map as it finishes with the files selected by `write_stars`, `write_maps`, `write_parities` and `write_histograms` (with none set, only parameter files are written, with a warning), and returns one `SavedMap` per map in batch order; `writers` sets the number of writer threads. When every map failed, it raises the first map's `BatchMapError` (the records are on its `records` attribute).
+- Ctrl-C (or another exception) during `run(save=True)` stops new maps from starting and lets running ones finish, then drops the maps still waiting for a writer, whose files are not written, lets the writes in progress finish and raises.
+- `last_run_stats` describes the last run: its `result_budget` is `max_result_bytes`, and `peak_result_bytes` the most result bytes on the host at once (being copied off the GPUs, or waiting).
+
+Memory and GPUs:
+- The finished maps waiting for the consumer (in save mode, for their files to be written) are capped at `max_result_bytes` (default 8 GiB), with always room for one map. A result counts its maps, its histograms and its stars twice, as it holds two copies of the stars (in its C++ object and in `ipm.stars`).
+- A map that finishes is copied off its GPU only once its result fits under the cap, and waits in its worker's GPU memory until then, and while the cap is reached, workers stop starting maps. Maps in progress do not count against the cap, so large maps still run side by side.
+- Host RAM therefore holds at most `max_result_bytes` of results (or one result, if that is larger), counting those being copied off the GPUs, plus the results your loop keeps. In save mode, a map with `write_maps=False` never has its maps copied to the host.
+- By default `devices=None` uses every visible GPU, and `maps_per_gpu=None` runs at most 8 maps per GPU, fewer if memory is short; an explicit `maps_per_gpu` is only an upper limit. `devices` is a list, tuple, range or numpy array of GPU numbers, as its first GPU reads the star files for the memory estimates; a set or a dict raises `TypeError`.
+
+Failures and stops:
+- A failing map does not stop the batch: it comes back as `(index, BatchMapError)` (or as the `error` of its `SavedMap`).
+- A map that runs out of device memory is retried with fewer maps on its GPU, which goes back to its full number of maps once the retry succeeds; a GPU that then runs out of memory beside other maps again returns to the lower number and keeps it. The map fails only if it cannot run alone.
+- A map whose estimate exceeds the memory one GPU has for maps goes to a GPU where it fits.
+- A GPU whose CUDA context breaks leaves the batch with a warning: the map whose error reveals the break fails with the GPU's error, and the other maps that fail there are retried once on the other GPUs; with no GPU left, the remaining maps fail.
+- Breaking out of the loop, an exception or Ctrl-C stops new maps from starting, lets running ones finish and joins the workers.
+
+Other points:
+- `t_shoot_cells` of a batched map is wall time and can include time shared with other maps on the GPU.
+- With `verbose` above 0, the messages that the C++ code prints for maps running at the same time interleave and do not say which map they belong to; use `verbose=0` for large batches.
+- Maps with a `starfile` read their file twice (once for the memory estimate and once to run) and allocate their star memory anew on every run, which briefly stalls the GPU, so star-file batches overlap less than batches with generated star fields.
+- Batching needs libraries built with its exports; with others (including the precompiled ones in `microlensing/lib/`) the maps run one at a time on GPU 0, with a warning (`devices` other than `[0]` raise `ValueError`, and `maps_per_gpu` and `max_result_bytes` have no effect), and the results are plain `IPM` objects that hold their GPU memory until they are deleted.
