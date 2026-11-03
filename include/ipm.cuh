@@ -10,7 +10,7 @@
 
 #include <thrust/device_ptr.h> //for thrust::device_ptr
 #include <thrust/execution_policy.h> //for thrust::device
-#include <thrust/extrema.h> //for thrust::min_element, thrust::max_element
+#include <thrust/extrema.h> //for thrust::minmax_element
 #include <thrust/fill.h> //for thrust::fill
 #include <thrust/functional.h> //for thrust::plus
 #include <thrust/transform.h> //for thrust::transform
@@ -499,9 +499,23 @@ private:
 
 			/******************************************************************************
 			histogram of mu
+			one fused min/max pass per array (device memory, so go through
+			thrust::device_ptr; dereferencing copies the value to the host)
 			******************************************************************************/
-			min_mag = std::round(*thrust::min_element(thrust::device, thrust::device_pointer_cast(d_pixels), thrust::device_pointer_cast(d_pixels) + (1ULL * num_pixels_y.re * num_pixels_y.im)) * factor);
-			max_mag = std::round(*thrust::max_element(thrust::device, thrust::device_pointer_cast(d_pixels), thrust::device_pointer_cast(d_pixels) + (1ULL * num_pixels_y.re * num_pixels_y.im)) * factor);
+			const size_t npix_total = 1ULL * num_pixels_y.re * num_pixels_y.im;
+			auto minmax = [&](T* d_arr, T& lo, T& hi)
+			{
+				thrust::device_ptr<T> dp = thrust::device_pointer_cast(d_arr);
+				auto mm = thrust::minmax_element(thrust::device, dp, dp + npix_total);
+				lo = *mm.first;
+				hi = *mm.second;
+			};
+			T lo_all, hi_all;
+			minmax(d_pixels, lo_all, hi_all);
+			min_mag = std::round(lo_all * factor);
+			max_mag = std::round(hi_all * factor);
+			min_log_mag = std::round(std::log10(lo_all) * factor);
+			max_log_mag = std::round(std::log10(hi_all) * factor);
 
 			T mu_min_theory = 1 / ((1 - kappa_tot + kappa_star) * (1 - kappa_tot + kappa_star));
 			T mu_min_actual = 1.0 * min_mag / factor;
@@ -517,8 +531,11 @@ private:
 
 			if (write_parities)
 			{
-				int min_mag_minima = std::round(*thrust::min_element(thrust::device, thrust::device_pointer_cast(d_pixels_minima), thrust::device_pointer_cast(d_pixels_minima) + (1ULL * num_pixels_y.re * num_pixels_y.im)) * factor);
-				int max_mag_minima = std::round(*thrust::max_element(thrust::device, thrust::device_pointer_cast(d_pixels_minima), thrust::device_pointer_cast(d_pixels_minima) + (1ULL * num_pixels_y.re * num_pixels_y.im)) * factor);
+				T lo_min, hi_min, lo_sad, hi_sad;
+				minmax(d_pixels_minima, lo_min, hi_min);
+				minmax(d_pixels_saddles, lo_sad, hi_sad);
+				int min_mag_minima = std::round(lo_min * factor);
+				int max_mag_minima = std::round(hi_min * factor);
 
 				mu_min_actual = 1.0 * min_mag_minima / factor;
 
@@ -531,11 +548,19 @@ private:
 					print_verbose("\n", verbose * (verbose < 2), 1);
 				}
 
-				int min_mag_saddles = std::round(*thrust::min_element(thrust::device, thrust::device_pointer_cast(d_pixels_saddles), thrust::device_pointer_cast(d_pixels_saddles) + (1ULL * num_pixels_y.re * num_pixels_y.im)) * factor);
-				int max_mag_saddles = std::round(*thrust::max_element(thrust::device, thrust::device_pointer_cast(d_pixels_saddles), thrust::device_pointer_cast(d_pixels_saddles) + (1ULL * num_pixels_y.re * num_pixels_y.im)) * factor);
+				int min_mag_saddles = std::round(lo_sad * factor);
+				int max_mag_saddles = std::round(hi_sad * factor);
 
 				min_mag = std::min({min_mag, min_mag_minima, min_mag_saddles});
 				max_mag = std::max({max_mag, max_mag_minima, max_mag_saddles});
+
+				int min_log_mag_minima = std::round(std::log10(lo_min) * factor);
+				int max_log_mag_minima = std::round(std::log10(hi_min) * factor);
+				int min_log_mag_saddles = std::round(std::log10(lo_sad) * factor);
+				int max_log_mag_saddles = std::round(std::log10(hi_sad) * factor);
+
+				min_log_mag = std::min({min_log_mag, min_log_mag_minima, min_log_mag_saddles});
+				max_log_mag = std::max({max_log_mag, max_log_mag_minima, max_log_mag_saddles});
 			}
 
 			histogram_length = max_mag - min_mag + 1;
@@ -573,23 +598,8 @@ private:
 			
 
 			/******************************************************************************
-			histogram of log_10(mu)
+			histogram of log_10(mu) (ranges computed above)
 			******************************************************************************/
-
-			min_log_mag = std::round(std::log10(*thrust::min_element(thrust::device, thrust::device_pointer_cast(d_pixels), thrust::device_pointer_cast(d_pixels) + (1ULL * num_pixels_y.re * num_pixels_y.im))) * factor);
-			max_log_mag = std::round(std::log10(*thrust::max_element(thrust::device, thrust::device_pointer_cast(d_pixels), thrust::device_pointer_cast(d_pixels) + (1ULL * num_pixels_y.re * num_pixels_y.im))) * factor);
-
-			if (write_parities)
-			{
-				int min_log_mag_minima = std::round(std::log10(*thrust::min_element(thrust::device, thrust::device_pointer_cast(d_pixels_minima), thrust::device_pointer_cast(d_pixels_minima) + (1ULL * num_pixels_y.re * num_pixels_y.im))) * factor);
-				int max_log_mag_minima = std::round(std::log10(*thrust::max_element(thrust::device, thrust::device_pointer_cast(d_pixels_minima), thrust::device_pointer_cast(d_pixels_minima) + (1ULL * num_pixels_y.re * num_pixels_y.im))) * factor);
-
-				int min_log_mag_saddles = std::round(std::log10(*thrust::min_element(thrust::device, thrust::device_pointer_cast(d_pixels_saddles), thrust::device_pointer_cast(d_pixels_saddles) + (1ULL * num_pixels_y.re * num_pixels_y.im))) * factor);
-				int max_log_mag_saddles = std::round(std::log10(*thrust::max_element(thrust::device, thrust::device_pointer_cast(d_pixels_saddles), thrust::device_pointer_cast(d_pixels_saddles) + (1ULL * num_pixels_y.re * num_pixels_y.im))) * factor);
-
-				min_log_mag = std::min({min_log_mag, min_log_mag_minima, min_log_mag_saddles});
-				max_log_mag = std::max({max_log_mag, max_log_mag_minima, max_log_mag_saddles});
-			}
 
 			log_histogram_length = max_log_mag - min_log_mag + 1;
 
