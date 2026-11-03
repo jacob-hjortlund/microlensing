@@ -243,7 +243,7 @@ private:
 		number density of rays in the lens plane
 		******************************************************************************/
 		set_param("num_rays_x", num_rays_x,
-			1.0 * num_rays_y * num_pixels_y.re * num_pixels_y.im / (2 * half_length_y.re * 2 * half_length_y.im),
+			1.0 * num_rays_y * (1ULL * num_pixels_y.re * num_pixels_y.im) / (2 * half_length_y.re * 2 * half_length_y.im),
 			verbose);
 
 		/******************************************************************************
