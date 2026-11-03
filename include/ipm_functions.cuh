@@ -12,6 +12,7 @@
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 
+#include <climits>
 #include <numbers>
 
 
@@ -276,6 +277,10 @@ namespace ipm_functions
 
 	constexpr int TILE = 16; //cells per tile side; a block handles one TILE x TILE tile at a time
 	constexpr int NCORNER = (TILE + 1) * (TILE + 1);
+#ifndef IPM_EDGE_MIN_BBOX
+#define IPM_EDGE_MIN_BBOX 64 //tuning knob: triangles whose clamped bounding box has more pixels than this take the perimeter path
+#endif
+	constexpr long long EDGE_MIN_BBOX = IPM_EDGE_MIN_BBOX;
 	//IPM_MIN_BLOCKS_PER_SM sets the minimum blocks per SM in shoot_cells_tiled_kernel's __launch_bounds__, which caps its registers per thread
 #ifndef IPM_MIN_BLOCKS_PER_SM
 #define IPM_MIN_BLOCKS_PER_SM 0 //tuning knob: 0 = automatic (4 blocks/SM for float, 3 for double), else the value given
@@ -305,6 +310,12 @@ namespace ipm_functions
 	  origin-shifted coordinates
 	- single-pixel triangles (the hot path in magnified regions) are merged per
 	  cell and warp-aggregated before the atomic
+	- triangles whose clamped bounding box has more than edge_min_bbox pixels
+	  are deposited along their perimeter (tri_cov::allocate_triangle): values
+	  on the edges go to the map, steps to the step buffer of the same parity
+	  (steps_min / steps_sad with parities, else steps), whose row-wise prefix
+	  sum add_row_prefix_kernel adds to the map afterwards. with LLONG_MAX the
+	  step buffers are never touched and may be null
 
 	\tparam T -- precision of the lens mapping and of the pixel arrays
 	\tparam P -- precision of the pixel-allocation arithmetic (the map precision T in both builds)
@@ -317,6 +328,7 @@ namespace ipm_functions
 		int rectangular, Complex<T> corner, int approx, int taylor_smooth, SmoothConst<T> sc,
 		Complex<T> ray_half_sep, Complex<int> num_ray_threads, Complex<T> center_x, Complex<T> hlx,
 		Complex<T> center_y, Complex<T> hly, T* pixmin, T* pixsad, T* pixels, Complex<int> npixels,
+		T* steps_min, T* steps_sad, T* steps, long long edge_min_bbox,
 		unsigned long long int* percentage, int verbose)
 	{
 		//plain arrays: a class with a constructor cannot be a __shared__ variable
@@ -469,7 +481,7 @@ namespace ipm_functions
 					if (!(fabs(area) < max_area)) return;
 					const long long parity = (parities && area >= 0) ? 1 : 0;
 					T* target = parities ? (parity ? pixsad : pixmin) : pixels;
-					tri_cov::allocate_triangle<P, T>(pa, pb, pc, area, factor, npixels,
+					tri_cov::allocate_triangle<P, T>(pa, pb, pc, area, factor, npixels, edge_min_bbox,
 						[&](long long idx, P v)
 						{
 							const long long key = (idx << 1) | parity;
@@ -484,7 +496,14 @@ namespace ipm_functions
 								pend_val = v;
 							}
 						},
-						[&](long long idx, P v) { atomicAdd(&target[idx], static_cast<T>(v)); });
+						//on the perimeter path v is a partial value: possibly negative, not clamped
+						[&](long long idx, P v) { atomicAdd(&target[idx], static_cast<T>(v)); },
+						[&](long long idx, P v)
+						{
+							//steps follow the triangle's parity like its values
+							T* step_target = parities ? (parity ? steps_sad : steps_min) : steps;
+							atomicAdd(&step_target[idx], static_cast<T>(v));
+						});
 				};
 				deposit(y0, y1, y2);
 				deposit(y2, y3, y0);
@@ -501,6 +520,99 @@ namespace ipm_functions
 				}
 			}
 			__syncthreads(); //the shared arrays are reused by the next tile
+		}
+	}
+
+	constexpr int ROW_PREFIX_BLOCK = 256; //threads per block of add_row_prefix_kernel: 8 rows at a time
+
+	/******************************************************************************
+	second half of the perimeter deposit: add the row-wise inclusive prefix sum of
+	the step buffer to the map. one warp per row, 32 columns at a time with a warp
+	scan and a carry between chunks; rows may be shorter than a warp. the scan, the
+	carry and the add are in double, with one rounding to T at the store.
+
+	in exact arithmetic every resulting pixel is >= 0. a rounding residue below 0
+	is set to 0; the number of such pixels and the sum of their values (<= 0) are
+	added to n_clamped and clamped_total with one atomic each per block
+
+	launch with a block size that is a multiple of 32 (ROW_PREFIX_BLOCK)
+
+	\param pixels -- map to add to (num_pixels_y2 rows of num_pixels_y1 columns)
+	\param steps -- step buffer of the same layout
+	\param npix -- number of pixels in each direction
+	\param n_clamped -- device counter of clamped pixels
+	\param clamped_total -- device sum of the clamped values
+	******************************************************************************/
+	template <typename T>
+	__global__ void add_row_prefix_kernel(T* pixels, const T* steps, Complex<int> npix, unsigned long long* n_clamped, double* clamped_total)
+	{
+		const int lane = threadIdx.x & 31;
+		const long long num_warps = (1LL * gridDim.x * blockDim.x) >> 5;
+		unsigned long long n = 0;
+		double total = 0;
+
+		//row and column loops are uniform across the warp, so every lane takes part in the shuffles
+		for (long long row = (1LL * blockIdx.x * blockDim.x + threadIdx.x) >> 5; row < npix.im; row += num_warps)
+		{
+			const long long base = npix.re * row;
+			double carry = 0; //double: a float carry would accumulate rounding along a long row
+			for (int c0 = 0; c0 < npix.re; c0 += 32)
+			{
+				const int c = c0 + lane;
+				double v = c < npix.re ? static_cast<double>(steps[base + c]) : 0.0;
+				for (int o = 1; o < 32; o <<= 1)
+				{
+					const double u = __shfl_up_sync(0xffffffffu, v, o);
+					if (lane >= o) v += u;
+				}
+				v += carry;
+				carry = __shfl_sync(0xffffffffu, v, 31);
+				if (c < npix.re)
+				{
+					double r = pixels[base + c] + v;
+					if (r < 0)
+					{
+						n++;
+						total += r;
+						r = 0;
+					}
+					pixels[base + c] = static_cast<T>(r);
+				}
+			}
+		}
+
+		/******************************************************************************
+		block reduction of the clamp statistics, then one atomic per block
+		******************************************************************************/
+		__shared__ unsigned long long s_n[32];
+		__shared__ double s_total[32];
+		for (int o = 16; o > 0; o >>= 1)
+		{
+			n += __shfl_down_sync(0xffffffffu, n, o);
+			total += __shfl_down_sync(0xffffffffu, total, o);
+		}
+		const int warp = threadIdx.x >> 5;
+		if (lane == 0)
+		{
+			s_n[warp] = n;
+			s_total[warp] = total;
+		}
+		__syncthreads();
+		if (warp == 0)
+		{
+			const int warps_per_block = blockDim.x >> 5;
+			n = lane < warps_per_block ? s_n[lane] : 0;
+			total = lane < warps_per_block ? s_total[lane] : 0;
+			for (int o = 16; o > 0; o >>= 1)
+			{
+				n += __shfl_down_sync(0xffffffffu, n, o);
+				total += __shfl_down_sync(0xffffffffu, total, o);
+			}
+			if (lane == 0 && n > 0)
+			{
+				atomicAdd(n_clamped, n);
+				atomicAdd(clamped_total, total);
+			}
 		}
 	}
 }
